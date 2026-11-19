@@ -6,6 +6,7 @@
 //! Over it all, the death screen, as vanilla's `DeathScreen` and its `TitleConfirmScreen`
 //! lay them out.
 
+pub mod chat;
 pub mod launcher;
 pub mod menu;
 pub mod pause;
@@ -114,6 +115,19 @@ pub struct HudArt {
 }
 
 impl HudArt {
+    /// A font cell's rect in the atlas.
+    fn glyph_rect(&self, cell: u8) -> [f32; 4] {
+        let [u0, v0, u1, v1] = self.font;
+        let (du, dv) = ((u1 - u0) / 16.0, (v1 - v0) / 16.0);
+        let (col, row) = ((cell % 16) as f32, (cell / 16) as f32);
+        [
+            u0 + du * col,
+            v0 + dv * row,
+            u0 + du * (col + 1.0),
+            v0 + dv * (row + 1.0),
+        ]
+    }
+
     /// `StringSplitter.splitLines`: `text` broken at spaces into lines at most `max` GUI
     /// pixels wide, a word wider than that on a line of its own.
     pub(crate) fn wrap(&self, text: &str, max: i32) -> Vec<String> {
@@ -246,6 +260,7 @@ pub struct Hotbar {
     pub vitals: Option<Vitals>,
     /// The death screen, when the player has died.
     pub death: Option<DeathScreen>,
+    pub chat: chat::Chat,
 }
 
 /// A screen drawn instead of the HUD.
@@ -432,15 +447,7 @@ impl GuiMesh {
                 continue;
             };
             if c != ' ' {
-                let [u0, v0, u1, v1] = art.font;
-                let (du, dv) = ((u1 - u0) / 16.0, (v1 - v0) / 16.0);
-                let (col, row) = ((cell % 16) as f32, (cell / 16) as f32);
-                let rect = [
-                    u0 + du * col,
-                    v0 + dv * row,
-                    u0 + du * (col + 1.0),
-                    v0 + dv * (row + 1.0),
-                ];
+                let rect = art.glyph_rect(cell);
                 let size = 8.0 * scale;
                 self.blit(pen, y, z, size, size, rect, [rgb[0], rgb[1], rgb[2], 1.0]);
             }
@@ -599,6 +606,7 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
     if let Some(vitals) = &hotbar.vitals {
         mesh.vitals(art, vitals, width as i32, height as i32);
     }
+    mesh.chat(art, &hotbar.chat, width as i32, height as i32);
     if let Some(death) = &hotbar.death {
         mesh.death_screen(art, death, width as i32, height as i32);
     }

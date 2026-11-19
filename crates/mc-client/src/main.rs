@@ -11,7 +11,8 @@
 //! In the window: click to capture the mouse, WASD to move, Space and Shift to go up and
 //! down, Ctrl to fly faster, Esc to pause. On a server, left click mines, right
 //! click places or uses, middle click picks the block, and 1 to 9 or the wheel choose the
-//! hotbar slot. Dying opens the death screen, whose buttons respawn or leave.
+//! hotbar slot. T opens the chat and / opens it to type a command; Enter sends. Dying
+//! opens the death screen, whose buttons respawn or leave.
 //!
 //! Without `--world` or `--server`, the window opens on the title screen: Singleplayer opens
 //! the test world, and Multiplayer asks for a server's address (remembered in `options.txt`
@@ -24,6 +25,7 @@ use glam::Vec3;
 use mc_render::bake::BlockModels;
 use mc_render::hud::menu;
 
+mod chat;
 mod skins;
 mod stream;
 mod walk;
@@ -316,6 +318,7 @@ fn run() -> Result<()> {
                 cursor: None,
                 focused_at: Instant::now(),
                 paused: false,
+                chat: Default::default(),
             };
             if app.start.server.is_some() || app.start.world_given {
                 app.play(app.start.server.clone());
@@ -447,6 +450,8 @@ struct App {
     focused_at: Instant,
     /// The pause screen is open over the world.
     paused: bool,
+    /// The chat on a server, and its screen when open.
+    chat: chat::Chat,
     view: View,
     state: Option<WindowState>,
     keys: std::collections::HashSet<winit::keyboard::KeyCode>,
@@ -578,6 +583,7 @@ impl App {
         self.models = scene.models.clone();
         self.streamer = Some(spawn_streamer(scene, &self.args));
         (self.menu, self.paused) = (None, false);
+        self.chat = Default::default();
         (self.outlined, self.shown_hotbar) = (None, None);
         self.shown_cracks.clear();
         self.view.ticks = self.args.ticks;
@@ -602,6 +608,7 @@ impl App {
         self.models = self.menu_models.clone();
         (self.captured, self.buttons, self.paused) = (false, Default::default(), false);
         self.keys.clear();
+        self.chat = Default::default();
         self.menu = Some(menu::Menu {
             screen,
             ..Default::default()
@@ -709,7 +716,12 @@ impl App {
     /// the mouse. Not over another screen.
     fn pause(&mut self) {
         let screen_open = self.walker.as_ref().is_some_and(walk::Walker::screen_open);
-        if self.streamer.is_none() || self.menu.is_some() || self.paused || screen_open {
+        if self.streamer.is_none()
+            || self.menu.is_some()
+            || self.paused
+            || screen_open
+            || self.chat.is_open()
+        {
             return;
         }
         if let Some(state) = &self.state {
@@ -744,6 +756,29 @@ impl App {
             Some(mc_render::hud::pause::Action::ReturnToGame) => self.resume(),
             Some(mc_render::hud::pause::Action::Leave) => self.leave_world(menu::Screen::Title),
             _ => {}
+        }
+    }
+
+    /// A key in the open chat: Enter sends what was typed and closes it, as Esc does,
+    /// capturing the mouse again.
+    fn chat_key(&mut self, event: &winit::event::KeyEvent) {
+        let close = match self.chat.key(&event.logical_key, event.text.as_deref()) {
+            chat::Key::Send(message) => {
+                if let Some(walker) = &self.walker
+                    && let Err(e) = walker.send_chat(&message)
+                {
+                    eprintln!("sending chat: {e:#}");
+                }
+                true
+            }
+            chat::Key::Close => true,
+            chat::Key::None => false,
+        };
+        if close {
+            self.chat.close();
+            if let Some(state) = &self.state {
+                self.captured = state.grab();
+            }
         }
     }
 
@@ -820,6 +855,22 @@ impl winit::application::ApplicationHandler for App {
                 button: winit::event::MouseButton::Left,
                 ..
             } if self.paused => self.pause_click(),
+            WindowEvent::KeyboardInput { event, .. } if self.chat.is_open() => {
+                if event.state == ElementState::Pressed {
+                    self.chat_key(&event);
+                }
+            }
+            // `ChatScreen.mouseScrolled`: seven lines a notch, one with Shift.
+            WindowEvent::MouseWheel { delta, .. } if self.chat.is_open() => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                };
+                let shift = self.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+                let notches = lines.clamp(-1.0, 1.0) * if shift { 1.0 } else { 7.0 };
+                self.chat.scroll_by(notches as i32);
+            }
+            WindowEvent::MouseInput { .. } if self.chat.is_open() => {}
             // Esc closes the pause screen (`Screen.shouldCloseOnEsc`), back to the game.
             WindowEvent::KeyboardInput { event, .. } if self.paused => {
                 if event.state == ElementState::Pressed
@@ -896,6 +947,22 @@ impl winit::application::ApplicationHandler for App {
                             Some(walker) if walker.screen_open() => walker.escape(),
                             _ => self.pause(),
                         }
+                        return;
+                    }
+                    // `Gui.handleKeybinds`: T opens the chat, / opens it with a slash.
+                    let prefix = match code {
+                        winit::keyboard::KeyCode::KeyT => Some(""),
+                        winit::keyboard::KeyCode::Slash => Some("/"),
+                        _ => None,
+                    };
+                    if let Some(prefix) = prefix
+                        && event.state == ElementState::Pressed
+                        && self.walker.as_ref().is_some_and(|w| !w.screen_open())
+                    {
+                        self.chat.open(prefix);
+                        state.release();
+                        (self.captured, self.buttons) = (false, Default::default());
+                        self.keys.clear();
                         return;
                     }
                     let digits = [
@@ -976,6 +1043,10 @@ impl winit::application::ApplicationHandler for App {
                                 walker.blocks(&changes);
                             }
                         }
+                        stream::Update::Server(mc_protocol::Event::Chat(spans)) => {
+                            self.chat
+                                .add(&self.models.hud, &spans, self.view.ticks as i32);
+                        }
                         stream::Update::Server(event) => {
                             if let Some(walker) = &mut self.walker {
                                 walker.server_event(event);
@@ -1009,6 +1080,7 @@ impl winit::application::ApplicationHandler for App {
                         }
                         if let Some(state) = &mut self.state {
                             let mut hotbar = walker.hotbar();
+                            hotbar.chat = self.chat.view(self.view.ticks as i32);
                             if let Some(death) = &mut hotbar.death {
                                 // A screen frees the mouse, as `Gui.setScreen` does.
                                 if self.captured {

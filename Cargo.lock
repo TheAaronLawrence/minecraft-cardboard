@@ -1167,6 +1167,7 @@ dependencies = [
  "image",
  "mc-assets",
  "mc-nbt",
+ "mc-protocol",
  "mc-registry",
  "mc-world",
  "pollster",

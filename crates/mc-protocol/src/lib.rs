@@ -1,11 +1,12 @@
 //! The Java Edition network protocol, as vanilla 26.3 speaks it (protocol 777): framing and
 //! compression, the handshake, login and configuration states, and the play packets a client
-//! needs to stand in a world and receive its chunks.
+//! needs to stand in a world, receive its chunks, and chat.
 //!
 //! Packet ids come from the data generator's `packets.json` report in `resources/reports/`,
 //! so they always match the version the reports were made from. Only offline-mode servers
 //! are supported so far: online mode needs a Microsoft login and encryption.
 
+pub mod chat;
 mod chunk;
 pub mod codec;
 mod connection;
@@ -93,6 +94,8 @@ pub enum Event {
         sky: Vec<(i32, Box<[u8; 2048]>)>,
         block: Vec<(i32, Box<[u8; 2048]>)>,
     },
+    /// A message for the chat: from the server, or a player's, decorated by its chat type.
+    Chat(Vec<chat::Span>),
     /// The connection ended, with the server's reason.
     Disconnected(String),
 }
@@ -110,6 +113,9 @@ pub struct Session {
 pub struct Outbox {
     writer: connection::Writer,
     ids: Arc<HashMap<String, i32>>,
+    /// Signed messages received and not yet acknowledged to the server
+    /// (`LastSeenMessagesTracker.offset`).
+    unacknowledged: Arc<std::sync::atomic::AtomicI32>,
 }
 
 impl Outbox {
@@ -120,6 +126,21 @@ impl Outbox {
             .get(&format!("minecraft:{name}"))
             .with_context(|| format!("no serverbound {name} packet"))?;
         self.writer.send(*id, body)
+    }
+
+    /// `ClientPacketListener.sendChat` for an unsigned message, acknowledging the signed
+    /// messages seen since the last acknowledgement.
+    pub fn send_chat(&self, message: &str) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let offset = self.unacknowledged.swap(0, Ordering::SeqCst);
+        self.send("chat", &chat::chat_packet(message, offset)?)
+    }
+
+    /// `ClientPacketListener.sendCommand`, unsigned: `command` without its `/`.
+    pub fn send_command(&self, command: &str) -> Result<()> {
+        let mut body = Vec::new();
+        body.put_string(command);
+        self.send("chat_command", &body)
     }
 
     /// Leaves the server: closes the connection, as quitting does.
@@ -292,12 +313,21 @@ pub fn connect(
                 .map(|((_, name), id)| (name.clone(), *id))
                 .collect(),
         ),
+        unacknowledged: Default::default(),
     };
+    let unacknowledged = outbox.unacknowledged.clone();
     let (tx, events) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("server connection".into())
         .spawn(move || {
-            let result = play(&mut conn, &packets, &config, &registry, &tx);
+            let result = play(
+                &mut conn,
+                &packets,
+                &config,
+                &registry,
+                &tx,
+                &unacknowledged,
+            );
             let reason = match result {
                 Ok(reason) => reason,
                 Err(e) => format!("{e:#}"),
@@ -377,8 +407,11 @@ fn play(
     config: &Config,
     registry: &Registry,
     tx: &Sender<Event>,
+    unacknowledged: &std::sync::atomic::AtomicI32,
 ) -> Result<String> {
     const STATE: State = State::Play;
+    let chat_types = chat::chat_types(config.entries("minecraft:chat_type"));
+    let lang = english();
     let biomes: Vec<String> = config
         .entries("minecraft:worldgen/biome")
         .iter()
@@ -656,6 +689,68 @@ fn play(
                 tx.send(Event::Forget(packed as i32, (packed >> 32) as i32))
                     .is_ok()
             }
+            "system_chat" => {
+                let message = chat::component(r.nbt()?);
+                // An overlay message goes above the hotbar, which isn't drawn yet.
+                r.bool()? || tx.send(Event::Chat(chat::spans(&message, &lang))).is_ok()
+            }
+            "disguised_chat" => {
+                let content = chat::component(r.nbt()?);
+                match chat_bound(&mut r, &chat_types)? {
+                    Some((ty, name, target)) => {
+                        let message = ty.decorate(name, target, content);
+                        tx.send(Event::Chat(chat::spans(&message, &lang))).is_ok()
+                    }
+                    None => true,
+                }
+            }
+            "player_chat" => {
+                // `ClientboundPlayerChatPacket`: indices, the sender, then the message.
+                r.varint()?;
+                r.take(16)?;
+                r.varint()?;
+                let signed = r.bool()?;
+                if signed {
+                    r.take(256)?;
+                }
+                let content = r.string()?;
+                r.i64()?; // time stamp
+                r.i64()?; // salt
+                for _ in 0..r.count()? {
+                    // `MessageSignature.Packed`: a cached id plus one, or 0 and the signature.
+                    if r.varint()? == 0 {
+                        r.take(256)?;
+                    }
+                }
+                let unsigned = if r.bool()? { r.nbt()? } else { None };
+                // `FilterMask`: pass through, fully filtered, or a bit set of what's hidden.
+                let filter = r.varint()?;
+                if filter == 2 {
+                    r.long_array()?;
+                }
+                // `ClientPacketListener.markMessageAsProcessed`: every 64 signed messages
+                // seen, acknowledge them.
+                if signed {
+                    use std::sync::atomic::Ordering;
+                    if unacknowledged.fetch_add(1, Ordering::SeqCst) + 1 > 64 {
+                        let offset = unacknowledged.swap(0, Ordering::SeqCst);
+                        let mut ack = Vec::new();
+                        ack.put_varint(offset);
+                        send(conn, "chat_ack", &ack)?;
+                    }
+                }
+                let content = match unsigned {
+                    Some(tag) => chat::component(Some(tag)),
+                    None => content.into(),
+                };
+                match chat_bound(&mut r, &chat_types)? {
+                    Some((ty, name, target)) if filter != 1 => {
+                        let message = ty.decorate(name, target, content);
+                        tx.send(Event::Chat(chat::spans(&message, &lang))).is_ok()
+                    }
+                    _ => true,
+                }
+            }
             "disconnect" => return Ok(nbt_reason(r.nbt()?)),
             "start_configuration" => {
                 return Ok("the server asked to reconfigure, which isn't supported yet".into());
@@ -666,6 +761,34 @@ fn play(
             return Ok("the game closed the connection".into());
         }
     }
+}
+
+/// A `ChatType.Bound`: the chat type, the sender's name, and the target's if any. A chat
+/// type sent inline rather than by registry id gives `None`.
+fn chat_bound<'a>(
+    r: &mut Reader,
+    types: &'a [Option<chat::ChatType>],
+) -> Result<
+    Option<(
+        &'a chat::ChatType,
+        serde_json::Value,
+        Option<serde_json::Value>,
+    )>,
+> {
+    let id = r.varint()?;
+    if id == 0 {
+        return Ok(None);
+    }
+    let name = chat::component(r.nbt()?);
+    let target = if r.bool()? {
+        Some(chat::component(r.nbt()?))
+    } else {
+        None
+    };
+    Ok(types
+        .get(id as usize - 1)
+        .and_then(Option::as_ref)
+        .map(|ty| (ty, name, target)))
 }
 
 /// `Player.DATA_SCORE_ID` from a `ClientboundSetEntityDataPacket`'s values, if it holds
@@ -811,66 +934,13 @@ fn reason(component: &serde_json::Value) -> String {
     }
 }
 
-/// The text of a chat component (JSON form, which NBT components convert to): `text`, or
-/// `translate` looked up in `lang` with its `%s` / `%1$s` slots filled from `with`, then
-/// each of `extra`.
+/// The text of a chat component (JSON form, which NBT components convert to), without its
+/// styles.
 fn component_text(
     c: &serde_json::Value,
     lang: &serde_json::Map<String, serde_json::Value>,
 ) -> String {
-    use serde_json::Value;
-    let mut out = match c {
-        Value::String(s) => return s.clone(),
-        Value::Array(parts) => return parts.iter().map(|p| component_text(p, lang)).collect(),
-        Value::Object(_) => String::new(),
-        other => return other.to_string(),
-    };
-    // A string in a list of mixed tags is a compound with an empty key.
-    if let Some(text) = c["text"].as_str().or(c[""].as_str()) {
-        out.push_str(text);
-    } else if let Some(key) = c["translate"].as_str() {
-        let args: Vec<String> = c["with"]
-            .as_array()
-            .map(|with| with.iter().map(|a| component_text(a, lang)).collect())
-            .unwrap_or_default();
-        let format = lang.get(key).and_then(Value::as_str).unwrap_or(key);
-        out.push_str(&fill(format, &args));
-    }
-    if let Some(extra) = c["extra"].as_array() {
-        out.extend(extra.iter().map(|e| component_text(e, lang)));
-    }
-    out
-}
-
-/// Fills a translation's `%s` (next argument), `%N$s` (argument N) and `%%` slots, as
-/// vanilla's `TranslatableContents` does. A missing argument fills nothing.
-fn fill(format: &str, args: &[String]) -> String {
-    let mut out = String::new();
-    let mut next = 0;
-    let mut rest = format;
-    while let Some(at) = rest.find('%') {
-        out.push_str(&rest[..at]);
-        rest = &rest[at + 1..];
-        if let Some(after) = rest.strip_prefix('%') {
-            out.push('%');
-            rest = after;
-        } else if let Some(after) = rest.strip_prefix('s') {
-            out.push_str(args.get(next).map_or("", String::as_str));
-            next += 1;
-            rest = after;
-        } else if let Some((n, after)) = rest
-            .split_once("$s")
-            .filter(|(n, _)| n.parse::<usize>().is_ok())
-        {
-            let n: usize = n.parse().unwrap();
-            out.push_str(args.get(n.wrapping_sub(1)).map_or("", String::as_str));
-            rest = after;
-        } else {
-            out.push('%');
-        }
-    }
-    out.push_str(rest);
-    out
+    chat::plain(&chat::spans(c, lang))
 }
 
 /// The English translations, or none if they can't be read.

@@ -54,7 +54,8 @@ Joins a vanilla 26.3 server instead, and draws the chunks it sends. On a server 
 with vanilla's movement and collision: WASD, Space to jump, Shift to sneak, Ctrl to sprint,
 and double-tap Space to fly where the server allows it. Only offline-mode servers
 (`online-mode=false`) work so far. Swimming isn't simulated yet. In survival the HUD shows
-hearts, food and experience, and dying opens the death screen.
+hearts, food and experience, and dying opens the death screen. The chat shows the
+server's and other players' messages; T opens it to type one, and / to type a command.
 
 ```sh
 cargo build --release -p mc-client && cargo run --release -p mc-launcher

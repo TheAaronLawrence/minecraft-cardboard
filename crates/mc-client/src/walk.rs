@@ -443,6 +443,14 @@ impl Walker {
         }
     }
 
+    /// `ChatScreen.handleChatInput`: a `/` command, or else a chat message.
+    pub fn send_chat(&self, message: &str) -> anyhow::Result<()> {
+        match message.strip_prefix('/') {
+            Some(command) => self.outbox.send_command(command),
+            None => self.outbox.send_chat(message),
+        }
+    }
+
     /// Leaves the server, closing the connection.
     pub fn leave(&self) {
         self.outbox.close();
@@ -500,6 +508,7 @@ impl Walker {
             selected: self.selected,
             vitals,
             death: self.death_screen(),
+            chat: Default::default(),
         }
     }
 
