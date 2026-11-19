@@ -88,7 +88,14 @@ struct Scene {
 }
 
 fn load_scene(args: &Args) -> Result<Scene> {
-    let res = mc_assets::Resources::new(mc_assets::default_root());
+    let root = mc_assets::default_root();
+    anyhow::ensure!(
+        root.join("reports/blocks.json").exists(),
+        "can't find the game's resources (looked in {}). If you downloaded the zip, extract \
+         the whole of it, then run minecraft-cardboard.exe from the extracted folder.",
+        root.display()
+    );
+    let res = mc_assets::Resources::new(root);
     let registry = mc_registry::Registry::vanilla()?;
     let mut world = mc_world::World::open(&args.world);
     let eye = args.camera.eye;
@@ -128,7 +135,41 @@ fn load_scene(args: &Args) -> Result<Scene> {
     Ok(Scene { models, mesh })
 }
 
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    // A panic's message also goes in the log, and the window waits, as for an error.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        report_failure(&format!("{info}"));
+    }));
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            report_failure(&format!("{e:?}"));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Writes what went wrong to `minecraft-cardboard.log` beside the exe. On Windows, started
+/// by double-clicking, the console closes as soon as the program exits, so it also waits
+/// for Enter before closing.
+fn report_failure(message: &str) {
+    let log = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("minecraft-cardboard.log")))
+        .unwrap_or_else(|| "minecraft-cardboard.log".into());
+    if std::fs::write(&log, format!("{message}\n")).is_ok() {
+        eprintln!("(also written to {})", log.display());
+    }
+    if cfg!(windows) && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("Press Enter to close.");
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
+}
+
+fn run() -> Result<()> {
     let args = parse_args()?;
     let scene = load_scene(&args)?;
     let view = View {
