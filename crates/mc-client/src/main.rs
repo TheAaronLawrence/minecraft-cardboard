@@ -1,10 +1,13 @@
-//! minecraft-cardboard: opens a vanilla save and lets you fly around it, or renders one
-//! frame to a PNG.
+//! minecraft-cardboard: opens a vanilla save, or joins an offline-mode vanilla server, and
+//! lets you fly around the world; or renders one frame to a PNG.
 //!
 //! ```text
-//! minecraft-cardboard [--world DIR] [--pos X,Y,Z] [--look YAW,PITCH] [--distance CHUNKS]
+//! minecraft-cardboard [--world DIR | --server HOST:PORT [--name NAME]]
+//!                     [--pos X,Y,Z] [--look YAW,PITCH] [--distance CHUNKS]
 //!                     [--fov DEG] [--screenshot OUT.png] [--size WxH] [--ticks N]
 //! ```
+//! On a server, the camera starts where the server puts the player, unless `--pos` and
+//! `--look` say otherwise.
 //! In the window: click to capture the mouse, WASD to move, Space and Shift to go up and
 //! down, Ctrl to fly faster, Esc to release the mouse.
 
@@ -23,6 +26,11 @@ use std::time::Instant;
 
 struct Args {
     world: PathBuf,
+    server: Option<String>,
+    name: String,
+    /// `--pos` and `--look` were given, so they win over the server's placement.
+    pos_given: bool,
+    look_given: bool,
     camera: Camera,
     distance: i32,
     /// Game ticks at the start, which set where end portals' stars have drifted to.
@@ -34,6 +42,10 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         world: mc_assets::locate("fixtures/worlds/test-world"),
+        server: None,
+        name: "cardboard".into(),
+        pos_given: false,
+        look_given: false,
         camera: Camera {
             eye: Vec3::new(0.5, 100.0, 0.5),
             yaw: 0.0,
@@ -59,12 +71,17 @@ fn parse_args() -> Result<Args> {
         let mut value = || it.next().with_context(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--world" => args.world = value()?.into(),
+            "--server" => args.server = Some(value()?),
+            "--name" => args.name = value()?,
             "--pos" => match numbers(&value()?)?[..] {
-                [x, y, z] => args.camera.eye = Vec3::new(x, y, z),
+                [x, y, z] => (args.camera.eye, args.pos_given) = (Vec3::new(x, y, z), true),
                 _ => bail!("--pos takes X,Y,Z"),
             },
             "--look" => match numbers(&value()?)?[..] {
-                [yaw, pitch] => (args.camera.yaw, args.camera.pitch) = (yaw, pitch),
+                [yaw, pitch] => {
+                    (args.camera.yaw, args.camera.pitch) = (yaw, pitch);
+                    args.look_given = true;
+                }
                 _ => bail!("--look takes YAW,PITCH"),
             },
             "--distance" => args.distance = value()?.parse()?,
@@ -83,12 +100,12 @@ fn parse_args() -> Result<Args> {
 }
 
 /// Everything the renderer needs, built from the resources and the save, with the chunks
-/// around the start position already loaded.
+/// around the start position already loaded; or, on a server, joined and with no chunks yet.
 struct Scene {
     models: Arc<BlockModels>,
     biomes: Arc<Biomes>,
     registry: Arc<mc_registry::Registry>,
-    world: mc_world::World,
+    source: stream::Source,
     view: WorldView,
 }
 
@@ -101,17 +118,37 @@ fn load_scene(args: &Args) -> Result<Scene> {
         root.display()
     );
     let res = mc_assets::Resources::new(root);
-    let registry = mc_registry::Registry::vanilla()?;
-    let mut world = mc_world::World::open(&args.world);
-    let eye = args.camera.eye;
-    // One chunk more than drawn, so the outermost drawn chunks have neighbours to cull against.
-    let view = WorldView::load(
-        &mut world,
-        &registry,
-        eye.x.floor() as i32,
-        eye.z.floor() as i32,
-        args.distance + 1,
-    )?;
+    let registry = Arc::new(mc_registry::Registry::vanilla()?);
+    let (source, view) = match &args.server {
+        Some(address) => {
+            // One chunk more than drawn, so the outermost drawn chunks have neighbours.
+            let session = mc_protocol::connect(
+                address,
+                &args.name,
+                (args.distance + 1).clamp(2, 32) as u8,
+                registry.clone(),
+            )?;
+            eprintln!("joined {address} as {}", args.name);
+            (
+                stream::Source::Server(session.events),
+                WorldView::empty(&registry),
+            )
+        }
+        None => {
+            let mut world = mc_world::World::open(&args.world);
+            let eye = args.camera.eye;
+            // One chunk more than drawn, so the outermost drawn chunks have neighbours to
+            // cull against.
+            let view = WorldView::load(
+                &mut world,
+                &registry,
+                eye.x.floor() as i32,
+                eye.z.floor() as i32,
+                args.distance + 1,
+            )?;
+            (stream::Source::Save(world), view)
+        }
+    };
     // Player heads' skins go in the atlas, so they're fetched before baking. Heads streamed
     // in later wear the default skin for their UUID.
     let skins = skins::fetch(
@@ -139,8 +176,8 @@ fn load_scene(args: &Args) -> Result<Scene> {
     Ok(Scene {
         models: Arc::new(models),
         biomes: Arc::new(biomes),
-        registry: Arc::new(registry),
-        world,
+        registry,
+        source,
         view,
     })
 }
@@ -180,13 +217,25 @@ fn report_failure(message: &str) {
 }
 
 fn run() -> Result<()> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     let scene = load_scene(&args)?;
     let view = View {
         distance: (args.distance * 16) as f32,
         ticks: args.ticks,
     };
-    match &args.screenshot {
+    match args.screenshot.clone() {
+        Some(path) if args.server.is_some() => {
+            let models = scene.models.clone();
+            let mut streamer = spawn_streamer(scene, &args);
+            let mut renderer = Renderer::headless(&models)?;
+            server_screenshot(&mut args, &mut streamer, &mut renderer)?;
+            let image = renderer.screenshot(args.size.0, args.size.1, &args.camera, &view)?;
+            image
+                .save(&path)
+                .with_context(|| format!("saving {}", path.display()))?;
+            eprintln!("wrote {}", path.display());
+            Ok(())
+        }
         Some(path) => {
             let mut renderer = Renderer::headless(&scene.models)?;
             let started = Instant::now();
@@ -207,7 +256,7 @@ fn run() -> Result<()> {
             eprintln!("meshed {quads} quads in {:.1?}", started.elapsed());
             let image = renderer.screenshot(args.size.0, args.size.1, &args.camera, &view)?;
             image
-                .save(path)
+                .save(&path)
                 .with_context(|| format!("saving {}", path.display()))?;
             eprintln!("wrote {}", path.display());
             Ok(())
@@ -215,17 +264,7 @@ fn run() -> Result<()> {
         None => {
             let event_loop = winit::event_loop::EventLoop::new()?;
             let models = scene.models.clone();
-            let streamer = stream::Streamer::spawn(
-                stream::Sources {
-                    world: scene.world,
-                    view: scene.view,
-                    models: scene.models,
-                    biomes: scene.biomes,
-                    registry: scene.registry,
-                },
-                args.distance,
-                args.camera.eye,
-            );
+            let streamer = spawn_streamer(scene, &args);
             let mut app = App {
                 args,
                 models,
@@ -238,6 +277,67 @@ fn run() -> Result<()> {
             };
             event_loop.run_app(&mut app)?;
             Ok(())
+        }
+    }
+}
+
+fn spawn_streamer(scene: Scene, args: &Args) -> stream::Streamer {
+    stream::Streamer::spawn(
+        stream::Sources {
+            source: scene.source,
+            view: scene.view,
+            models: scene.models,
+            biomes: scene.biomes,
+            registry: scene.registry,
+        },
+        args.distance,
+        args.camera.eye,
+    )
+}
+
+/// Points the camera where the server put the player (unless `--pos`/`--look` say
+/// otherwise), and uploads chunks until none has arrived for a few seconds.
+fn server_screenshot(
+    args: &mut Args,
+    streamer: &mut stream::Streamer,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    const QUIET: std::time::Duration = std::time::Duration::from_secs(3);
+    let deadline = Instant::now() + std::time::Duration::from_secs(120);
+    let (mut placed, mut last_mesh, mut chunks) = (false, Instant::now(), 0);
+    while Instant::now() < deadline && !(placed && last_mesh.elapsed() > QUIET) {
+        for update in streamer.updates() {
+            match update {
+                stream::Update::Mesh(key, mesh) => {
+                    renderer.upload_chunk(key, &mesh);
+                    (last_mesh, chunks) = (Instant::now(), chunks + 1);
+                }
+                stream::Update::Remove(key) => renderer.remove_chunk(key),
+                stream::Update::Teleport(eye, yaw, pitch) => {
+                    args.place(eye, yaw, pitch);
+                    (placed, last_mesh) = (true, Instant::now());
+                }
+                stream::Update::Disconnected(reason) => bail!("disconnected: {reason}"),
+                stream::Update::Idle => {}
+            }
+        }
+        streamer.follow(args.camera.eye);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    anyhow::ensure!(placed, "the server never placed the player");
+    eprintln!("drew {chunks} chunks from the server");
+    Ok(())
+}
+
+impl Args {
+    /// Moves the camera where the server put the player, except what `--pos` and `--look`
+    /// fixed.
+    fn place(&mut self, eye: Vec3, yaw: f32, pitch: f32) {
+        if !self.pos_given {
+            self.camera.eye = eye;
+        }
+        if !self.look_given {
+            (self.camera.yaw, self.camera.pitch) = (yaw, pitch);
         }
     }
 }
@@ -408,6 +508,17 @@ impl winit::application::ApplicationHandler for App {
                     match update {
                         stream::Update::Mesh(key, mesh) => state.renderer.upload_chunk(key, &mesh),
                         stream::Update::Remove(key) => state.renderer.remove_chunk(key),
+                        stream::Update::Teleport(eye, yaw, pitch) => {
+                            self.args.place(eye, yaw, pitch);
+                            // Only the first placement is a choice; later ones are moves.
+                            (self.args.pos_given, self.args.look_given) = (false, false);
+                        }
+                        stream::Update::Disconnected(reason) => {
+                            eprintln!("disconnected: {reason}");
+                            state.window.set_title(&format!(
+                                "minecraft-cardboard 0.0.1 (disconnected: {reason})"
+                            ));
+                        }
                         stream::Update::Idle => {}
                     }
                 }

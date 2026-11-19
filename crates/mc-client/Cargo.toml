@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 mc-assets = { path = "../mc-assets" }
 mc-registry = { path = "../mc-registry" }
 mc-render = { path = "../mc-render" }
+mc-protocol = { path = "../mc-protocol" }
 mc-world = { path = "../mc-world" }
 pollster = "1"
 serde_json.workspace = true

@@ -54,11 +54,12 @@ fn version_info(version: &str) -> Result<Value> {
 }
 
 /// Runs vanilla's data generator on the server jar and copies the reports we use into
-/// `resources/reports/`: every block's properties and state ids, and every registry's
-/// protocol ids. Vanilla defines these in code, so they aren't in the data packs. Needs
+/// `resources/reports/`: every block's properties and state ids, every registry's protocol
+/// ids, and every packet's id in each protocol state. Vanilla defines these in code, so
+/// they aren't in the data packs. `source.json` records the protocol version. Needs
 /// `java` (the version's Java, 25 for 26.3) on PATH, or set JAVA to its path.
 fn gen_reports(version: &str) -> Result<()> {
-    const REPORTS: [&str; 2] = ["blocks.json", "registries.json"];
+    const REPORTS: [&str; 3] = ["blocks.json", "registries.json", "packets.json"];
     let (work, server_sha1) = server_workdir(version, "gen-reports")?;
     let status = java()
         .current_dir(&work)
@@ -81,7 +82,18 @@ fn gen_reports(version: &str) -> Result<()> {
             &std::fs::read(work.join("out/reports").join(name))?,
         )?;
     }
-    let source = serde_json::json!({ "version": version, "server_jar_sha1": server_sha1 });
+    // The jar's version.json holds the protocol version a client sends in its handshake.
+    let jar = std::fs::read(work.join("server.jar"))?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar))?;
+    let version_json: Value = serde_json::from_reader(archive.by_name("version.json")?)?;
+    let protocol = version_json["protocol_version"]
+        .as_u64()
+        .context("version.json has no protocol_version")?;
+    let source = serde_json::json!({
+        "version": version,
+        "server_jar_sha1": server_sha1,
+        "protocol_version": protocol,
+    });
     write(
         &reports.join("source.json"),
         serde_json::to_string_pretty(&source)?.as_bytes(),

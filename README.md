@@ -19,8 +19,9 @@ assets and data, never game code. Keep this repository private: Mojang's EULA do
 redistributing these files.
 
 `resources/reports/` holds what vanilla defines in code rather than data: every block's
-properties and numeric state ids (`blocks.json`) and every registry's protocol ids
-(`registries.json`). They come from vanilla's own data generator, which needs Java 25:
+properties and numeric state ids (`blocks.json`), every registry's protocol ids
+(`registries.json`), and every packet's id (`packets.json`); `source.json` records the
+protocol version. They come from vanilla's own data generator, which needs Java 25:
 
 ```sh
 cargo xtask gen-reports         # set JAVA=/path/to/java if it isn't on PATH
@@ -42,12 +43,22 @@ mouse, WASD to move, Space and Shift for up and down, Ctrl to go faster, Esc to 
 Add `--screenshot out.png` to render one frame to a file instead; it works without a GPU
 through Mesa's lavapipe Vulkan driver.
 
+```sh
+cargo run --release -p mc-client -- --server localhost:25565 --name cardboard
+```
+
+Joins a vanilla 26.3 server instead, and draws the chunks it sends; the camera starts where
+the server puts the player. Only offline-mode servers (`online-mode=false`) work so far.
+The camera flies freely and doesn't send movement to the server yet.
+
 ## Crates
 
 - `mc-assets`: blockstates, block models (parents merged), choosing a state's models
 - `mc-nbt`: NBT read/write, file and network forms
 - `mc-registry`: blocks, block states and items with vanilla's ids
 - `mc-world`: saves: region files, chunks, block states, biomes, light
+- `mc-protocol`: the network protocol: framing, compression, login, configuration, and the
+  play packets for joining and receiving chunks
 - `mc-render`: texture atlas, model baking, chunk meshing with smooth lighting, wgpu renderer
 - `mc-client`: the `minecraft-cardboard` binary
 

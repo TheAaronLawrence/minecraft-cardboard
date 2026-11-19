@@ -20,6 +20,8 @@ pub struct Registry {
     /// Indexed by item id.
     items: Vec<String>,
     item_ids: HashMap<String, u32>,
+    /// Indexed by block entity type id.
+    block_entity_types: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -160,10 +162,10 @@ impl Registry {
         }
 
         let item_ids = protocol_ids(&registries, "minecraft:item")?;
-        let mut items = vec![String::new(); item_ids.len()];
-        for (name, &id) in &item_ids {
-            items[id as usize].clone_from(name);
-        }
+        let items = names_by_id(&item_ids);
+
+        let block_entity_types =
+            names_by_id(&protocol_ids(&registries, "minecraft:block_entity_type")?);
 
         Ok(Self {
             block_ids,
@@ -171,6 +173,7 @@ impl Registry {
             state_blocks,
             items,
             item_ids,
+            block_entity_types,
         })
     }
 
@@ -210,12 +213,26 @@ impl Registry {
         self.items.get(id as usize).map(String::as_str)
     }
 
+    /// A block entity type's name, such as `minecraft:chest`, from its protocol id.
+    pub fn block_entity_type(&self, id: u32) -> Option<&str> {
+        self.block_entity_types.get(id as usize).map(String::as_str)
+    }
+
     pub fn item_count(&self) -> u32 {
         self.items.len() as u32
     }
 }
 
 /// Names to ids for one registry, checked to run 0..N with no gaps or repeats.
+/// Names indexed by id, from a registry's name-to-id map.
+fn names_by_id(ids: &HashMap<String, u32>) -> Vec<String> {
+    let mut names = vec![String::new(); ids.len()];
+    for (name, &id) in ids {
+        names[id as usize].clone_from(name);
+    }
+    names
+}
+
 fn protocol_ids(
     registries: &HashMap<String, RegistryReport>,
     registry: &str,

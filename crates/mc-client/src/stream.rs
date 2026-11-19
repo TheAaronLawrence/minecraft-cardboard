@@ -1,7 +1,8 @@
-//! Chunk streaming: a background thread owns the save, loads the chunks around the camera
-//! nearest first, meshes each once its eight neighbours are loaded (so culling, light and
-//! biome blending see across its edges), and drops chunks the camera has left behind.
-//! The render thread uploads what it sends.
+//! Chunk streaming: a background thread owns the chunks' source, loads the chunks around the
+//! camera nearest first, meshes each once its eight neighbours are loaded (so culling, light
+//! and biome blending see across its edges), and drops chunks the camera has left behind.
+//! The render thread uploads what it sends. From a save the thread reads chunks itself; from
+//! a server they arrive as the server sends them.
 
 use glam::Vec3;
 use mc_registry::Registry;
@@ -19,6 +20,16 @@ pub enum Update {
     Remove((i32, i32)),
     /// Everything in range is loaded and meshed; the thread waits for the camera to move.
     Idle,
+    /// The server placed the player: eye position, yaw and pitch.
+    Teleport(Vec3, f32, f32),
+    /// The server connection ended, for this reason.
+    Disconnected(String),
+}
+
+/// Where chunks come from.
+pub enum Source {
+    Save(mc_world::World),
+    Server(Receiver<mc_protocol::Event>),
 }
 
 pub struct Streamer {
@@ -37,7 +48,7 @@ pub fn chunk_of(p: Vec3) -> (i32, i32) {
 
 /// What the streaming thread works with. `view` may already hold chunks.
 pub struct Sources {
-    pub world: mc_world::World,
+    pub source: Source,
     pub view: WorldView,
     pub models: Arc<BlockModels>,
     pub biomes: Arc<Biomes>,
@@ -84,7 +95,7 @@ fn work(
     tx: &Sender<Update>,
 ) {
     let Sources {
-        mut world,
+        mut source,
         mut view,
         models,
         biomes,
@@ -95,7 +106,16 @@ fn work(
     let mut missing: HashSet<(i32, i32)> = HashSet::new();
     // Chunks meshed (or found unmeshable) and not removed since.
     let mut meshed: HashSet<(i32, i32)> = HashSet::new();
+    let mut idle = false;
     loop {
+        if let Source::Server(events) = &source {
+            for event in events.try_iter() {
+                idle = false;
+                if !receive(event, &mut view, &mut meshed, tx) {
+                    return;
+                }
+            }
+        }
         loop {
             match eye_rx.try_recv() {
                 Ok(e) => eye = e,
@@ -135,12 +155,14 @@ fn work(
                 .flat_map(move |x| (center.1 - r..=center.1 + r).map(move |z| (x, z)))
         };
         let known = |k: (i32, i32)| view.contains(k.0, k.1) || missing.contains(&k);
+        // A server sends the chunks; only a save is read here.
+        let reads = matches!(source, Source::Save(_));
         let to_mesh = around(distance)
             .filter(|&k| !meshed.contains(&k) && view.contains(k.0, k.1))
             .filter(|&(x, z)| (-1..=1).all(|dx| (-1..=1).all(|dz| known((x + dx, z + dz)))))
             .min_by_key(|&k| square(k));
         let to_load = around(distance + 1)
-            .filter(|&k| !known(k))
+            .filter(|&k| reads && !known(k))
             .min_by_key(|&k| square(k));
 
         // Whichever is nearer, meshing on a tie.
@@ -150,6 +172,7 @@ fn work(
         };
         match (to_mesh.filter(|_| mesh_first), to_load) {
             (Some(key), _) => {
+                idle = false;
                 meshed.insert(key);
                 // A chunk beside one the save never had can't be meshed; it stays blank.
                 if let Some(mut mesh) = mesher.mesh_chunk(&view, key.0, key.1) {
@@ -159,27 +182,87 @@ fn work(
                     }
                 }
             }
-            (_, Some((x, z))) => match world.chunk(&registry, x, z) {
-                Ok(Some(chunk)) => view.insert(chunk),
-                Ok(None) => {
-                    missing.insert((x, z));
-                }
-                Err(e) => {
-                    eprintln!("chunk {x}, {z}: {e:#}");
-                    missing.insert((x, z));
-                }
+            (_, Some((x, z))) => match &mut source {
+                Source::Save(world) => match world.chunk(&registry, x, z) {
+                    Ok(Some(chunk)) => view.insert(chunk),
+                    Ok(None) => {
+                        missing.insert((x, z));
+                    }
+                    Err(e) => {
+                        eprintln!("chunk {x}, {z}: {e:#}");
+                        missing.insert((x, z));
+                    }
+                },
+                Source::Server(_) => unreachable!("server chunks aren't read"),
             },
             (None, None) => {
-                if tx.send(Update::Idle).is_err() {
-                    return;
+                if !idle {
+                    idle = true;
+                    if tx.send(Update::Idle).is_err() {
+                        return;
+                    }
                 }
-                match eye_rx.recv() {
-                    Ok(e) => eye = e,
-                    Err(_) => return,
+                match &source {
+                    Source::Save(_) => match eye_rx.recv() {
+                        Ok(e) => eye = e,
+                        Err(_) => return,
+                    },
+                    // Wait for the server's next packet or the camera, whichever comes.
+                    Source::Server(events) => {
+                        match events.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok(event) => {
+                                idle = false;
+                                if !receive(event, &mut view, &mut meshed, tx) {
+                                    return;
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                // The connection is over; keep drawing what we have.
+                                source = Source::Server(std::sync::mpsc::channel().1);
+                                match eye_rx.recv() {
+                                    Ok(e) => eye = e,
+                                    Err(_) => return,
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Applies one server event; false once the renderer has gone.
+fn receive(
+    event: mc_protocol::Event,
+    view: &mut WorldView,
+    meshed: &mut HashSet<(i32, i32)>,
+    tx: &Sender<Update>,
+) -> bool {
+    use mc_protocol::Event;
+    let update = match event {
+        Event::Chunk(chunk) => {
+            // A chunk sent again replaces the old one and is meshed afresh.
+            meshed.remove(&(chunk.x, chunk.z));
+            view.insert(chunk);
+            return true;
+        }
+        Event::Forget(x, z) => {
+            view.remove(x, z);
+            if !meshed.remove(&(x, z)) {
+                return true;
+            }
+            Update::Remove((x, z))
+        }
+        Event::Position { pos, yaw, pitch } => {
+            let [x, y, z] = pos.map(|c| c as f32);
+            // Vanilla's standing eye height.
+            Update::Teleport(Vec3::new(x, y + 1.62, z), yaw, pitch)
+        }
+        Event::Disconnected(reason) => Update::Disconnected(reason),
+    };
+    tx.send(update).is_ok()
 }
 
 #[cfg(test)]
@@ -203,6 +286,7 @@ mod tests {
                     assert!(drawn.remove(&key), "removed {key:?}, which wasn't drawn");
                 }
                 Update::Idle => return,
+                Update::Teleport(..) | Update::Disconnected(_) => {}
             }
         }
     }
@@ -223,7 +307,9 @@ mod tests {
         let models = Arc::new(BlockModels::bake(&res, &registry, &[]).unwrap());
         let biomes = Arc::new(Biomes::load(&res, Vec::<String>::new()).unwrap());
         let sources = Sources {
-            world: mc_world::World::open(mc_assets::locate("fixtures/worlds/test-world")),
+            source: Source::Save(mc_world::World::open(mc_assets::locate(
+                "fixtures/worlds/test-world",
+            ))),
             view: WorldView::empty(&registry),
             models,
             biomes,

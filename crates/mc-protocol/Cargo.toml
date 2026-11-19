@@ -1,0 +1,15 @@
+[package]
+name = "mc-protocol"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+flate2 = "1"
+mc-assets = { path = "../mc-assets" }
+mc-nbt = { path = "../mc-nbt" }
+mc-registry = { path = "../mc-registry" }
+mc-world = { path = "../mc-world" }
+md-5 = "0.10"
+serde_json.workspace = true

@@ -146,6 +146,17 @@ pub fn from_network_bytes(bytes: &[u8]) -> Result<Tag> {
     Ok(tag)
 }
 
+/// Reads a network root at the start of `bytes`, as packets embed it, and how many bytes it
+/// took. A lone end tag (0) is how packets write "no tag", read as `None`.
+pub fn read_network(bytes: &[u8]) -> Result<(Option<Tag>, usize)> {
+    let mut r = Reader { bytes, depth: 0 };
+    let tag = match r.u8()? {
+        0 => None,
+        id => Some(r.payload(id)?),
+    };
+    Ok((tag, bytes.len() - r.bytes.len()))
+}
+
 pub fn to_bytes(name: &str, root: &Compound) -> Vec<u8> {
     let mut out = vec![10];
     write_string(&mut out, name);
