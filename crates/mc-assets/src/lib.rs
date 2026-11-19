@@ -1,0 +1,258 @@
+//! Reads the vanilla resources committed under `resources/`: blockstates, block models
+//! (with their parent chains flattened) and texture files.
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// The purple and black sprite the game draws in code; it has no texture file.
+pub const MISSING_SPRITE: &str = "minecraft:missingno";
+
+/// The `resources/` folder at the repository root.
+pub fn default_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources")
+}
+
+pub struct Resources {
+    root: PathBuf,
+}
+
+impl Resources {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// `kind` is the folder under `assets/<namespace>/`, such as `models` or `textures`.
+    pub fn asset_path(&self, kind: &str, id: &str, extension: &str) -> PathBuf {
+        let (namespace, path) = split_id(id);
+        self.root
+            .join("assets")
+            .join(namespace)
+            .join(kind)
+            .join(format!("{path}.{extension}"))
+    }
+
+    /// Names of every block with a blockstate file, such as `oak_log`.
+    pub fn block_names(&self) -> Result<Vec<String>> {
+        let dir = self.root.join("assets/minecraft/blockstates");
+        let mut names = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .map(|e| {
+                Ok(e?
+                    .path()
+                    .file_stem()
+                    .context("no file name")?
+                    .to_string_lossy()
+                    .into_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    pub fn blockstate(&self, id: &str) -> Result<BlockState> {
+        read_json(&self.asset_path("blockstates", id, "json"))
+    }
+
+    /// Loads a model and merges its parents into it: the child's textures override the
+    /// parent's, and the elements come from the nearest model that defines any.
+    pub fn model(&self, id: &str) -> Result<Model> {
+        let mut model = Model {
+            textures: HashMap::new(),
+            elements: None,
+            ambient_occlusion: None,
+            generated: false,
+        };
+        let mut next = Some(id.to_owned());
+        let mut depth = 0;
+        while let Some(id) = next.take() {
+            if id == "builtin/generated" {
+                model.generated = true;
+                break;
+            }
+            depth += 1;
+            anyhow::ensure!(
+                depth <= 32,
+                "model parent chain of {id} is too deep or circular"
+            );
+            let raw: RawModel = read_json(&self.asset_path("models", &id, "json"))
+                .with_context(|| format!("loading model {id}"))?;
+            for (key, value) in raw.textures {
+                model.textures.entry(key).or_insert(value);
+            }
+            if model.elements.is_none() {
+                model.elements = raw.elements;
+            }
+            model.ambient_occlusion = model.ambient_occlusion.or(raw.ambientocclusion);
+            next = raw.parent;
+        }
+        Ok(model)
+    }
+}
+
+/// `minecraft:block/stone` and `block/stone` both mean namespace `minecraft`, path `block/stone`.
+pub fn split_id(id: &str) -> (&str, &str) {
+    id.split_once(':').unwrap_or(("minecraft", id))
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockState {
+    /// Property string such as `axis=x,lit=true` (empty for blocks with one state) to its variants.
+    Variants(HashMap<String, Variants>),
+    Multipart(Vec<MultipartCase>),
+}
+
+impl BlockState {
+    pub fn all_variants(&self) -> Vec<&Variant> {
+        match self {
+            BlockState::Variants(map) => map.values().flat_map(Variants::as_slice).collect(),
+            BlockState::Multipart(cases) => cases.iter().flat_map(|c| c.apply.as_slice()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MultipartCase {
+    /// Kept raw for now: an object of property conditions, possibly nested in `OR`/`AND`.
+    #[serde(default)]
+    pub when: Option<serde_json::Value>,
+    pub apply: Variants,
+}
+
+/// One variant, or a weighted list the game picks from at random by position.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Variants {
+    One(Variant),
+    Weighted(Vec<Variant>),
+}
+
+impl Variants {
+    pub fn as_slice(&self) -> &[Variant] {
+        match self {
+            Variants::One(v) => std::slice::from_ref(v),
+            Variants::Weighted(list) => list,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Variant {
+    pub model: String,
+    #[serde(default)]
+    pub x: i32,
+    #[serde(default)]
+    pub y: i32,
+    #[serde(default)]
+    pub uvlock: bool,
+    #[serde(default = "one")]
+    pub weight: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+#[derive(Deserialize)]
+struct RawModel {
+    parent: Option<String>,
+    #[serde(default)]
+    textures: HashMap<String, TextureRef>,
+    elements: Option<Vec<Element>>,
+    ambientocclusion: Option<bool>,
+}
+
+/// A model with its parent chain merged in.
+#[derive(Debug)]
+pub struct Model {
+    /// Texture variables, such as `side`, to a sprite or to another variable (`#end`).
+    pub textures: HashMap<String, TextureRef>,
+    /// `None` for models drawn by code (chests, signs) or generated from a sprite (items).
+    pub elements: Option<Vec<Element>>,
+    pub ambient_occlusion: Option<bool>,
+    /// Extruded from its `layer0`, `layer1`… sprites, like most item models.
+    pub generated: bool,
+}
+
+impl Model {
+    /// Resolves a texture slot, such as a face's `texture`, to a sprite id such as
+    /// `minecraft:block/oak_log`. Like vanilla, the slot's leading `#` is optional
+    /// (`heavy_core` writes `"all"`), and slot values starting with `#` point at other slots.
+    pub fn sprite(&self, slot: &str) -> Option<&str> {
+        let mut slot = slot.strip_prefix('#').unwrap_or(slot);
+        for _ in 0..=self.textures.len() {
+            let value = self.textures.get(slot)?.sprite();
+            match value.strip_prefix('#') {
+                Some(next) => slot = next,
+                None => return Some(value),
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TextureRef {
+    Plain(String),
+    Detailed {
+        sprite: String,
+        #[serde(default)]
+        force_translucent: bool,
+    },
+}
+
+impl TextureRef {
+    pub fn sprite(&self) -> &str {
+        match self {
+            TextureRef::Plain(s) | TextureRef::Detailed { sprite: s, .. } => s,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Element {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub rotation: Option<serde_json::Value>,
+    #[serde(default = "yes")]
+    pub shade: bool,
+    pub faces: HashMap<Direction, Face>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    Down,
+    Up,
+    North,
+    South,
+    West,
+    East,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Face {
+    pub texture: String,
+    pub uv: Option<[f32; 4]>,
+    pub cullface: Option<Direction>,
+    #[serde(default)]
+    pub rotation: i32,
+    #[serde(default = "no_tint")]
+    pub tintindex: i32,
+}
+
+fn no_tint() -> i32 {
+    -1
+}

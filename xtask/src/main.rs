@@ -1,0 +1,147 @@
+//! Project tasks. `cargo xtask fetch-assets [version]` copies Mojang's assets for a
+//! vanilla Java Edition version into `resources/`, which is committed to the repo.
+
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::Value;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The vanilla version our data, protocol and saves match.
+const DEFAULT_VERSION: &str = "26.3";
+const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+const OBJECTS_URL: &str = "https://resources.download.minecraft.net";
+const DOWNLOAD_THREADS: usize = 16;
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("fetch-assets") => fetch_assets(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
+        _ => bail!("usage: cargo xtask fetch-assets [version]"),
+    }
+}
+
+fn fetch_assets(version: &str) -> Result<()> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources");
+    let manifest: Value = serde_json::from_slice(&get(MANIFEST_URL)?)?;
+    let entry = manifest["versions"]
+        .as_array()
+        .context("manifest has no versions")?
+        .iter()
+        .find(|v| v["id"] == version)
+        .with_context(|| format!("version {version} not in the manifest"))?;
+    let version_json = get_verified(str_at(entry, "url")?, str_at(entry, "sha1")?)?;
+    let version_info: Value = serde_json::from_slice(&version_json)?;
+
+    // Start from an empty tree so files removed upstream don't linger.
+    for dir in ["assets", "data"] {
+        let path = root.join(dir);
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+    }
+
+    // Sounds, languages, fonts and icons come from the asset index. Written first, so
+    // anything the client jar also ships (such as en_us.json) ends up as the jar's copy.
+    let index_ref = &version_info["assetIndex"];
+    let index: Value = serde_json::from_slice(&get_verified(
+        str_at(index_ref, "url")?,
+        str_at(index_ref, "sha1")?,
+    )?)?;
+    let objects: Vec<(String, String)> = index["objects"]
+        .as_object()
+        .context("asset index has no objects")?
+        .iter()
+        .filter(|(key, _)| key.contains('/'))
+        .map(|(key, obj)| Ok((key.clone(), str_at(obj, "hash")?.to_owned())))
+        .collect::<Result<_>>()?;
+    download_objects(&root.join("assets"), &objects)?;
+
+    // Textures, models, blockstates, shaders and data packs come from the client jar.
+    // Only `assets/` and `data/` are copied; the game's code is not.
+    let client = &version_info["downloads"]["client"];
+    let jar = get_verified(str_at(client, "url")?, str_at(client, "sha1")?)?;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar))?;
+    let mut jar_files = 0;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let Some(name) = file.enclosed_name() else {
+            continue;
+        };
+        if file.is_dir() || !(name.starts_with("assets") || name.starts_with("data")) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        write(&root.join(name), &bytes)?;
+        jar_files += 1;
+    }
+
+    let source = serde_json::json!({
+        "version": version,
+        "client_jar_sha1": str_at(client, "sha1")?,
+        "asset_index": str_at(index_ref, "id")?,
+        "asset_index_sha1": str_at(index_ref, "sha1")?,
+    });
+    write(
+        &root.join("source.json"),
+        serde_json::to_string_pretty(&source)?.as_bytes(),
+    )?;
+    println!(
+        "resources/: {jar_files} files from the client jar, {} from the asset index",
+        objects.len()
+    );
+    Ok(())
+}
+
+fn download_objects(assets: &Path, objects: &[(String, String)]) -> Result<()> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..DOWNLOAD_THREADS)
+            .map(|_| {
+                scope.spawn(|| -> Result<()> {
+                    while let Some((key, hash)) = objects.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        let bytes =
+                            get_verified(&format!("{OBJECTS_URL}/{}/{hash}", &hash[..2]), hash)
+                                .with_context(|| format!("downloading {key}"))?;
+                        write(&assets.join(key), &bytes)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .try_for_each(|w| w.join().expect("download thread panicked"))
+    })
+}
+
+fn get(url: &str) -> Result<Vec<u8>> {
+    let mut response = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
+    Ok(response
+        .body_mut()
+        .with_config()
+        .limit(u64::MAX)
+        .read_to_vec()?)
+}
+
+fn get_verified(url: &str, sha1: &str) -> Result<Vec<u8>> {
+    let bytes = get(url)?;
+    let actual = sha1_smol::Sha1::from(&bytes).digest().to_string();
+    ensure!(actual == sha1, "{url}: sha1 {actual}, expected {sha1}");
+    Ok(bytes)
+}
+
+fn write(path: &PathBuf, bytes: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(path.parent().expect("file path has a parent"))?;
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+fn str_at<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value[key]
+        .as_str()
+        .with_context(|| format!("missing string field {key}"))
+}
