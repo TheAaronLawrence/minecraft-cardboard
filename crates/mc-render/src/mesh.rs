@@ -2,7 +2,10 @@
 //! biome tints, and simple water and lava.
 
 use crate::atlas::Layer;
-use crate::bake::{self, BlockModels, Dir, JavaRandom, LAVA_SPRITE, Quad, WATER_SPRITE};
+use crate::bake::{
+    self, BlockModels, Dir, JavaRandom, LAVA_FLOW_SPRITE, LAVA_SPRITE, Quad, WATER_FLOW_SPRITE,
+    WATER_SPRITE,
+};
 use crate::tint::{Biomes, Tint, block_tint};
 use glam::Vec3;
 use mc_registry::Registry;
@@ -427,8 +430,10 @@ impl<'a> Mesher<'a> {
         (brightness, (blend(|l| l.0), blend(|l| l.1)))
     }
 
-    /// Water and lava are drawn by code in vanilla, not by models: a box whose top sits at
-    /// the fluid's height, with faces only where they touch something else.
+    /// Water and lava are drawn by code in vanilla (`LiquidBlockRenderer`), not by models.
+    /// Each top corner sits at a weighted average of the fluid heights around it, the top
+    /// uses the flowing texture turned to the direction the fluid flows, and faces are only
+    /// drawn where they touch something other than the same fluid.
     fn mesh_fluid(
         &self,
         view: &WorldView,
@@ -436,60 +441,257 @@ impl<'a> Mesher<'a> {
         (fluid, level): (Fluid, u8),
         [x, y, z]: [i32; 3],
     ) {
-        let fluid_at = |x, y, z| self.infos[view.state(x, y, z) as usize].fluid.map(|f| f.0);
-        let above = fluid_at(x, y + 1, z) == Some(fluid);
-        let height = if above || level >= 8 {
-            1.0
-        } else {
-            (8 - level.min(7)) as f32 / 9.0
+        let info = |x, y, z| self.infos[view.state(x, y, z) as usize];
+        let same = |x, y, z| info(x, y, z).fluid.is_some_and(|f| f.0 == fluid);
+        let own = |x, y, z| {
+            info(x, y, z)
+                .fluid
+                .filter(|f| f.0 == fluid)
+                .map(|f| own_height(f.1))
         };
-        let (sprite, layer, tint) = match fluid {
+        // Vanilla's `getHeight`: 1 under more of the same fluid, the fluid's own height,
+        // 0 for open space, -1 for a solid block. (Vanilla's "solid" is a per-block flag;
+        // here anything that isn't air, fluid or a plant counts.)
+        let height = |x, y, z| -> f32 {
+            if let Some(h) = own(x, y, z) {
+                return if same(x, y + 1, z) { 1.0 } else { h };
+            }
+            let i = info(x, y, z);
+            if i.air || i.offset { 0.0 } else { -1.0 }
+        };
+        let above = same(x, y + 1, z);
+        let corner = |dx: i32, dz: i32| {
+            if above {
+                return 1.0;
+            }
+            average_height(
+                height(x, y, z),
+                height(x + dx, y, z),
+                height(x, y, z + dz),
+                || height(x + dx, y, z + dz),
+            )
+        };
+        // Indexed [x][z], x and z each 0 (west, north) or 1 (east, south).
+        let heights = [
+            [corner(-1, -1), corner(-1, 1)],
+            [corner(1, -1), corner(1, 1)],
+        ];
+
+        let (still, flowing, layer, tint) = match fluid {
             Fluid::Water => (
                 WATER_SPRITE,
+                WATER_FLOW_SPRITE,
                 Layer::Translucent,
                 self.blended_tint(view, Tint::Water, x, y, z),
             ),
-            Fluid::Lava => (LAVA_SPRITE, Layer::Opaque, [1.0; 3]),
+            Fluid::Lava => (LAVA_SPRITE, LAVA_FLOW_SPRITE, Layer::Opaque, [1.0; 3]),
         };
-        let sprite = self.models.atlas.sprite(sprite);
-        let [u0, v0, u1, v1] = sprite.rect;
-        let max = Vec3::new(1.0, height, 1.0);
-        for dir in Dir::ALL {
-            let [dx, dy, dz] = dir.offset();
-            let (nx, ny, nz) = (x + dx, y + dy, z + dz);
-            if fluid_at(nx, ny, nz) == Some(fluid)
-                || (dir != Dir::Up && self.occludes(view.state(nx, ny, nz)))
-            {
-                continue;
-            }
-            let pos = bake::corners(dir, Vec3::ZERO, max);
-            // Side faces only show the part of the texture the water covers.
-            let side_v1 = v0
-                + (v1 - v0)
-                    * if matches!(dir, Dir::Up | Dir::Down) {
-                        1.0
-                    } else {
-                        height
-                    };
-            let quad = Quad {
-                pos,
-                uv: [[u0, v0], [u0, side_v1], [u1, side_v1], [u1, v0]],
-                dir,
-                cull: None,
-                tint: 0,
-                shade: true,
-                layer,
-                on_face: dir != Dir::Up || height >= 1.0,
+        let (still, flowing) = (
+            self.models.atlas.sprite(still).rect,
+            self.models.atlas.sprite(flowing).rect,
+        );
+        let at = |rect: [f32; 4], u: f32, v: f32| {
+            [
+                rect[0] + (rect[2] - rect[0]) * u,
+                rect[1] + (rect[3] - rect[1]) * v,
+            ]
+        };
+        // Vanilla takes the brighter of each light at the fluid and the block above it.
+        let light_at = |x, y, z, with_above: bool| {
+            let (s, b) = view.light(x, y, z);
+            let (sa, ba) = if with_above {
+                view.light(x, y + 1, z)
+            } else {
+                (0, 0)
             };
-            self.emit_quad(
-                view,
-                mesh,
-                &quad,
-                Vec3::new(x as f32, y as f32, z as f32),
-                [x, y, z],
-                tint,
-                false,
+            [s.max(sa) * 16, b.max(ba) * 16, 0, 0]
+        };
+        let origin = Vec3::new(x as f32, y as f32, z as f32);
+        let out = mesh.layer(layer);
+        let mut emit =
+            |dir: Dir, pos: [Vec3; 4], uv: [[f32; 2]; 4], light: [u8; 4], both_sides: bool| {
+                let shade = dir.shade();
+                let color = tint.map(|c| (c * shade * 255.0).round().clamp(0.0, 255.0) as u8);
+                let vertex = |i: usize| Vertex {
+                    pos: (origin + pos[i]).into(),
+                    uv: uv[i],
+                    color: [color[0], color[1], color[2], 255],
+                    light,
+                };
+                out.extend((0..4).map(vertex));
+                if both_sides {
+                    out.extend([0, 3, 2, 1].map(vertex));
+                }
+            };
+
+        if !above {
+            let mut pos = bake::corners(Dir::Up, Vec3::ZERO, Vec3::ONE);
+            for p in &mut pos {
+                p.y = heights[p.x as usize][p.z as usize];
+            }
+            let flow = self.flow(view, fluid, own_height(level), [x, y, z]);
+            let uv = if flow == [0.0, 0.0] {
+                [
+                    at(still, 0.0, 0.0),
+                    at(still, 0.0, 1.0),
+                    at(still, 1.0, 1.0),
+                    at(still, 1.0, 0.0),
+                ]
+            } else {
+                // Half the flowing texture, turned to face downstream.
+                let angle = flow[1].atan2(flow[0]) - std::f32::consts::FRAC_PI_2;
+                let (s, c) = (angle.sin() * 0.25, angle.cos() * 0.25);
+                [
+                    at(flowing, 0.5 + (-c - s), 0.5 + (-c + s)),
+                    at(flowing, 0.5 + (-c + s), 0.5 + (c + s)),
+                    at(flowing, 0.5 + (c + s), 0.5 + (c - s)),
+                    at(flowing, 0.5 + (c - s), 0.5 + (-c - s)),
+                ]
+            };
+            // Seen from below too, so the surface shows from underwater.
+            emit(
+                Dir::Up,
+                pos,
+                uv,
+                light_at(x, y, z, true),
+                fluid == Fluid::Water,
             );
         }
+        if !same(x, y - 1, z) && !self.occludes(view.state(x, y - 1, z)) {
+            let pos =
+                bake::corners(Dir::Down, Vec3::ZERO, Vec3::ONE).map(|p| Vec3::new(p.x, 0.0, p.z));
+            let uv = [
+                at(still, 0.0, 1.0),
+                at(still, 0.0, 0.0),
+                at(still, 1.0, 0.0),
+                at(still, 1.0, 1.0),
+            ];
+            emit(Dir::Down, pos, uv, light_at(x, y - 1, z, false), false);
+        }
+        for dir in [Dir::North, Dir::South, Dir::West, Dir::East] {
+            let [dx, _, dz] = dir.offset();
+            if same(x + dx, y, z + dz) || self.occludes(view.state(x + dx, y, z + dz)) {
+                continue;
+            }
+            // Top corners at the fluid's height there; the texture is the top-left quarter
+            // of the flowing texture, cut off where the fluid ends.
+            let mut pos = bake::corners(dir, Vec3::ZERO, Vec3::ONE);
+            let mut uv = [[0.0; 2]; 4];
+            for (i, p) in pos.iter_mut().enumerate() {
+                let v = if p.y > 0.5 {
+                    p.y = heights[p.x as usize][p.z as usize];
+                    (1.0 - p.y) * 0.5
+                } else {
+                    0.5
+                };
+                uv[i] = at(flowing, if i < 2 { 0.0 } else { 0.5 }, v);
+            }
+            emit(
+                dir,
+                pos,
+                uv,
+                light_at(x + dx, y, z + dz, false),
+                fluid == Fluid::Water,
+            );
+        }
+    }
+
+    /// `FlowingFluid.getFlow`: which way the fluid runs, toward lower neighbours and over
+    /// edges. Zero for still fluid, which draws the still texture.
+    fn flow(&self, view: &WorldView, fluid: Fluid, own: f32, [x, y, z]: [i32; 3]) -> [f32; 2] {
+        let neighbour = |x, y, z| {
+            let info = self.infos[view.state(x, y, z) as usize];
+            match info.fluid {
+                Some((f, level)) if f == fluid => Some(own_height(level)),
+                Some(_) => None,
+                // Fluid flows toward empty space as if it held fluid of height 0.
+                None => Some(0.0),
+            }
+        };
+        let mut flow = [0.0f32; 2];
+        for dir in [Dir::North, Dir::South, Dir::West, Dir::East] {
+            let [dx, _, dz] = dir.offset();
+            let Some(h) = neighbour(x + dx, y, z + dz) else {
+                continue;
+            };
+            let diff = if h == 0.0 {
+                let open = self.infos[view.state(x + dx, y, z + dz) as usize].air;
+                match neighbour(x + dx, y - 1, z + dz) {
+                    Some(below) if open && below > 0.0 => own - (below - 8.0 / 9.0),
+                    _ => 0.0,
+                }
+            } else {
+                own - h
+            };
+            flow[0] += dx as f32 * diff;
+            flow[1] += dz as f32 * diff;
+        }
+        flow
+    }
+}
+
+/// A fluid's own height in a block: amount / 9, where a source or falling fluid holds 8.
+fn own_height(level: u8) -> f32 {
+    let amount = if level == 0 || level >= 8 {
+        8
+    } else {
+        8 - level
+    };
+    amount as f32 / 9.0
+}
+
+/// `LiquidBlockRenderer.calculateAverageHeight` for one top corner: the fluid's height and
+/// its two edge neighbours' (and the diagonal's, when an edge neighbour holds fluid),
+/// where heights of at least 0.8 count ten times and solid blocks (-1) don't count.
+fn average_height(center: f32, side1: f32, side2: f32, diagonal: impl Fn() -> f32) -> f32 {
+    if side1 >= 1.0 || side2 >= 1.0 {
+        return 1.0;
+    }
+    let (mut sum, mut weight) = (0.0, 0.0);
+    let mut add = |h: f32| {
+        if h >= 0.8 {
+            (sum, weight) = (sum + h * 10.0, weight + 10.0);
+        } else if h >= 0.0 {
+            (sum, weight) = (sum + h, weight + 1.0);
+        }
+    };
+    if side1 > 0.0 || side2 > 0.0 {
+        let d = diagonal();
+        if d >= 1.0 {
+            return 1.0;
+        }
+        add(d);
+    }
+    add(center);
+    add(side1);
+    add(side2);
+    sum / weight
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{average_height, own_height};
+
+    /// Expected values worked by hand from vanilla's weighting.
+    #[test]
+    fn corner_heights_weight_tall_fluid_tenfold() {
+        let source = own_height(0);
+        assert_eq!(source, 8.0 / 9.0);
+        assert_eq!(own_height(3), 5.0 / 9.0);
+        assert_eq!(
+            own_height(8),
+            8.0 / 9.0,
+            "falling fluid holds a full amount"
+        );
+        // A source next to level-3 water and air, with air diagonally: (8.889 + 5/9 + 0 + 0) / 13.
+        let h = average_height(source, own_height(3), 0.0, || 0.0);
+        assert!((h - (80.0 / 9.0 + 5.0 / 9.0) / 13.0).abs() < 1e-6, "{h}");
+        // Against solid blocks only the fluid itself counts.
+        assert_eq!(
+            average_height(own_height(3), -1.0, -1.0, || panic!("no diagonal")),
+            5.0 / 9.0
+        );
+        // Fluid above a neighbour makes the corner full.
+        assert_eq!(average_height(source, 1.0, 0.0, || 0.0), 1.0);
     }
 }

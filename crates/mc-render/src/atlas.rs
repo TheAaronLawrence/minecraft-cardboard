@@ -17,10 +17,14 @@ pub enum Layer {
 pub struct Atlas {
     pub width: u32,
     pub height: u32,
-    /// RGBA, row by row.
-    pub pixels: Vec<u8>,
+    /// RGBA, row by row: the full-size atlas, then each mipmap level at half the size of
+    /// the one before.
+    pub levels: Vec<Vec<u8>>,
     sprites: HashMap<String, Sprite>,
 }
+
+/// Vanilla's default "Mipmap Levels" option.
+pub const MIP_LEVELS: u32 = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Sprite {
@@ -56,36 +60,48 @@ impl Atlas {
             images.push((id, image.unwrap_or_else(missing_texture)));
         }
 
-        // Shelf packing, tallest first. Block sprites are mostly 16×16.
+        // Shelf packing, tallest first. Slots are whole multiples of 16 pixels, so every
+        // sprite starts on a boundary that stays a whole pixel in each mipmap level.
         images.sort_by_key(|(_, img)| std::cmp::Reverse((img.height(), img.width())));
         const WIDTH: u32 = 2048;
+        let slot = |n: u32| n.next_multiple_of(1 << MIP_LEVELS);
         let (mut x, mut y, mut shelf) = (0, 0, 0);
         let mut placed = Vec::with_capacity(images.len());
         for (id, img) in images {
-            if x + img.width() > WIDTH {
+            if x + slot(img.width()) > WIDTH {
                 (x, y, shelf) = (0, y + shelf, 0);
             }
+            shelf = shelf.max(slot(img.height()));
+            let next = x + slot(img.width());
             placed.push((id, img, x, y));
-            shelf = shelf.max(placed.last().unwrap().1.height());
-            x += placed.last().unwrap().1.width();
+            x = next;
         }
         let height = (y + shelf).next_power_of_two();
 
-        let mut pixels = vec![0u8; (WIDTH * height * 4) as usize];
+        let mut levels: Vec<Vec<u8>> = (0..=MIP_LEVELS)
+            .map(|l| vec![0u8; ((WIDTH >> l) * (height >> l) * 4) as usize])
+            .collect();
         let mut sprites = HashMap::new();
         for (id, img, x, y) in placed {
-            for row in 0..img.height() {
-                let src = &img.as_raw()
-                    [(row * img.width() * 4) as usize..((row + 1) * img.width() * 4) as usize];
-                let start = (((y + row) * WIDTH + x) * 4) as usize;
-                pixels[start..start + src.len()].copy_from_slice(src);
-            }
-            let alphas = img.pixels().map(|p| p[3]);
-            let layer = alphas.fold(Layer::Opaque, |layer, a| match a {
+            let layer = img.pixels().fold(Layer::Opaque, |layer, p| match p[3] {
                 255 => layer,
                 0 => layer.max(Layer::Cutout),
                 _ => Layer::Translucent,
             });
+            // Each sprite gets its own mipmaps, so neighbours never bleed into it.
+            let mut mip = img.clone();
+            for (level, pixels) in levels.iter_mut().enumerate() {
+                if level > 0 {
+                    mip = downsample(&mip, layer != Layer::Opaque);
+                }
+                let (lx, ly, level_width) = (x >> level, y >> level, WIDTH >> level);
+                for row in 0..mip.height() {
+                    let src = &mip.as_raw()
+                        [(row * mip.width() * 4) as usize..((row + 1) * mip.width() * 4) as usize];
+                    let start = (((ly + row) * level_width + lx) * 4) as usize;
+                    pixels[start..start + src.len()].copy_from_slice(src);
+                }
+            }
             let rect = [
                 x as f32 / WIDTH as f32,
                 y as f32 / height as f32,
@@ -97,7 +113,7 @@ impl Atlas {
         Ok(Self {
             width: WIDTH,
             height,
-            pixels,
+            levels,
             sprites,
         })
     }
@@ -144,5 +160,36 @@ fn missing_texture() -> image::RgbaImage {
         } else {
             image::Rgba([0, 0, 0, 255])
         }
+    })
+}
+
+/// One mipmap step, as vanilla's `MipmapGenerator`: each pixel is the gamma-2.2 average of
+/// four. For sprites with see-through pixels, clear pixels add nothing and a result less
+/// than 96/255 opaque becomes fully clear, so leaves and glass keep crisp edges.
+fn downsample(img: &image::RgbaImage, transparent: bool) -> image::RgbaImage {
+    let pow22 = |c: u8| (c as f32 / 255.0).powf(2.2);
+    let back = |v: f32| ((v / 4.0).powf(1.0 / 2.2) * 255.0) as u8;
+    let (w, h) = ((img.width() / 2).max(1), (img.height() / 2).max(1));
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let px = |dx: u32, dy: u32| {
+            img.get_pixel(
+                (x * 2 + dx).min(img.width() - 1),
+                (y * 2 + dy).min(img.height() - 1),
+            )
+            .0
+        };
+        let four = [px(0, 0), px(1, 0), px(0, 1), px(1, 1)];
+        let mut sum = [0.0f32; 4];
+        for p in four {
+            if transparent && p[3] == 0 {
+                continue;
+            }
+            (0..4).for_each(|i| sum[i] += pow22(p[i]));
+        }
+        let mut out = sum.map(back);
+        if transparent && out[3] < 96 {
+            out[3] = 0;
+        }
+        image::Rgba(out)
     })
 }

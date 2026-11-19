@@ -3,6 +3,7 @@
 
 pub mod atlas;
 pub mod bake;
+pub mod chest;
 pub mod gpu;
 pub mod mesh;
 pub mod tint;

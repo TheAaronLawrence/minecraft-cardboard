@@ -40,13 +40,13 @@ impl Dir {
         }
     }
 
-    fn normal(self) -> Vec3 {
+    pub(crate) fn normal(self) -> Vec3 {
         let [x, y, z] = self.offset();
         Vec3::new(x as f32, y as f32, z as f32)
     }
 
     /// The face a direction points at most closely.
-    fn nearest(v: Vec3) -> Dir {
+    pub(crate) fn nearest(v: Vec3) -> Dir {
         *Dir::ALL
             .iter()
             .max_by(|a, b| a.normal().dot(v).total_cmp(&b.normal().dot(v)))
@@ -118,13 +118,22 @@ pub struct BlockModels {
 /// Sprites the renderer draws itself, not through block models.
 pub const WATER_SPRITE: &str = "minecraft:block/water_still";
 pub const LAVA_SPRITE: &str = "minecraft:block/lava_still";
+pub const WATER_FLOW_SPRITE: &str = "minecraft:block/water_flow";
+pub const LAVA_FLOW_SPRITE: &str = "minecraft:block/lava_flow";
 
 impl BlockModels {
     pub fn bake(res: &Resources, registry: &Registry) -> Result<Self> {
         // Load each block's blockstate file and every model it can pick.
         let mut files = Vec::new();
         let mut models: HashMap<String, Model> = HashMap::new();
-        let mut sprites: HashSet<String> = [WATER_SPRITE.to_owned(), LAVA_SPRITE.to_owned()].into();
+        let mut sprites: HashSet<String> = [
+            WATER_SPRITE,
+            LAVA_SPRITE,
+            WATER_FLOW_SPRITE,
+            LAVA_FLOW_SPRITE,
+        ]
+        .map(str::to_owned)
+        .into();
         for block in registry.blocks() {
             let file = res
                 .blockstate(&block.name)
@@ -142,6 +151,7 @@ impl BlockModels {
             }
             files.push(file);
         }
+        sprites.extend(crate::chest::SPRITES.iter().map(|s| s.to_string()));
         let atlas = Atlas::build(res, sprites)?;
 
         let mut baked: HashMap<(String, i32, i32, bool), Arc<BakedModel>> = HashMap::new();
@@ -174,7 +184,14 @@ impl BlockModels {
                 let occludes = matches!(file, BlockState::Variants(_))
                     && parts.len() == 1
                     && parts[0].iter().all(|(_, m)| is_full_opaque_cube(m));
-                states[state as usize] = StateModel { parts, occludes };
+                let chest = crate::chest::model(&block.name, &values, &atlas);
+                states[state as usize] = match chest {
+                    Some(chest) => StateModel {
+                        parts: vec![vec![(1, Arc::new(chest))]],
+                        occludes: false,
+                    },
+                    None => StateModel { parts, occludes },
+                };
             }
         }
         Ok(Self { states, atlas })
@@ -277,15 +294,7 @@ fn bake_variant(model: &Model, variant: &Variant, atlas: &Atlas) -> BakedModel {
             let cull = face
                 .cullface
                 .map(|c| Dir::nearest(rotation * Dir::from(c).normal()));
-            let on_face = pos.iter().all(|p| {
-                let along = p.dot(dir.normal());
-                let edge = if dir.normal().max_element() > 0.0 {
-                    1.0
-                } else {
-                    0.0
-                };
-                (along.abs() - edge).abs() < 1e-4
-            });
+            let on_face = lies_on_face(&pos, dir);
             let layer = if forced {
                 Layer::Translucent
             } else {
@@ -309,9 +318,20 @@ fn bake_variant(model: &Model, variant: &Variant, atlas: &Atlas) -> BakedModel {
     }
 }
 
+/// Whether a quad lies in the block's outer face on the `dir` side.
+pub(crate) fn lies_on_face(pos: &[Vec3; 4], dir: Dir) -> bool {
+    let edge = if dir.normal().max_element() > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    pos.iter()
+        .all(|p| (p.dot(dir.normal()).abs() - edge).abs() < 1e-4)
+}
+
 /// Rotating by quarter turns leaves float error, such as -0.0000001 for 0; put coordinates
 /// that close to a 1/16 step back on it, so neighbouring blocks' faces meet without cracks.
-fn snap(p: Vec3) -> Vec3 {
+pub(crate) fn snap(p: Vec3) -> Vec3 {
     p.map(|c| {
         let steps = (c * 16.0).round();
         if (c * 16.0 - steps).abs() < 1e-3 {

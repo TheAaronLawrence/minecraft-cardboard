@@ -80,3 +80,54 @@ fn a_lone_block_in_the_sky_gets_six_sky_lit_faces() {
         "the top face is under open sky"
     );
 }
+
+/// Every block draws something except the ones vanilla also draws in code that we haven't
+/// written yet, or that are invisible. A block that silently loses its model shows up here.
+#[test]
+fn only_known_blocks_draw_nothing() {
+    let (_, registry, models) = setup();
+    let invisible = [
+        "air",
+        "cave_air",
+        "void_air",
+        "barrier",
+        "light",
+        "structure_void",
+        "moving_piston",
+    ];
+    // Drawn by the fluid mesher.
+    let fluids = ["water", "lava", "bubble_column"];
+    // Still to do: drawn in code by vanilla's block-entity renderers.
+    let todo = [
+        "banner",
+        "shulker_box",
+        "skull",
+        "_head",
+        "decorated_pot",
+        "conduit",
+        "copper_golem_statue",
+        "end_portal",
+        "end_gateway",
+    ];
+    let mut empty = Vec::new();
+    for block in registry.blocks() {
+        let name = block.name.strip_prefix("minecraft:").unwrap();
+        let state = &models.states[block.default_state as usize];
+        let quads: usize = state
+            .parts
+            .iter()
+            .flatten()
+            .map(|(_, m)| m.quads.len())
+            .sum();
+        let known = invisible.contains(&name)
+            || fluids.contains(&name)
+            || todo.iter().any(|t| name.contains(t));
+        if quads == 0 && !known {
+            empty.push(name.to_owned());
+        }
+        if name.ends_with("chest") {
+            assert!(quads > 0, "{name} draws nothing");
+        }
+    }
+    assert!(empty.is_empty(), "blocks that draw nothing: {empty:?}");
+}

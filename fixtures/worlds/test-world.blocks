@@ -20,3 +20,5 @@
 18 250 1 minecraft:amethyst_cluster[facing=north,waterlogged=false]
 24 250 -2 minecraft:diamond_block
 24 250 -5 minecraft:cherry_trapdoor[facing=south,half=top,open=true,powered=false,waterlogged=false]
+-27 250 1 minecraft:chest[facing=south,type=single,waterlogged=false]
+-30 250 1 minecraft:ender_chest[facing=north,waterlogged=false]

@@ -115,7 +115,7 @@ impl Renderer {
                     height: atlas.height,
                     depth_or_array_layers: 1,
                 },
-                mip_level_count: 1,
+                mip_level_count: atlas.levels.len() as u32,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
@@ -123,10 +123,14 @@ impl Renderer {
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            &atlas.pixels,
+            &atlas.levels.concat(),
         );
-        // Nearest filtering: block textures are pixel art.
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        // Nearest within a mipmap level (block textures are pixel art), blended between
+        // levels, as vanilla samples its block atlas.
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
