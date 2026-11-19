@@ -24,7 +24,7 @@ pub fn block_tint(name: &str) -> Option<Tint> {
         "spruce_leaves" => Tint::Fixed(rgb(0x619961)),
         "lily_pad" => Tint::Fixed(rgb(0x208030)),
         "water" | "bubble_column" | "water_cauldron" => Tint::Water,
-        _ => return None,
+        _ => return crate::entity_model::banner_color(name).map(Tint::Fixed),
     })
 }
 

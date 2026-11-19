@@ -99,10 +99,6 @@ fn only_known_blocks_draw_nothing() {
     let fluids = ["water", "lava", "bubble_column"];
     // Still to do: drawn in code by vanilla's block-entity renderers.
     let todo = [
-        "banner",
-        "shulker_box",
-        "skull",
-        "_head",
         "decorated_pot",
         "conduit",
         "copper_golem_statue",
@@ -125,7 +121,8 @@ fn only_known_blocks_draw_nothing() {
         if quads == 0 && !known {
             empty.push(name.to_owned());
         }
-        if name.ends_with("chest") {
+        let entity_drawn = ["chest", "banner", "shulker_box", "skull", "_head"];
+        if entity_drawn.iter().any(|e| name.ends_with(e)) {
             assert!(quads > 0, "{name} draws nothing");
         }
     }

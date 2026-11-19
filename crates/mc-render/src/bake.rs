@@ -152,6 +152,7 @@ impl BlockModels {
             files.push(file);
         }
         sprites.extend(crate::chest::SPRITES.iter().map(|s| s.to_string()));
+        sprites.extend(crate::entity_model::sprites());
         let atlas = Atlas::build(res, sprites)?;
 
         let mut baked: HashMap<(String, i32, i32, bool), Arc<BakedModel>> = HashMap::new();
@@ -184,10 +185,11 @@ impl BlockModels {
                 let occludes = matches!(file, BlockState::Variants(_))
                     && parts.len() == 1
                     && parts[0].iter().all(|(_, m)| is_full_opaque_cube(m));
-                let chest = crate::chest::model(&block.name, &values, &atlas);
-                states[state as usize] = match chest {
-                    Some(chest) => StateModel {
-                        parts: vec![vec![(1, Arc::new(chest))]],
+                let entity = crate::chest::model(&block.name, &values, &atlas)
+                    .or_else(|| crate::entity_model::model(&block.name, &values, &atlas));
+                states[state as usize] = match entity {
+                    Some(model) => StateModel {
+                        parts: vec![vec![(1, Arc::new(model))]],
                         occludes: false,
                     },
                     None => StateModel { parts, occludes },
