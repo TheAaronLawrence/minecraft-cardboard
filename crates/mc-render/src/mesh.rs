@@ -29,6 +29,9 @@ pub struct Mesh {
     pub opaque: Vec<Vertex>,
     pub cutout: Vec<Vertex>,
     pub translucent: Vec<Vertex>,
+    /// End portal and gateway faces, for the portal shader; the third light byte holds
+    /// the number of star layers.
+    pub portal: Vec<Vertex>,
 }
 
 impl Mesh {
@@ -37,6 +40,7 @@ impl Mesh {
             Layer::Opaque => &mut self.opaque,
             Layer::Cutout => &mut self.cutout,
             Layer::Translucent => &mut self.translucent,
+            Layer::EndPortal(_) => &mut self.portal,
         }
     }
 
@@ -403,6 +407,10 @@ impl<'a> Mesher<'a> {
             let (sky, block_light) = view.light(base[0], base[1], base[2]);
             [(1.0, (sky as f32, block_light as f32)); 4]
         };
+        let layers = match quad.layer {
+            Layer::EndPortal(n) => n,
+            _ => 0,
+        };
         let out = mesh.layer(quad.layer);
         for (i, (brightness, (sky, block_light))) in corners.into_iter().enumerate() {
             let color =
@@ -411,7 +419,7 @@ impl<'a> Mesher<'a> {
                 pos: (origin + quad.pos[i]).into(),
                 uv: quad.uv[i],
                 color: [color[0], color[1], color[2], 255],
-                light: [(sky * 16.0) as u8, (block_light * 16.0) as u8, 0, 0],
+                light: [(sky * 16.0) as u8, (block_light * 16.0) as u8, layers, 0],
             });
         }
     }

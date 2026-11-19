@@ -6,9 +6,9 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-/// The `resources/reports/` folder at the repository root.
+/// The `resources/reports/` folder (see `mc_assets::locate`).
 pub fn default_reports_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/reports")
+    mc_assets::locate("resources/reports")
 }
 
 pub struct Registry {

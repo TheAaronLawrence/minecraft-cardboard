@@ -6,8 +6,6 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+mc-assets = { path = "../mc-assets" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
-
-[dev-dependencies]
-mc-assets = { path = "../mc-assets" }

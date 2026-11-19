@@ -9,9 +9,25 @@ use std::path::{Path, PathBuf};
 /// The purple and black sprite the game draws in code; it has no texture file.
 pub const MISSING_SPRITE: &str = "minecraft:missingno";
 
-/// The `resources/` folder at the repository root.
+/// The `resources/` folder: beside the executable in a portable build, otherwise at the
+/// repository root.
 pub fn default_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources")
+    locate("resources")
+}
+
+/// A path relative to the repository root, such as `resources/reports`. A portable build
+/// ships these folders beside its executable, so that copy wins when it exists; otherwise
+/// it's the repository this was built from.
+pub fn locate(relative: &str) -> PathBuf {
+    let beside_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join(relative)));
+    match beside_exe {
+        Some(path) if path.exists() => path,
+        _ => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(relative),
+    }
 }
 
 pub struct Resources {

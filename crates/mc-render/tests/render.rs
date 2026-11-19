@@ -163,3 +163,38 @@ fn block_entity_data_draws_patterns_and_sherds() {
         [24.0, 250.0, -2.0]
     ));
 }
+
+/// End portals and gateways go to the portal shader, with vanilla's 15 and 16 star layers,
+/// and nowhere else.
+#[test]
+fn portals_draw_with_the_portal_shader() {
+    let (res, registry, models) = setup();
+    let mut world = mc_world::World::open(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/worlds/test-world"
+    ));
+    let view = WorldView::load(&mut world, &registry, -85, 1, 1).unwrap();
+    let biomes = Biomes::load(&res, view.biome_names()).unwrap();
+    let mesh = Mesher::new(&models, &biomes, &registry).mesh_world(&view);
+    // Within the block at (x, 250, 1).
+    let at = |v: &mc_render::mesh::Vertex, x: f32| {
+        [x, 250.0, 1.0]
+            .iter()
+            .zip(v.pos)
+            .all(|(min, p)| (p - min - 0.5).abs() <= 0.5)
+    };
+    // The end portal at x = -84 has a top and a bottom face; the gateway at -87 all six.
+    let portal: Vec<_> = mesh.portal.iter().filter(|v| at(v, -84.0)).collect();
+    let gateway: Vec<_> = mesh.portal.iter().filter(|v| at(v, -87.0)).collect();
+    assert_eq!(portal.len(), 2 * 4);
+    assert_eq!(gateway.len(), 6 * 4);
+    assert!(portal.iter().all(|v| v.light[2] == 15));
+    assert!(gateway.iter().all(|v| v.light[2] == 16));
+    let elsewhere = mesh
+        .opaque
+        .iter()
+        .chain(&mesh.cutout)
+        .chain(&mesh.translucent)
+        .any(|v| at(v, -84.0) || at(v, -87.0));
+    assert!(!elsewhere, "portal faces in a terrain layer");
+}

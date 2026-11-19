@@ -113,6 +113,29 @@ pub struct BlockModels {
     /// Indexed by state id.
     pub states: Vec<StateModel>,
     pub atlas: Atlas,
+    /// The end portal shader's own textures, which it tiles, so they aren't in the atlas.
+    pub portal_textures: PortalTextures,
+}
+
+/// `TheEndPortalRenderer`'s two textures: the sky behind, and the stars on every layer.
+pub struct PortalTextures {
+    pub sky: image::RgbaImage,
+    pub stars: image::RgbaImage,
+}
+
+impl PortalTextures {
+    fn load(res: &Resources) -> Result<Self> {
+        let load = |id: &str| -> Result<image::RgbaImage> {
+            let path = res.asset_path("textures", id, "png");
+            Ok(image::open(&path)
+                .with_context(|| format!("{}", path.display()))?
+                .to_rgba8())
+        };
+        Ok(Self {
+            sky: load("minecraft:environment/end_sky")?,
+            stars: load("minecraft:entity/end_portal/end_portal")?,
+        })
+    }
 }
 
 /// Sprites the renderer draws itself, not through block models.
@@ -202,7 +225,11 @@ impl BlockModels {
                 };
             }
         }
-        Ok(Self { states, atlas })
+        Ok(Self {
+            states,
+            atlas,
+            portal_textures: PortalTextures::load(res)?,
+        })
     }
 }
 

@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! minecraft-cardboard [--world DIR] [--pos X,Y,Z] [--look YAW,PITCH] [--distance CHUNKS]
-//!                     [--fov DEG] [--screenshot OUT.png] [--size WxH]
+//!                     [--fov DEG] [--screenshot OUT.png] [--size WxH] [--ticks N]
 //! ```
 //! In the window: click to capture the mouse, WASD to move, Space and Shift to go up and
 //! down, Ctrl to fly faster, Esc to release the mouse.
@@ -24,14 +24,15 @@ struct Args {
     world: PathBuf,
     camera: Camera,
     distance: i32,
+    /// Game ticks at the start, which set where end portals' stars have drifted to.
+    ticks: f32,
     screenshot: Option<PathBuf>,
     size: (u32, u32),
 }
 
 fn parse_args() -> Result<Args> {
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut args = Args {
-        world: repo.join("fixtures/worlds/test-world"),
+        world: mc_assets::locate("fixtures/worlds/test-world"),
         camera: Camera {
             eye: Vec3::new(0.5, 100.0, 0.5),
             yaw: 0.0,
@@ -39,6 +40,7 @@ fn parse_args() -> Result<Args> {
             fov: 70.0,
         },
         distance: 5,
+        ticks: 0.0,
         screenshot: None,
         size: (1280, 720),
     };
@@ -65,6 +67,7 @@ fn parse_args() -> Result<Args> {
                 _ => bail!("--look takes YAW,PITCH"),
             },
             "--distance" => args.distance = value()?.parse()?,
+            "--ticks" => args.ticks = value()?.parse()?,
             "--fov" => args.camera.fov = value()?.parse()?,
             "--screenshot" => args.screenshot = Some(value()?.into()),
             "--size" => {
@@ -130,10 +133,11 @@ fn main() -> Result<()> {
     let scene = load_scene(&args)?;
     let view = View {
         distance: (args.distance * 16) as f32,
+        ticks: args.ticks,
     };
     match &args.screenshot {
         Some(path) => {
-            let mut renderer = Renderer::headless(&scene.models.atlas)?;
+            let mut renderer = Renderer::headless(&scene.models)?;
             renderer.upload(&scene.mesh);
             let image = renderer.screenshot(args.size.0, args.size.1, &args.camera, &view)?;
             image
@@ -214,7 +218,7 @@ impl App {
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
-        let mut renderer = Renderer::new(device, queue, format, &self.scene.models.atlas);
+        let mut renderer = Renderer::new(device, queue, format, &self.scene.models);
         renderer.upload(&self.scene.mesh);
         self.state = Some(WindowState {
             window,
@@ -332,6 +336,8 @@ impl winit::application::ApplicationHandler for App {
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
                 self.fly(dt);
+                // 20 game ticks a second.
+                self.view.ticks += dt * 20.0;
                 let Some(state) = &mut self.state else { return };
                 let frame = match state.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)

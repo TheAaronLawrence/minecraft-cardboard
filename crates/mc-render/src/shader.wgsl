@@ -8,6 +8,8 @@ struct Uniforms {
     sky_color: vec4<f32>,
     // fog start, fog end, sky brightness (1 at noon), brightness option (vanilla default 0.5)
     params: vec4<f32>,
+    // x: vanilla's `GameTime`, the day's progress, (ticks % 24000) / 24000.
+    time: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -113,4 +115,97 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let dir = normalize(far.xyz / far.w - u.eye.xyz);
     let t = smoothstep(0.0, 0.35, dir.y);
     return vec4<f32>(mix(u.fog_color.rgb, u.sky_color.rgb, t), 1.0);
+}
+
+// End portals and gateways: vanilla's `rendertype_end_portal` shader. The sky texture and
+// `PORTAL_LAYERS` layers of stars are sampled in screen space, each layer scaled, turned
+// and drifting with the game time. WGSL, like GLSL, takes matrix constructor arguments by
+// column and reads `v * m` as a row vector, so vanilla's matrices are copied as written.
+@group(1) @binding(0) var portal_sky: texture_2d<f32>;
+@group(1) @binding(1) var portal_stars: texture_2d<f32>;
+@group(1) @binding(2) var portal_sampler: sampler;
+
+const PORTAL_COLORS = array<vec3<f32>, 16>(
+    vec3<f32>(0.022087, 0.098399, 0.110818),
+    vec3<f32>(0.011892, 0.095924, 0.089485),
+    vec3<f32>(0.027636, 0.101689, 0.100326),
+    vec3<f32>(0.046564, 0.109883, 0.114838),
+    vec3<f32>(0.064901, 0.117696, 0.097189),
+    vec3<f32>(0.063761, 0.086895, 0.123646),
+    vec3<f32>(0.084817, 0.111994, 0.166380),
+    vec3<f32>(0.097489, 0.154120, 0.091064),
+    vec3<f32>(0.106152, 0.131144, 0.195191),
+    vec3<f32>(0.097721, 0.110188, 0.187229),
+    vec3<f32>(0.133516, 0.138278, 0.148582),
+    vec3<f32>(0.070006, 0.243332, 0.235792),
+    vec3<f32>(0.196766, 0.142899, 0.214696),
+    vec3<f32>(0.047281, 0.315338, 0.321970),
+    vec3<f32>(0.204675, 0.390010, 0.302066),
+    vec3<f32>(0.080955, 0.314821, 0.661491),
+);
+
+const SCALE_TRANSLATE = mat4x4<f32>(
+    0.5, 0.0, 0.0, 0.25,
+    0.0, 0.5, 0.0, 0.25,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+);
+
+struct PortalOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) tex_proj: vec4<f32>,
+    @location(1) distance: f32,
+    @location(2) @interpolate(flat) layers: u32,
+};
+
+@vertex
+fn vs_portal(in: VertexIn) -> PortalOut {
+    var out: PortalOut;
+    out.clip = u.view_proj * vec4<f32>(in.pos, 1.0);
+    // `projection_from_position`.
+    let half = out.clip * 0.5;
+    out.tex_proj = vec4<f32>(half.x + half.w, half.y + half.w, out.clip.z, out.clip.w);
+    let d = in.pos - u.eye.xyz;
+    out.distance = max(length(d.xz), abs(d.y));
+    out.layers = u32(round(in.light.z * 255.0));
+    return out;
+}
+
+fn end_portal_layer(layer: f32) -> mat4x4<f32> {
+    let translate = mat4x4<f32>(
+        1.0, 0.0, 0.0, 17.0 / layer,
+        0.0, 1.0, 0.0, (2.0 + layer / 1.5) * (u.time.x * 1.5),
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    );
+    // `mat2_rotate_z`, then the uniform scale, widened to a mat4 as GLSL's `mat4(mat2)` is.
+    let a = radians((layer * layer * 4321.0 + layer * 9.0) * 2.0);
+    let s = (4.5 - layer / 4.0) * 2.0;
+    let m = mat2x2<f32>(s, 0.0, 0.0, s) * mat2x2<f32>(cos(a), -sin(a), sin(a), cos(a));
+    let wide = mat4x4<f32>(
+        m[0].x, m[0].y, 0.0, 0.0,
+        m[1].x, m[1].y, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    );
+    return wide * translate * SCALE_TRANSLATE;
+}
+
+// `textureProj`: divide by w.
+fn sample_proj(t: texture_2d<f32>, p: vec4<f32>) -> vec3<f32> {
+    return textureSample(t, portal_sampler, p.xy / p.w).rgb;
+}
+
+@fragment
+fn fs_portal(in: PortalOut) -> @location(0) vec4<f32> {
+    var color = sample_proj(portal_sky, in.tex_proj) * PORTAL_COLORS[0];
+    for (var i = 0u; i < 16u; i++) {
+        // Uniform control flow for the sampling: skip a layer's colour, not its sample.
+        let layer = sample_proj(portal_stars, in.tex_proj * end_portal_layer(f32(i + 1u)));
+        if i < in.layers {
+            color += layer * PORTAL_COLORS[i];
+        }
+    }
+    let fog = smoothstep(u.params.x, u.params.y, in.distance);
+    return vec4<f32>(mix(color, u.fog_color.rgb, fog), 1.0);
 }

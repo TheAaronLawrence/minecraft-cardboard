@@ -5,7 +5,7 @@
 //! `DragonHeadModel`, `DecoratedPotRenderer`, `ConduitRenderer`, `CopperGolemModel`'s pose
 //! layers) and their block entity renderers.
 
-use crate::atlas::{Atlas, Sprite};
+use crate::atlas::{Atlas, Layer, Sprite};
 use crate::bake::{self, BakedModel, Dir, Quad};
 use glam::{Mat3, Mat4, Quat, Vec3};
 use mc_assets::Resources;
@@ -40,10 +40,9 @@ const DYE_RGB: [u32; 16] = [
 const POT_BASE: &str = "minecraft:entity/decorated_pot/decorated_pot_base";
 const POT_SIDE: &str = "minecraft:entity/decorated_pot/decorated_pot_side";
 const CONDUIT: &str = "minecraft:entity/conduit/base";
-/// Vanilla draws portals with a parallax star shader; until we write one, they show the
-/// end sky texture, tinted dark teal by `PORTAL_TINT`.
+/// Portal faces are drawn by the end portal shader, which ignores their atlas coordinates;
+/// they point at this sprite only so they have some.
 const PORTAL: &str = "minecraft:environment/end_sky";
-pub const PORTAL_TINT: [f32; 3] = [0.15, 0.3, 0.32];
 const BANNER_BASE: &str = "minecraft:entity/banner/banner_base";
 const BANNER_FLAG: &str = "minecraft:entity/banner/base";
 const SKULLS: [(&str, &str); 7] = [
@@ -543,9 +542,10 @@ fn portal(atlas: &Atlas, end_portal: bool) -> Vec<Quad> {
                 uv: [[u0, v0], [u0, v1], [u1, v1], [u1, v0]],
                 dir,
                 cull: (!end_portal).then_some(dir),
-                tint: 0,
+                tint: -1,
                 shade: false,
-                layer: sprite.layer,
+                // `RenderPipelines`' `PORTAL_LAYERS` for each.
+                layer: Layer::EndPortal(if end_portal { 15 } else { 16 }),
                 on_face: bake::lies_on_face(&pos, dir),
             }
         })

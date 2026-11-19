@@ -12,6 +12,9 @@ pub enum Layer {
     Cutout,
     /// Some pixels are partly see-through (stained glass, ice, water).
     Translucent,
+    /// Drawn by the end portal shader with this many star layers (15 for portals, 16 for
+    /// gateways), ignoring its texture coordinates. No sprite has this layer.
+    EndPortal(u8),
 }
 
 pub struct Atlas {

@@ -1,6 +1,6 @@
 //! Draws a meshed world with wgpu, into a window's surface or an offscreen image.
 
-use crate::atlas::Atlas;
+use crate::bake::BlockModels;
 use crate::mesh::{Mesh, Vertex};
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec3};
@@ -39,6 +39,8 @@ impl Camera {
 pub struct View {
     /// Render distance in blocks; fog ends here.
     pub distance: f32,
+    /// Game ticks since the world started, which animate end portals.
+    pub ticks: f32,
 }
 
 #[repr(C)]
@@ -50,6 +52,7 @@ struct Uniforms {
     fog_color: [f32; 4],
     sky_color: [f32; 4],
     params: [f32; 4],
+    time: [f32; 4],
 }
 
 /// Vanilla's plains sky and fog colours at noon.
@@ -73,16 +76,19 @@ pub struct Renderer {
     opaque: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
+    portal: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    portal_bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     indices: Option<wgpu::Buffer>,
-    layers: [Option<(wgpu::Buffer, u32)>; 3],
+    /// Opaque, cutout, translucent and portal vertices, with their index counts.
+    layers: [Option<(wgpu::Buffer, u32)>; 4],
     depth: Option<(wgpu::TextureView, u32, u32)>,
 }
 
 impl Renderer {
     /// A device with no window, for screenshots.
-    pub fn headless(atlas: &Atlas) -> Result<Self> {
+    pub fn headless(models: &BlockModels) -> Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter =
             pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
@@ -93,7 +99,7 @@ impl Renderer {
             device,
             queue,
             wgpu::TextureFormat::Rgba8Unorm,
-            atlas,
+            models,
         ))
     }
 
@@ -103,8 +109,9 @@ impl Renderer {
         device: wgpu::Device,
         queue: wgpu::Queue,
         format: wgpu::TextureFormat,
-        atlas: &Atlas,
+        models: &BlockModels,
     ) -> Self {
+        let atlas = &models.atlas;
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let texture = device.create_texture_with_data(
             &queue,
@@ -194,6 +201,87 @@ impl Renderer {
             ..Default::default()
         });
 
+        // The portal shader's textures repeat across the screen, unfiltered as vanilla
+        // samples them.
+        let portal_texture = |label: &str, img: &image::RgbaImage| {
+            device
+                .create_texture_with_data(
+                    &queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d {
+                            width: img.width(),
+                            height: img.height(),
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    img.as_raw(),
+                )
+                .create_view(&Default::default())
+        };
+        let portal_textures = &models.portal_textures;
+        let portal_sky = portal_texture("end sky", &portal_textures.sky);
+        let portal_stars = portal_texture("end portal", &portal_textures.stars);
+        let repeat = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            ..Default::default()
+        });
+        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let portal_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("portal"),
+            entries: &[
+                texture_entry(0),
+                texture_entry(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let portal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("portal"),
+            layout: &portal_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&portal_sky),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&portal_stars),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&repeat),
+                },
+            ],
+        });
+        let portal_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("portal"),
+                bind_group_layouts: &[Some(&layout), Some(&portal_layout)],
+                ..Default::default()
+            });
+
         let vertex_layout = Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -201,12 +289,21 @@ impl Renderer {
         });
         let pipeline =
             |fragment: &str, blend: Option<wgpu::BlendState>, depth_write: bool, sky: bool| {
+                let portal = fragment == "fs_portal";
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(fragment),
-                    layout: Some(&pipeline_layout),
+                    layout: Some(if portal {
+                        &portal_pipeline_layout
+                    } else {
+                        &pipeline_layout
+                    }),
                     vertex: wgpu::VertexState {
                         module: &shader,
-                        entry_point: Some(if sky { "vs_sky" } else { "vs" }),
+                        entry_point: Some(match (sky, portal) {
+                            (true, _) => "vs_sky",
+                            (_, true) => "vs_portal",
+                            _ => "vs",
+                        }),
                         buffers: if sky {
                             &[]
                         } else {
@@ -253,6 +350,7 @@ impl Renderer {
             false,
             false,
         );
+        let portal = pipeline("fs_portal", None, true, false);
         Self {
             device,
             queue,
@@ -260,21 +358,20 @@ impl Renderer {
             opaque,
             cutout,
             translucent,
+            portal,
             bind_group,
+            portal_bind_group,
             uniforms,
             indices: None,
-            layers: [None, None, None],
+            layers: [None, None, None, None],
             depth: None,
         }
     }
 
     /// Replaces what's drawn with `mesh`.
     pub fn upload(&mut self, mesh: &Mesh) {
-        let quads = [&mesh.opaque, &mesh.cutout, &mesh.translucent]
-            .iter()
-            .map(|l| l.len() / 4)
-            .max()
-            .unwrap_or(0);
+        let lists = [&mesh.opaque, &mesh.cutout, &mesh.translucent, &mesh.portal];
+        let quads = lists.iter().map(|l| l.len() / 4).max().unwrap_or(0);
         let indices: Vec<u32> = (0..quads as u32)
             .flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q * 4 + i))
             .collect();
@@ -286,11 +383,7 @@ impl Renderer {
                     usage: wgpu::BufferUsages::INDEX,
                 }),
         );
-        for (slot, vertices) in
-            self.layers
-                .iter_mut()
-                .zip([&mesh.opaque, &mesh.cutout, &mesh.translucent])
-        {
+        for (slot, vertices) in self.layers.iter_mut().zip(lists) {
             *slot = (!vertices.is_empty()).then(|| {
                 let buffer = self
                     .device
@@ -345,6 +438,8 @@ impl Renderer {
             fog_color: color(FOG),
             sky_color: color(SKY),
             params: [fog_start, fog_end, 1.0, 0.5],
+            // `GlobalSettingsUniform`'s GameTime.
+            time: [(view.ticks % 24000.0) / 24000.0, 0.0, 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -377,11 +472,16 @@ impl Renderer {
             pass.draw(0..3, 0..1);
             if let Some(indices) = &self.indices {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                for (pipeline, layer) in [&self.opaque, &self.cutout, &self.translucent]
-                    .into_iter()
-                    .zip(&self.layers)
-                {
-                    if let Some((buffer, count)) = layer {
+                // Portals are opaque, so they draw before the translucent layer.
+                let order = [
+                    (&self.opaque, 0),
+                    (&self.cutout, 1),
+                    (&self.portal, 3),
+                    (&self.translucent, 2),
+                ];
+                pass.set_bind_group(1, &self.portal_bind_group, &[]);
+                for (pipeline, slot) in order {
+                    if let Some((buffer, count)) = &self.layers[slot] {
                         pass.set_pipeline(pipeline);
                         pass.set_vertex_buffer(0, buffer.slice(..));
                         pass.draw_indexed(0..*count, 0, 0..1);
