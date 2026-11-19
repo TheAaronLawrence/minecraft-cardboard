@@ -26,6 +26,8 @@ pub enum Update {
     Disconnected(String),
     /// A server chunk's blocks by section y, for collision; `None` when it's dropped.
     Collision((i32, i32), Option<Vec<(i32, mc_world::Blocks)>>),
+    /// The server changed these blocks: position and new state.
+    Blocks(Vec<([i32; 3], u32)>),
     /// Another server event for the game: the login, or the player's abilities.
     Server(mc_protocol::Event),
 }
@@ -110,12 +112,14 @@ fn work(
     let mut missing: HashSet<(i32, i32)> = HashSet::new();
     // Chunks meshed (or found unmeshable) and not removed since.
     let mut meshed: HashSet<(i32, i32)> = HashSet::new();
+    // Meshed chunks whose blocks or light have changed since, to mesh again.
+    let mut dirty: HashSet<(i32, i32)> = HashSet::new();
     let mut idle = false;
     loop {
         if let Source::Server(events) = &source {
             for event in events.try_iter() {
                 idle = false;
-                if !receive(event, &mut view, &mut meshed, tx) {
+                if !receive(event, &mut view, &mut meshed, &mut dirty, tx) {
                     return;
                 }
             }
@@ -141,6 +145,7 @@ fn work(
             .collect();
         for key in gone {
             meshed.remove(&key);
+            dirty.remove(&key);
             if tx.send(Update::Remove(key)).is_err() {
                 return;
             }
@@ -162,7 +167,7 @@ fn work(
         // A server sends the chunks; only a save is read here.
         let reads = matches!(source, Source::Save(_));
         let to_mesh = around(distance)
-            .filter(|&k| !meshed.contains(&k) && view.contains(k.0, k.1))
+            .filter(|&k| (!meshed.contains(&k) || dirty.contains(&k)) && view.contains(k.0, k.1))
             .filter(|&(x, z)| (-1..=1).all(|dx| (-1..=1).all(|dz| known((x + dx, z + dz)))))
             .min_by_key(|&k| square(k));
         let to_load = around(distance + 1)
@@ -178,6 +183,7 @@ fn work(
             (Some(key), _) => {
                 idle = false;
                 meshed.insert(key);
+                dirty.remove(&key);
                 // A chunk beside one the save never had can't be meshed; it stays blank.
                 if let Some(mut mesh) = mesher.mesh_chunk(&view, key.0, key.1) {
                     mesh.sort_translucent(eye);
@@ -216,7 +222,7 @@ fn work(
                         match events.recv_timeout(std::time::Duration::from_millis(50)) {
                             Ok(event) => {
                                 idle = false;
-                                if !receive(event, &mut view, &mut meshed, tx) {
+                                if !receive(event, &mut view, &mut meshed, &mut dirty, tx) {
                                     return;
                                 }
                             }
@@ -242,8 +248,21 @@ fn receive(
     event: mc_protocol::Event,
     view: &mut WorldView,
     meshed: &mut HashSet<(i32, i32)>,
+    dirty: &mut HashSet<(i32, i32)>,
     tx: &Sender<Update>,
 ) -> bool {
+    // A chunk is meshed with its neighbours' edge blocks and light, so a change in one
+    // re-meshes those around it too.
+    let mut touch =
+        |cx: i32, cz: i32, dx: std::ops::RangeInclusive<i32>, dz: std::ops::RangeInclusive<i32>| {
+            for x in dx {
+                for z in dz.clone() {
+                    if meshed.contains(&(cx + x, cz + z)) {
+                        dirty.insert((cx + x, cz + z));
+                    }
+                }
+            }
+        };
     use mc_protocol::Event;
     let update = match event {
         Event::Chunk(chunk) => {
@@ -258,8 +277,32 @@ fn receive(
             view.insert(chunk);
             return tx.send(Update::Collision(key, Some(blocks))).is_ok();
         }
+        Event::Blocks(changes) => {
+            for &([x, y, z], state) in &changes {
+                if view.set_block([x, y, z], state) {
+                    // Only blocks on a chunk's edge show in the next chunk over.
+                    let near = |c: i32| match c.rem_euclid(16) {
+                        0 => -1..=0,
+                        15 => 0..=1,
+                        _ => 0..=0,
+                    };
+                    touch(x.div_euclid(16), z.div_euclid(16), near(x), near(z));
+                }
+            }
+            Update::Blocks(changes)
+        }
+        Event::Light { x, z, sky, block } => {
+            for (light, is_sky) in [(sky, true), (block, false)] {
+                for (section_y, array) in light {
+                    view.set_light((x, z), section_y, is_sky, array);
+                }
+            }
+            touch(x, z, -1..=1, -1..=1);
+            return true;
+        }
         Event::Forget(x, z) => {
             view.remove(x, z);
+            dirty.remove(&(x, z));
             if tx.send(Update::Collision((x, z), None)).is_err() {
                 return false;
             }

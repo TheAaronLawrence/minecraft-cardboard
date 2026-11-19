@@ -16,6 +16,16 @@ pub struct Dimension {
 }
 
 impl Dimension {
+    /// The section y of index `i` in light data, which starts a section below the world.
+    pub fn light_section_y(&self, i: usize) -> i32 {
+        self.min_section - 1 + i as i32
+    }
+
+    /// How many sections light data covers.
+    pub fn light_sections(&self) -> usize {
+        self.sections + 2
+    }
+
     /// From the registry data's inline entry, or else vanilla's own file for `name`.
     pub fn new(name: &str, data: Option<&Tag>) -> Result<Self> {
         let (min_y, height) = match data.and_then(Tag::as_compound) {
@@ -132,22 +142,48 @@ pub fn decode(
         block_entities.insert([x, y, z], data);
     }
 
-    // Light: which sections have sky and block light, which are all dark, then the arrays.
-    // Bit i is section `min_section - 1 + i`. A section in neither mask has no array, as in
-    // a save: full sky light above the terrain, no block light.
+    // Sections the light data leaves out have no array, as in a save: full sky light above
+    // the terrain, no block light.
+    let light = light(r, sections.len())?;
+    for (i, array) in light.sky {
+        sections[i].sky_light = Some(array);
+    }
+    for (i, array) in light.block {
+        sections[i].block_light = Some(array);
+    }
+
+    Ok(Chunk {
+        x: cx,
+        z: cz,
+        status: "minecraft:full".into(),
+        sections,
+        block_entities,
+    })
+}
+
+/// `ClientboundLightUpdatePacketData`'s arrays, by section index (bit i of its masks is
+/// section `min_section - 1 + i`). Sections marked all dark come as zeros; sections it
+/// leaves out keep what they had.
+pub struct Light {
+    pub sky: Vec<(usize, Box<[u8; 2048]>)>,
+    pub block: Vec<(usize, Box<[u8; 2048]>)>,
+}
+
+/// Reads light data for a column of `sections` sections, counting the one below and above.
+pub fn light(r: &mut Reader, sections: usize) -> Result<Light> {
     let sky_mask = r.bit_set()?;
     let block_mask = r.bit_set()?;
     let empty_sky = r.bit_set()?;
     let empty_block = r.bit_set()?;
     let bit = |mask: &[u8], i: usize| mask.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 != 0);
-    let mut arrays = |mask: &[u8]| -> Result<HashMap<usize, Box<[u8; 2048]>>> {
+    let mut arrays = |mask: &[u8], empty: &[u8]| -> Result<Vec<(usize, Box<[u8; 2048]>)>> {
         let count = r.count()?;
-        let indices: Vec<usize> = (0..sections.len()).filter(|&i| bit(mask, i)).collect();
+        let indices: Vec<usize> = (0..sections).filter(|&i| bit(mask, i)).collect();
         ensure!(
             count == indices.len(),
             "light arrays don't match their mask"
         );
-        indices
+        let mut out = indices
             .into_iter()
             .map(|i| {
                 let bytes = r.byte_array()?;
@@ -159,26 +195,17 @@ pub fn decode(
                     .context("light array isn't 2048 bytes")?;
                 Ok((i, array))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        out.extend(
+            (0..sections)
+                .filter(|&i| bit(empty, i) && !bit(mask, i))
+                .map(|i| (i, Box::new([0; 2048]))),
+        );
+        Ok(out)
     };
-    let mut sky = arrays(sky_mask)?;
-    let mut block = arrays(block_mask)?;
-    for (i, section) in sections.iter_mut().enumerate() {
-        section.sky_light = sky
-            .remove(&i)
-            .or_else(|| bit(empty_sky, i).then(|| Box::new([0; 2048])));
-        section.block_light = block
-            .remove(&i)
-            .or_else(|| bit(empty_block, i).then(|| Box::new([0; 2048])));
-    }
-
-    Ok(Chunk {
-        x: cx,
-        z: cz,
-        status: "minecraft:full".into(),
-        sections,
-        block_entities,
-    })
+    let sky = arrays(sky_mask, empty_sky)?;
+    let block = arrays(block_mask, empty_block)?;
+    Ok(Light { sky, block })
 }
 
 enum Paletted {

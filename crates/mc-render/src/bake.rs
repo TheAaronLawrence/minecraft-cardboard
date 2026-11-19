@@ -115,6 +115,8 @@ pub struct BlockModels {
     /// Indexed by state id.
     pub states: Vec<StateModel>,
     pub atlas: Atlas,
+    /// Each item's icon, by name such as `minecraft:stone`, and the HUD's sprites.
+    pub hud: crate::hud::HudArt,
     /// The end portal shader's own textures, which it tiles, so they aren't in the atlas.
     pub portal_textures: PortalTextures,
 }
@@ -183,6 +185,9 @@ impl BlockModels {
             files.push(file);
         }
         sprites.extend(crate::chest::SPRITES.iter().map(|s| s.to_string()));
+        let items = crate::item::load(res, registry)?;
+        sprites.extend(items.sprites.iter().cloned());
+        sprites.extend(crate::hud::sprites());
         sprites.extend(crate::entity_model::sprites(res));
         let atlas = Atlas::build(res, sprites, extra_sprites)?;
 
@@ -227,9 +232,12 @@ impl BlockModels {
                 };
             }
         }
+        let icons = crate::item::bake(items, &atlas, &states, registry)?;
+        let hud = crate::hud::HudArt::new(res, &atlas, icons)?;
         Ok(Self {
             states,
             atlas,
+            hud,
             portal_textures: PortalTextures::load(res)?,
         })
     }
@@ -257,7 +265,7 @@ fn covers_face(q: &Quad) -> bool {
     }
 }
 
-fn bake_variant(model: &Model, variant: &Variant, atlas: &Atlas) -> BakedModel {
+pub(crate) fn bake_variant(model: &Model, variant: &Variant, atlas: &Atlas) -> BakedModel {
     // Vanilla rotates by -x degrees about X, then -y degrees about Y, around the block centre.
     let rotation = Quat::from_rotation_y((-variant.y as f32).to_radians())
         * Quat::from_rotation_x((-variant.x as f32).to_radians());

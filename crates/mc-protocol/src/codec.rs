@@ -50,6 +50,28 @@ impl<'a> Reader<'a> {
         bail!("VarInt longer than 5 bytes")
     }
 
+    pub fn varlong(&mut self) -> Result<i64> {
+        let mut value = 0u64;
+        for i in 0..10 {
+            let byte = self.u8()?;
+            value |= ((byte & 0x7F) as u64) << (7 * i);
+            if byte & 0x80 == 0 {
+                return Ok(value as i64);
+            }
+        }
+        bail!("VarLong longer than 10 bytes")
+    }
+
+    /// A `BlockPos` packed into a long: x in the top 26 bits, then z in 26, then y in 12.
+    pub fn block_pos(&mut self) -> Result<[i32; 3]> {
+        let v = self.i64()?;
+        Ok([
+            (v >> 38) as i32,
+            (v << 52 >> 52) as i32,
+            (v << 26 >> 38) as i32,
+        ])
+    }
+
     /// A VarInt that counts something, so it can't be negative.
     pub fn count(&mut self) -> Result<usize> {
         usize::try_from(self.varint()?).context("negative length")
@@ -107,6 +129,7 @@ pub trait Put {
     fn put_varint(&mut self, v: i32) -> &mut Self;
     fn put_string(&mut self, v: &str) -> &mut Self;
     fn put_uuid(&mut self, v: u128) -> &mut Self;
+    fn put_block_pos(&mut self, pos: [i32; 3]) -> &mut Self;
 }
 
 impl Put for Vec<u8> {
@@ -153,6 +176,12 @@ impl Put for Vec<u8> {
         self.extend_from_slice(v.as_bytes());
         self
     }
+    fn put_block_pos(&mut self, [x, y, z]: [i32; 3]) -> &mut Self {
+        self.put_i64(
+            (x as i64 & 0x3FF_FFFF) << 38 | (z as i64 & 0x3FF_FFFF) << 12 | (y as i64 & 0xFFF),
+        )
+    }
+
     fn put_uuid(&mut self, v: u128) -> &mut Self {
         self.extend(v.to_be_bytes());
         self

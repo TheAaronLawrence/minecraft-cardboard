@@ -24,11 +24,24 @@ pub enum Event {
     Login {
         entity_id: i32,
     },
-    /// What the player may do: fly (creative), and whether it is flying, at what speed.
+    /// What the player may do: fly (creative), and whether it is flying, at what speed;
+    /// and break blocks instantly (creative).
     Abilities {
         flying: bool,
         may_fly: bool,
+        instabuild: bool,
         flying_speed: f32,
+    },
+    /// The server selected this hotbar slot (0 to 8), such as after picking a block.
+    HeldSlot(u8),
+    /// Hotbar slots (0 to 8) now hold these items: name and count, or nothing.
+    Hotbar(Vec<(u8, Option<(String, i32)>)>),
+    /// Another player's mining of a block: their entity id, the block, and the crack stage
+    /// (0 to 9), or `None` once they stop.
+    Destruction {
+        id: i32,
+        pos: [i32; 3],
+        stage: Option<u8>,
     },
     /// The server placed the player: feet position, yaw and pitch.
     Position {
@@ -39,6 +52,16 @@ pub enum Event {
     Chunk(mc_world::Chunk),
     /// The chunk left the player's view.
     Forget(i32, i32),
+    /// Blocks changed: position and new state.
+    Blocks(Vec<([i32; 3], u32)>),
+    /// New light for some sections of a chunk column: by section y, sky then block light.
+    /// A section left out keeps its light.
+    Light {
+        x: i32,
+        z: i32,
+        sky: Vec<(i32, Box<[u8; 2048]>)>,
+        block: Vec<(i32, Box<[u8; 2048]>)>,
+    },
     /// The connection ended, with the server's reason.
     Disconnected(String),
 }
@@ -206,7 +229,9 @@ pub fn connect(
             "login_compression" => conn.compress(r.varint()?),
             "login_finished" => break,
             "login_disconnect" => {
-                bail!("the server refused the login: {}", text_json(&r.string()?))
+                let json = r.string()?;
+                let component = serde_json::from_str(&json).unwrap_or(json.into());
+                bail!("the server refused the login: {}", reason(&component))
             }
             "hello" => bail!("the server is in online mode, which needs a Microsoft login"),
             "custom_query" => {
@@ -298,7 +323,7 @@ fn configure(conn: &mut Connection, packets: &Packets, view_distance: u8) -> Res
             "keep_alive" => conn.send(packets.id(STATE, "keep_alive")?, r.take(8)?)?,
             "ping" => conn.send(packets.id(STATE, "pong")?, r.take(4)?)?,
             "code_of_conduct" => conn.send(packets.id(STATE, "accept_code_of_conduct")?, &[])?,
-            "disconnect" => bail!("the server disconnected: {}", text_nbt(r.nbt()?)),
+            "disconnect" => bail!("the server disconnected: {}", nbt_reason(r.nbt()?)),
             "finish_configuration" => {
                 conn.send(packets.id(STATE, "finish_configuration")?, &[])?;
                 return Ok(config);
@@ -370,6 +395,7 @@ fn play(
                 tx.send(Event::Abilities {
                     flying: flags & 2 != 0,
                     may_fly: flags & 4 != 0,
+                    instabuild: flags & 8 != 0,
                     flying_speed: r.f32()?,
                 })
                 .is_ok()
@@ -431,13 +457,112 @@ fn play(
                     chunk::decode(&mut r, dimension, registry, &biomes, &block_entity_names)?;
                 tx.send(Event::Chunk(chunk)).is_ok()
             }
+            "container_set_content" => {
+                // The player's inventory menu is container 0: crafting result and grid (0 to
+                // 4), armour (5 to 8), the inventory (9 to 35), then the hotbar (36 to 44).
+                let container = r.varint()?;
+                r.varint()?; // state id
+                let mut slots = Vec::new();
+                if container == 0 {
+                    for slot in 0..r.count()? {
+                        // A stack whose data this can't read ends the list early.
+                        let Some(stack) = item_stack(&mut r, registry).ok() else {
+                            break;
+                        };
+                        if (36..45).contains(&slot) {
+                            slots.push(((slot - 36) as u8, stack));
+                        }
+                    }
+                }
+                tx.send(Event::Hotbar(slots)).is_ok()
+            }
+            "container_set_slot" => {
+                let container = r.varint()?;
+                r.varint()?; // state id
+                let slot = r.i16()?;
+                let changed = (container == 0 && (36..45).contains(&slot))
+                    .then(|| {
+                        Ok::<_, anyhow::Error>(((slot - 36) as u8, item_stack(&mut r, registry)?))
+                    })
+                    .transpose()?;
+                tx.send(Event::Hotbar(changed.into_iter().collect()))
+                    .is_ok()
+            }
+            "set_player_inventory" => {
+                // An `Inventory` index, where the hotbar is 0 to 8.
+                let slot = r.varint()?;
+                let changed = (0..9)
+                    .contains(&slot)
+                    .then(|| Ok::<_, anyhow::Error>((slot as u8, item_stack(&mut r, registry)?)))
+                    .transpose()?;
+                tx.send(Event::Hotbar(changed.into_iter().collect()))
+                    .is_ok()
+            }
+            "block_destruction" => {
+                let id = r.varint()?;
+                let pos = r.block_pos()?;
+                let stage = r.u8()?;
+                tx.send(Event::Destruction {
+                    id,
+                    pos,
+                    stage: (stage < 10).then_some(stage),
+                })
+                .is_ok()
+            }
+            "set_held_slot" => tx
+                .send(Event::HeldSlot(r.varint()?.clamp(0, 8) as u8))
+                .is_ok(),
+            "block_update" => {
+                let pos = r.block_pos()?;
+                tx.send(Event::Blocks(vec![(pos, r.count()? as u32)]))
+                    .is_ok()
+            }
+            "section_blocks_update" => {
+                // `SectionPos.asLong`: x in the top 22 bits, then z in 22, then y in 20.
+                let section = r.i64()?;
+                let origin = [
+                    (section >> 42) as i32 * 16,
+                    (section << 44 >> 44) as i32 * 16,
+                    (section << 22 >> 42) as i32 * 16,
+                ];
+                // Each entry: the state id above 12 bits of x, z and y in the section.
+                let changes = (0..r.count()?)
+                    .map(|_| {
+                        let v = r.varlong()?;
+                        let at = |shift: i64| (v >> shift & 15) as i32;
+                        let pos = [origin[0] + at(8), origin[1] + at(0), origin[2] + at(4)];
+                        Ok((pos, (v >> 12) as u32))
+                    })
+                    .collect::<Result<_>>()?;
+                tx.send(Event::Blocks(changes)).is_ok()
+            }
+            "light_update" => {
+                let dimension = dimension
+                    .as_ref()
+                    .context("light arrived before the login packet")?;
+                let (x, z) = (r.varint()?, r.varint()?);
+                let light = chunk::light(&mut r, dimension.light_sections())?;
+                let by_y = |arrays: Vec<(usize, Box<[u8; 2048]>)>| {
+                    arrays
+                        .into_iter()
+                        .map(|(i, a)| (dimension.light_section_y(i), a))
+                        .collect()
+                };
+                tx.send(Event::Light {
+                    x,
+                    z,
+                    sky: by_y(light.sky),
+                    block: by_y(light.block),
+                })
+                .is_ok()
+            }
             "forget_level_chunk" => {
                 // `ChunkPos.pack`: x in the low 32 bits, z in the high.
                 let packed = r.i64()?;
                 tx.send(Event::Forget(packed as i32, (packed >> 32) as i32))
                     .is_ok()
             }
-            "disconnect" => return Ok(text_nbt(r.nbt()?)),
+            "disconnect" => return Ok(nbt_reason(r.nbt()?)),
             "start_configuration" => {
                 return Ok("the server asked to reconfigure, which isn't supported yet".into());
             }
@@ -449,28 +574,165 @@ fn play(
     }
 }
 
-/// A chat component's text, from its JSON form (login disconnects send it so).
-fn text_json(json: &str) -> String {
-    match serde_json::from_str::<serde_json::Value>(json) {
-        Ok(serde_json::Value::String(s)) => s,
-        Ok(v) => v["text"]
-            .as_str()
-            .or(v["translate"].as_str())
-            .map_or_else(|| json.to_owned(), str::to_owned),
-        Err(_) => json.to_owned(),
+/// An `ItemStack.OPTIONAL_STREAM_CODEC` stack: its item and count, or `None` for an empty
+/// slot. Its data components follow without lengths, so each must be read to reach the
+/// next stack; the common ones are, and any other fails the read.
+fn item_stack(r: &mut Reader, registry: &Registry) -> Result<Option<(String, i32)>> {
+    let count = r.varint()?;
+    if count <= 0 {
+        return Ok(None);
+    }
+    let item = r.count()? as u32;
+    let name = registry
+        .item_name(item)
+        .with_context(|| format!("unknown item {item}"))?
+        .to_owned();
+    let (added, removed) = (r.count()?, r.count()?);
+    for _ in 0..added {
+        let kind = r.count()? as u32;
+        let kind = registry.component_type(kind).unwrap_or_default();
+        match kind.strip_prefix("minecraft:").unwrap_or(kind) {
+            "max_damage" | "damage" | "repair_cost" => {
+                r.varint()?;
+            }
+            "unbreakable" => {}
+            "enchantment_glint_override" => {
+                r.bool()?;
+            }
+            "custom_name" | "item_name" => {
+                r.nbt()?;
+            }
+            "lore" => {
+                for _ in 0..r.count()? {
+                    r.nbt()?;
+                }
+            }
+            "enchantments" | "stored_enchantments" => {
+                for _ in 0..r.count()? {
+                    r.varint()?; // enchantment
+                    r.varint()?; // level
+                }
+            }
+            other => bail!("can't read item component {other}"),
+        }
+    }
+    for _ in 0..removed {
+        r.varint()?;
+    }
+    Ok(Some((name, count)))
+}
+
+/// A disconnect reason as a player reads it: the chat component in English, plus how to
+/// fix it when the fix is on the player's side.
+fn reason(component: &serde_json::Value) -> String {
+    let lang = std::fs::read(mc_assets::locate(
+        "resources/assets/minecraft/lang/en_us.json",
+    ))
+    .ok()
+    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    .unwrap_or_default();
+    let text = component_text(component, &lang);
+    let hint = match component["translate"].as_str().unwrap_or_default() {
+        "multiplayer.disconnect.not_whitelisted" => {
+            "Run `whitelist off` in the server console, or `whitelist add <name>` for this name."
+        }
+        "multiplayer.disconnect.outdated_client" | "multiplayer.disconnect.outdated_server" => {
+            "This client speaks Minecraft 26.3; the server needs to run the same version."
+        }
+        "multiplayer.disconnect.name_taken" | "multiplayer.disconnect.duplicate_login" => {
+            "Someone is already playing with this name: pick another with --name."
+        }
+        "multiplayer.disconnect.banned" | "multiplayer.disconnect.banned.reason" => {
+            "Run `pardon <name>` in the server console to lift the ban."
+        }
+        _ => "",
+    };
+    if hint.is_empty() {
+        text
+    } else {
+        format!("{text}\n{hint}")
     }
 }
 
-/// A chat component's text, from its NBT form: a plain string, or a compound's `text` or
-/// `translate` key.
-fn text_nbt(tag: Option<mc_nbt::Tag>) -> String {
+/// The text of a chat component (JSON form, which NBT components convert to): `text`, or
+/// `translate` looked up in `lang` with its `%s` / `%1$s` slots filled from `with`, then
+/// each of `extra`.
+fn component_text(
+    c: &serde_json::Value,
+    lang: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    use serde_json::Value;
+    let mut out = match c {
+        Value::String(s) => return s.clone(),
+        Value::Array(parts) => return parts.iter().map(|p| component_text(p, lang)).collect(),
+        Value::Object(_) => String::new(),
+        other => return other.to_string(),
+    };
+    if let Some(text) = c["text"].as_str() {
+        out.push_str(text);
+    } else if let Some(key) = c["translate"].as_str() {
+        let args: Vec<String> = c["with"]
+            .as_array()
+            .map(|with| with.iter().map(|a| component_text(a, lang)).collect())
+            .unwrap_or_default();
+        let format = lang.get(key).and_then(Value::as_str).unwrap_or(key);
+        out.push_str(&fill(format, &args));
+    }
+    if let Some(extra) = c["extra"].as_array() {
+        out.extend(extra.iter().map(|e| component_text(e, lang)));
+    }
+    out
+}
+
+/// Fills a translation's `%s` (next argument), `%N$s` (argument N) and `%%` slots, as
+/// vanilla's `TranslatableContents` does. A missing argument fills nothing.
+fn fill(format: &str, args: &[String]) -> String {
+    let mut out = String::new();
+    let mut next = 0;
+    let mut rest = format;
+    while let Some(at) = rest.find('%') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        if let Some(after) = rest.strip_prefix('%') {
+            out.push('%');
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix('s') {
+            out.push_str(args.get(next).map_or("", String::as_str));
+            next += 1;
+            rest = after;
+        } else if let Some((n, after)) = rest
+            .split_once("$s")
+            .filter(|(n, _)| n.parse::<usize>().is_ok())
+        {
+            let n: usize = n.parse().unwrap();
+            out.push_str(args.get(n.wrapping_sub(1)).map_or("", String::as_str));
+            rest = after;
+        } else {
+            out.push('%');
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn nbt_reason(tag: Option<mc_nbt::Tag>) -> String {
+    reason(&tag.as_ref().map_or(serde_json::Value::Null, nbt_json))
+}
+
+/// A chat component sent as NBT, in the JSON form `component_text` reads.
+fn nbt_json(tag: &mc_nbt::Tag) -> serde_json::Value {
+    use mc_nbt::Tag;
     match tag {
-        Some(mc_nbt::Tag::String(s)) => s,
-        Some(mc_nbt::Tag::Compound(c)) => ["text", "translate"]
-            .iter()
-            .find_map(|k| c.get(*k).and_then(mc_nbt::Tag::as_str))
-            .map_or_else(|| format!("{c:?}"), str::to_owned),
-        other => format!("{other:?}"),
+        Tag::String(s) => s.clone().into(),
+        Tag::Compound(c) => c.iter().map(|(k, v)| (k.clone(), nbt_json(v))).collect(),
+        Tag::List(l) => l.items.iter().map(nbt_json).collect(),
+        Tag::Byte(n) => (*n).into(),
+        Tag::Short(n) => (*n).into(),
+        Tag::Int(n) => (*n).into(),
+        Tag::Long(n) => (*n).into(),
+        Tag::Float(n) => (*n).into(),
+        Tag::Double(n) => (*n).into(),
+        other => format!("{other:?}").into(),
     }
 }
 
@@ -484,6 +746,37 @@ mod tests {
         assert_eq!(
             format!("{:032x}", offline_uuid("Notch")),
             "b50ad385829d3141a2167e7d7539ba7f"
+        );
+    }
+
+    /// Translated reasons fill `%s` in order and `%N$s` by number, append `extra`, and
+    /// read the same from NBT; the whitelist kick says how to fix it.
+    #[test]
+    fn disconnect_reasons_read_like_vanilla() {
+        let lang = serde_json::json!({ "k": "%2$s then %s, %s %%", "inner": "<%s>" });
+        let lang = lang.as_object().unwrap();
+        let c = serde_json::json!({
+            "translate": "k",
+            "with": ["a", { "translate": "inner", "with": [7] }],
+            "extra": [{ "text": "!" }]
+        });
+        assert_eq!(component_text(&c, lang), "<7> then a, <7> %!");
+        assert_eq!(
+            component_text(&nbt_json(&mc_nbt::Tag::String("x".into())), lang),
+            "x"
+        );
+
+        let kick = mc_nbt::Tag::Compound(
+            [(
+                "translate".to_owned(),
+                mc_nbt::Tag::String("multiplayer.disconnect.not_whitelisted".into()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(
+            nbt_reason(Some(kick)),
+            "You are not white-listed on this server!\nRun `whitelist off` in the server console, or `whitelist add <name>` for this name."
         );
     }
 }

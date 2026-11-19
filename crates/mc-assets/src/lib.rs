@@ -89,6 +89,8 @@ impl Resources {
             elements: None,
             ambient_occlusion: None,
             generated: false,
+            gui: None,
+            gui_light_front: None,
         };
         let mut next = Some(id.to_owned());
         let mut depth = 0;
@@ -111,6 +113,12 @@ impl Resources {
                 model.elements = raw.elements;
             }
             model.ambient_occlusion = model.ambient_occlusion.or(raw.ambientocclusion);
+            if model.gui.is_none() {
+                model.gui = raw.display.and_then(|mut d| d.remove("gui"));
+            }
+            if model.gui_light_front.is_none() {
+                model.gui_light_front = raw.gui_light.map(|l| l == "front");
+            }
             next = raw.parent;
         }
         Ok(model)
@@ -260,6 +268,8 @@ struct RawModel {
     textures: HashMap<String, TextureRef>,
     elements: Option<Vec<Element>>,
     ambientocclusion: Option<bool>,
+    display: Option<HashMap<String, Transform>>,
+    gui_light: Option<String>,
 }
 
 /// A model with its parent chain merged in.
@@ -272,6 +282,27 @@ pub struct Model {
     pub ambient_occlusion: Option<bool>,
     /// Extruded from its `layer0`, `layer1`… sprites, like most item models.
     pub generated: bool,
+    /// How an item drawn with this model sits in an inventory slot (`display.gui`).
+    pub gui: Option<Transform>,
+    /// `gui_light`: lit from the front, as flat items are, rather than from the side as
+    /// blocks are. `None` when no model in the chain says, which means side.
+    pub gui_light_front: Option<bool>,
+}
+
+/// An `ItemTransform`: rotation in degrees about x, y then z, translation in model pixels,
+/// and scale, applied scale first.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Transform {
+    #[serde(default)]
+    pub rotation: [f32; 3],
+    #[serde(default)]
+    pub translation: [f32; 3],
+    #[serde(default = "unit_scale")]
+    pub scale: [f32; 3],
+}
+
+fn unit_scale() -> [f32; 3] {
+    [1.0; 3]
 }
 
 impl Model {

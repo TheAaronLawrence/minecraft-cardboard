@@ -191,6 +191,13 @@ impl Chunk {
             .filter(|s| s.y == section_y)
     }
 
+    pub fn section_mut(&mut self, section_y: i32) -> Option<&mut Section> {
+        let first = self.sections.first()?.y;
+        self.sections
+            .get_mut(usize::try_from(section_y - first).ok()?)
+            .filter(|s| s.y == section_y)
+    }
+
     /// The state at world block coordinates, which must be inside this chunk. Outside the
     /// saved sections it's `None`.
     pub fn block(&self, x: i32, y: i32, z: i32) -> Option<u32> {
@@ -293,6 +300,19 @@ impl Section {
         match &self.blocks {
             Blocks::Uniform(id) => *id,
             Blocks::Mixed(ids) => ids[(y * 16 + z) * 16 + x],
+        }
+    }
+
+    /// Sets the state at coordinates 0..16 within the section.
+    pub fn set_block(&mut self, x: usize, y: usize, z: usize, state: u32) {
+        if let Blocks::Uniform(id) = self.blocks {
+            if id == state {
+                return;
+            }
+            self.blocks = Blocks::Mixed(Box::new([id; 4096]));
+        }
+        if let Blocks::Mixed(ids) = &mut self.blocks {
+            ids[(y * 16 + z) * 16 + x] = state;
         }
     }
 

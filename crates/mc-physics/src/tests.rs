@@ -143,3 +143,56 @@ fn sneaking_stays_on_ledges() {
     run(&mut p, FORWARD, 40, &world, &physics);
     assert!(p.pos.y < 63.0, "{}", p.pos);
 }
+
+/// Looking straight down hits the top of the floor; looking level at short grass hits its
+/// outline (2 px in from the block edge), not the block's full cube, and a ray over the
+/// grass's 13 px top passes it by.
+#[test]
+fn picks_block_outlines() {
+    let (registry, physics, mut world) = setup(|_, _| true);
+    let grass = registry
+        .block("minecraft:short_grass")
+        .unwrap()
+        .default_state;
+    world.blocks.insert([0, 64, 3], grass);
+
+    let eye = DVec3::new(0.5, 65.62, 0.5);
+    let down = view_vector(0.0, 90.0);
+    let hit = pick(&world, &physics, eye, eye + down * 4.5).unwrap();
+    assert_eq!(
+        (hit.pos, hit.face, hit.inside),
+        (glam::IVec3::new(0, 63, 0), 1, false)
+    );
+    assert!((hit.location.y - 64.0).abs() < 1e-9);
+
+    // Yaw 0 looks south, toward +z.
+    let low = DVec3::new(0.5, 64.5, 0.5);
+    let hit = pick(&world, &physics, low, low + view_vector(0.0, 0.0) * 4.5).unwrap();
+    assert_eq!((hit.pos, hit.face), (glam::IVec3::new(0, 64, 3), 2));
+    assert!((hit.location.z - 3.125).abs() < 1e-6, "{hit:?}");
+
+    let high = DVec3::new(0.5, 64.9, 0.5);
+    assert_eq!(
+        pick(&world, &physics, high, high + view_vector(0.0, 0.0) * 4.5),
+        None
+    );
+}
+
+/// Vanilla's bare-handed break times: stone 7.5 s (150 ticks), dirt 0.75 s, five times
+/// slower in the air, and bedrock never.
+#[test]
+fn destroy_progress_matches_vanilla() {
+    let (registry, physics, _) = setup(|_, _| true);
+    let state = |name: &str| registry.block(name).unwrap().default_state;
+    let ticks = |name: &str, on_ground: bool| {
+        (1.0 / physics.destroy_progress(state(name), on_ground)).ceil()
+    };
+    assert_eq!(ticks("minecraft:stone", true), 150.0);
+    assert_eq!(ticks("minecraft:dirt", true), 15.0);
+    assert_eq!(ticks("minecraft:dirt", false), 75.0);
+    assert_eq!(
+        physics.destroy_progress(state("minecraft:bedrock"), true),
+        0.0
+    );
+    assert!(physics.destroy_progress(state("minecraft:short_grass"), true) >= 1.0);
+}

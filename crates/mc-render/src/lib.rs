@@ -6,6 +6,8 @@ pub mod bake;
 pub mod chest;
 pub mod entity_model;
 pub mod gpu;
+pub mod hud;
+pub mod item;
 pub mod mesh;
 pub mod mipmap;
 pub mod tint;

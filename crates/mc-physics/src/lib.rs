@@ -3,17 +3,22 @@
 //! speed factors, collision with block shapes and stepping up, backing off edges while
 //! sneaking, ladders, and creative flight.
 //!
-//! Collision shapes and block friction come from `resources/reports/physics.json`, which
+//! `pick` finds the block the player looks at, against block outline shapes, as
+//! `Entity.pick` does; `BlockPhysics::destroy_progress` is how far a tick of mining gets.
+//!
+//! Collision and outline shapes, block friction and destroy times come from `resources/reports/physics.json`, which
 //! `cargo xtask gen-reports` dumps from vanilla, so they match it exactly. Not yet covered:
 //! swimming and other fluid movement, bouncing on slime and beds, cobwebs and powder snow,
 //! and entities as obstacles.
 
 mod collide;
+mod pick;
 
 use anyhow::{Context, Result};
-use collide::Aabb;
+pub use collide::Aabb;
 use glam::DVec3;
 use mc_registry::Registry;
+pub use pick::{BlockHit, pick, view_vector};
 use std::collections::HashSet;
 
 /// What movement needs to know about the world.
@@ -27,8 +32,15 @@ pub trait World {
 /// Each block state's collision boxes, and each block's movement properties.
 pub struct BlockPhysics {
     shapes: Vec<Vec<Aabb>>,
-    /// Shape index per state id.
+    /// Each shape's edges, from one corner to the other, as outlines draw them.
+    edges: Vec<Vec<[f64; 6]>>,
+    /// Collision and outline shape index per state id.
     state_shapes: Vec<u16>,
+    outlines: Vec<u16>,
+    /// Per state id: `Block.defaultDestroyTime` (-1 for unbreakable) and
+    /// `requiresCorrectToolForDrops`.
+    destroy_time: Vec<f32>,
+    requires_tool: Vec<bool>,
     /// Per state id: `Block.getFriction`, `getSpeedFactor`, `getJumpFactor`.
     friction: Vec<f32>,
     speed_factor: Vec<f32>,
@@ -69,18 +81,48 @@ impl BlockPhysics {
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;
-        let state_shapes: Vec<u16> = report["states"]
+        let edges = report["edges"]
             .as_array()
-            .context("physics.json has no states")?
+            .context("physics.json has no edges")?
             .iter()
-            .map(|v| v.as_u64().map(|v| v as u16).context("shape index"))
-            .collect::<Result<_>>()?;
+            .map(|shape| {
+                shape
+                    .as_array()
+                    .context("edges are not a list")?
+                    .iter()
+                    .map(|e| {
+                        let c: Vec<f64> = e
+                            .as_array()
+                            .context("edge is not a list")?
+                            .iter()
+                            .map(|v| v.as_f64().context("edge coordinate"))
+                            .collect::<Result<_>>()?;
+                        c.try_into().ok().context("edge needs 6 coordinates")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
         anyhow::ensure!(
-            state_shapes.len() == registry.state_count() as usize,
-            "physics.json has {} states, the registry {}",
-            state_shapes.len(),
-            registry.state_count()
+            edges.len() == shapes.len(),
+            "physics.json: one edge list per shape"
         );
+        let shape_ids = |key: &str| -> Result<Vec<u16>> {
+            let ids: Vec<u16> = report[key]
+                .as_array()
+                .with_context(|| format!("physics.json has no {key}"))?
+                .iter()
+                .map(|v| v.as_u64().map(|v| v as u16).context("shape index"))
+                .collect::<Result<_>>()?;
+            anyhow::ensure!(
+                ids.len() == registry.state_count() as usize
+                    && ids.iter().all(|&i| (i as usize) < shapes.len()),
+                "physics.json's {key} don't fit the registry's {} states",
+                registry.state_count()
+            );
+            Ok(ids)
+        };
+        let state_shapes = shape_ids("states")?;
+        let outlines = shape_ids("outlines")?;
 
         let n = state_shapes.len();
         let (mut friction, mut speed_factor, mut jump_factor) =
@@ -102,6 +144,21 @@ impl BlockPhysics {
             }
         }
 
+        let (mut destroy_time, mut requires_tool) = (vec![0.0f32; n], vec![false; n]);
+        for (name, mining) in report["mining"]
+            .as_object()
+            .context("physics.json has no mining")?
+        {
+            let block = registry
+                .block(name)
+                .with_context(|| format!("physics.json names unknown block {name}"))?;
+            let states =
+                block.first_state as usize..(block.first_state + block.state_count()) as usize;
+            let time = mining[0].as_f64().context("destroy time")?;
+            destroy_time[states.clone()].fill(time as f32);
+            requires_tool[states].fill(mining[1].as_bool().context("requires tool")?);
+        }
+
         let mut climbable = vec![false; n];
         for name in block_tag("minecraft:climbable")? {
             if let Some(block) = registry.block(&name) {
@@ -111,7 +168,11 @@ impl BlockPhysics {
         }
         Ok(Self {
             shapes,
+            edges,
             state_shapes,
+            outlines,
+            destroy_time,
+            requires_tool,
             friction,
             speed_factor,
             jump_factor,
@@ -123,6 +184,38 @@ impl BlockPhysics {
         self.state_shapes
             .get(state as usize)
             .map_or(&[], |&i| &self.shapes[i as usize])
+    }
+
+    /// The boxes the game outlines and aims at (`BlockState.getShape`), in block units.
+    pub fn outline(&self, state: u32) -> &[Aabb] {
+        self.outlines
+            .get(state as usize)
+            .map_or(&[], |&i| &self.shapes[i as usize])
+    }
+
+    /// The outline's edges, as drawn around the block the player looks at.
+    pub fn outline_edges(&self, state: u32) -> &[[f64; 6]] {
+        self.outlines
+            .get(state as usize)
+            .map_or(&[], |&i| &self.edges[i as usize])
+    }
+
+    /// How much of the block a tick of mining it with an empty hand breaks, where 1 is all
+    /// of it (`BlockBehaviour.getDestroyProgress` with `Player.getDestroySpeed`): a fifth as
+    /// much off the ground, and nothing for unbreakable blocks. Not yet counted: the held
+    /// tool, effects, and mining underwater.
+    pub fn destroy_progress(&self, state: u32, on_ground: bool) -> f32 {
+        let time = self.destroy_time[state as usize];
+        if time == -1.0 {
+            return 0.0;
+        }
+        let speed = if on_ground { 1.0 } else { 1.0 / 5.0 };
+        let tool = if self.requires_tool[state as usize] {
+            100.0
+        } else {
+            30.0
+        };
+        speed / time / tool
     }
 }
 

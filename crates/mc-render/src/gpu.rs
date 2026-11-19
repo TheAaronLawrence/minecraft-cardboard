@@ -41,6 +41,18 @@ pub struct View {
     pub distance: f32,
     /// Game ticks since the world started, which animate end portals.
     pub ticks: f32,
+    /// Draw the crosshair (a window does; screenshots for comparison don't).
+    pub hud: bool,
+}
+
+/// A corner of an outline edge's quad: the edge's end, its direction, and which side of
+/// the line this corner is on. The vertex shader widens the line on screen.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LineVertex {
+    pos: [f32; 3],
+    dir: [f32; 3],
+    side: f32,
 }
 
 #[repr(C)]
@@ -53,6 +65,8 @@ struct Uniforms {
     sky_color: [f32; 4],
     params: [f32; 4],
     time: [f32; 4],
+    /// Width and height in pixels, the outline width in pixels, and the GUI scale.
+    screen: [f32; 4],
 }
 
 /// Vanilla's plains sky and fog colours at noon.
@@ -69,6 +83,20 @@ fn color(c: u32) -> [f32; 4] {
     ]
 }
 
+/// Vanilla's automatic GUI scale: the largest that leaves the screen at least 320 × 240
+/// GUI pixels (`Window.calculateScale` with the setting at 0).
+fn gui_scale(width: u32, height: u32) -> u32 {
+    let mut scale = 1;
+    while scale < width
+        && scale < height
+        && width / (scale + 1) >= 320
+        && height / (scale + 1) >= 240
+    {
+        scale += 1;
+    }
+    scale
+}
+
 /// A chunk's vertex buffer and index count per layer, if it has any quads in it.
 type ChunkBuffers = [Option<(wgpu::Buffer, u32)>; 4];
 
@@ -80,6 +108,16 @@ pub struct Renderer {
     cutout: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
     portal: wgpu::RenderPipeline,
+    outline: wgpu::RenderPipeline,
+    crosshair: wgpu::RenderPipeline,
+    gui: wgpu::RenderPipeline,
+    crack: wgpu::RenderPipeline,
+    hud_art: crate::hud::HudArt,
+    hotbar: Option<crate::hud::Hotbar>,
+    /// The cracks over blocks being mined, and their index count.
+    crack_vertices: Option<(wgpu::Buffer, u32)>,
+    /// The outline around the block the player looks at, and its index count.
+    outline_vertices: Option<(wgpu::Buffer, u32)>,
     bind_group: wgpu::BindGroup,
     portal_bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
@@ -355,6 +393,153 @@ impl Renderer {
             false,
         );
         let portal = pipeline("fs_portal", None, true, false);
+        let line_layout = Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<LineVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32],
+        });
+        // Drawn over the world, tested against its depth but not writing it.
+        let overlay = |vertex: &str,
+                       fragment: &str,
+                       buffers: &[Option<wgpu::VertexBufferLayout>],
+                       blend: wgpu::BlendState,
+                       depth_compare: wgpu::CompareFunction| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(fragment),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vertex),
+                    buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(depth_compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let outline = overlay(
+            "vs_line",
+            "fs_line",
+            std::slice::from_ref(&line_layout),
+            wgpu::BlendState::ALPHA_BLENDING,
+            wgpu::CompareFunction::LessEqual,
+        );
+        // Vanilla's crosshair inverts what's behind it.
+        let invert = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::OneMinusDst,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let crosshair = overlay(
+            "vs_sky",
+            "fs_crosshair",
+            &[],
+            wgpu::BlendState {
+                color: invert,
+                alpha: wgpu::BlendComponent::OVER,
+            },
+            wgpu::CompareFunction::Always,
+        );
+        let vertex_layouts = std::slice::from_ref(&vertex_layout);
+        // The HUD has a depth buffer of its own, so items' faces hide each other.
+        let gui = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gui"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_gui"),
+                buffers: vertex_layouts,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_gui"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // `RenderTypes.crumbling`: the crack texture doubles or darkens what's under it, drawn
+        // just in front of the block's faces.
+        let crack = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("crack"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: vertex_layouts,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_crack"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Dst,
+                            dst_factor: wgpu::BlendFactor::Src,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent::REPLACE,
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                // `glPolygonOffset(-1, -10)`.
+                bias: wgpu::DepthBiasState {
+                    constant: -10,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         Self {
             device,
             queue,
@@ -363,6 +548,14 @@ impl Renderer {
             cutout,
             translucent,
             portal,
+            outline,
+            crosshair,
+            gui,
+            crack,
+            hud_art: models.hud.clone(),
+            hotbar: None,
+            crack_vertices: None,
+            outline_vertices: None,
             bind_group,
             portal_bind_group,
             uniforms,
@@ -376,6 +569,81 @@ impl Renderer {
     pub fn upload_chunk(&mut self, key: (i32, i32), mesh: &Mesh) {
         let lists = [&mesh.opaque, &mesh.cutout, &mesh.translucent, &mesh.portal];
         let quads = lists.iter().map(|l| l.len() / 4).max().unwrap_or(0) as u32;
+        self.ensure_indices(quads);
+        let buffers = lists.map(|vertices| {
+            (!vertices.is_empty()).then(|| {
+                let buffer = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None,
+                        contents: bytemuck::cast_slice(vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                (buffer, (vertices.len() / 4 * 6) as u32)
+            })
+        });
+        self.chunks.insert(key, buffers);
+    }
+
+    /// Outlines these edges (world coordinates, from one end to the other), as vanilla
+    /// outlines the block the player looks at; none clears it.
+    pub fn set_outline(&mut self, edges: &[[f32; 6]]) {
+        if edges.is_empty() {
+            self.outline_vertices = None;
+            return;
+        }
+        let vertices: Vec<LineVertex> = edges
+            .iter()
+            .flat_map(|e| {
+                let (a, b) = (Vec3::from_slice(&e[..3]), Vec3::from_slice(&e[3..]));
+                let dir = (b - a).normalize_or_zero().to_array();
+                [(a, 1.0), (a, -1.0), (b, -1.0), (b, 1.0)].map(|(p, side)| LineVertex {
+                    pos: p.to_array(),
+                    dir,
+                    side,
+                })
+            })
+            .collect();
+        self.ensure_indices(edges.len() as u32);
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("outline"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        self.outline_vertices = Some((buffer, edges.len() as u32 * 6));
+    }
+
+    /// The hotbar to draw over the world, or none.
+    pub fn set_hotbar(&mut self, hotbar: Option<crate::hud::Hotbar>) {
+        self.hotbar = hotbar;
+    }
+
+    /// Draws these crack quads (from `hud::cracks`) over blocks being mined.
+    pub fn set_cracks(&mut self, vertices: &[Vertex]) {
+        self.crack_vertices = self.quads_buffer("cracks", vertices);
+    }
+
+    /// A vertex buffer of whole quads and its index count, growing the index buffer to fit.
+    fn quads_buffer(&mut self, label: &str, vertices: &[Vertex]) -> Option<(wgpu::Buffer, u32)> {
+        if vertices.is_empty() {
+            return None;
+        }
+        let quads = (vertices.len() / 4) as u32;
+        self.ensure_indices(quads);
+        let buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        Some((buffer, quads * 6))
+    }
+
+    /// Makes the shared index buffer hold at least `quads` quads.
+    fn ensure_indices(&mut self, quads: u32) {
         if self.indices.as_ref().is_none_or(|(_, n)| *n < quads) {
             // Grow to the next power of two, so a stream of chunks rarely regrows it.
             let n = quads.next_power_of_two();
@@ -391,19 +659,6 @@ impl Renderer {
                 });
             self.indices = Some((buffer, n));
         }
-        let buffers = lists.map(|vertices| {
-            (!vertices.is_empty()).then(|| {
-                let buffer = self
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None,
-                        contents: bytemuck::cast_slice(vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                (buffer, (vertices.len() / 4 * 6) as u32)
-            })
-        });
-        self.chunks.insert(key, buffers);
     }
 
     pub fn remove_chunk(&mut self, key: (i32, i32)) {
@@ -464,9 +719,27 @@ impl Renderer {
             params: [fog_start, fog_end, 1.0, 0.5],
             // `GlobalSettingsUniform`'s GameTime.
             time: [(view.ticks % 24000.0) / 24000.0, 0.0, 0.0, 0.0],
+            screen: [
+                width as f32,
+                height as f32,
+                // `Window.getAppropriateLineWidth`.
+                (width as f32 / 1920.0 * 2.5).max(2.5),
+                gui_scale(width, height) as f32,
+            ],
         };
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        let scale = gui_scale(width, height);
+        let gui_mesh = match (&self.hotbar, view.hud) {
+            (Some(hotbar), true) => crate::hud::hotbar(
+                &self.hud_art,
+                hotbar,
+                width.div_ceil(scale),
+                height.div_ceil(scale),
+            ),
+            _ => Default::default(),
+        };
+        let gui_buffer = self.quads_buffer("gui", &gui_mesh.vertices);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -519,6 +792,76 @@ impl Renderer {
                             pass.draw_indexed(0..*count, 0, 0..1);
                         }
                     }
+                }
+                if let Some((buffer, count)) = &self.crack_vertices {
+                    pass.set_pipeline(&self.crack);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+                if let Some((buffer, count)) = &self.outline_vertices {
+                    pass.set_pipeline(&self.outline);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+            if view.hud {
+                pass.set_pipeline(&self.crosshair);
+                pass.draw(0..3, 0..1);
+            }
+        }
+        if gui_buffer.is_some() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hud"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth.as_ref().expect("made above").0,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            if let (Some((buffer, count)), Some((indices, _))) = (&gui_buffer, &self.indices) {
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_pipeline(&self.gui);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                // Unclipped runs between the clipped ones draw over the whole screen.
+                let mut runs = Vec::new();
+                let mut next = 0;
+                for (range, rect) in &gui_mesh.clips {
+                    runs.push((next..range.start, None));
+                    runs.push((range.clone(), Some(rect)));
+                    next = range.end;
+                }
+                runs.push((next..count / 6, None));
+                for (quads, rect) in runs {
+                    if quads.is_empty() {
+                        continue;
+                    }
+                    let (x, y, w, h) = match rect {
+                        Some(&[x, y, w, h]) => {
+                            let s = scale as f32;
+                            let x0 = ((x * s) as u32).min(width);
+                            let y0 = ((y * s) as u32).min(height);
+                            let x1 = (((x + w) * s) as u32).min(width);
+                            let y1 = (((y + h) * s) as u32).min(height);
+                            (x0, y0, x1 - x0, y1 - y0)
+                        }
+                        None => (0, 0, width, height),
+                    };
+                    pass.set_scissor_rect(x, y, w, h);
+                    pass.draw_indexed(quads.start * 6..quads.end * 6, 0, 0..1);
                 }
             }
         }

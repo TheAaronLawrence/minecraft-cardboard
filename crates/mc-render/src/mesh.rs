@@ -189,6 +189,43 @@ impl WorldView {
         self.chunks.contains_key(&(cx, cz))
     }
 
+    /// Sets a block's state, dropping the block entity it had; false when its chunk or
+    /// section isn't loaded.
+    pub fn set_block(&mut self, [x, y, z]: [i32; 3], state: u32) -> bool {
+        let Some(chunk) = self.chunks.get_mut(&(x.div_euclid(16), z.div_euclid(16))) else {
+            return false;
+        };
+        chunk.block_entities.remove(&[x, y, z]);
+        let Some(section) = chunk.section_mut(y.div_euclid(16)) else {
+            return false;
+        };
+        let local = [x, y, z].map(|c| c.rem_euclid(16) as usize);
+        section.set_block(local[0], local[1], local[2], state);
+        true
+    }
+
+    /// Replaces the sky or block light of a section of a loaded chunk.
+    pub fn set_light(
+        &mut self,
+        (cx, cz): (i32, i32),
+        section_y: i32,
+        sky: bool,
+        light: Box<[u8; 2048]>,
+    ) {
+        let Some(section) = self
+            .chunks
+            .get_mut(&(cx, cz))
+            .and_then(|c| c.section_mut(section_y))
+        else {
+            return;
+        };
+        if sky {
+            section.sky_light = Some(light);
+        } else {
+            section.block_light = Some(light);
+        }
+    }
+
     /// The loaded chunks' positions, in chunk coordinates.
     pub fn chunk_positions(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
         self.chunks.keys().copied()

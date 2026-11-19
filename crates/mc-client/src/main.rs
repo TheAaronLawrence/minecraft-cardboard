@@ -9,7 +9,9 @@
 //! On a server, the camera starts where the server puts the player, unless `--pos` and
 //! `--look` say otherwise.
 //! In the window: click to capture the mouse, WASD to move, Space and Shift to go up and
-//! down, Ctrl to fly faster, Esc to release the mouse.
+//! down, Ctrl to fly faster, Esc to release the mouse. On a server, left click mines, right
+//! click places or uses, middle click picks the block, and 1 to 9 or the wheel choose the
+//! hotbar slot.
 
 use anyhow::{Context, Result, bail};
 use glam::Vec3;
@@ -227,6 +229,7 @@ fn run() -> Result<()> {
     let view = View {
         distance: (args.distance * 16) as f32,
         ticks: args.ticks,
+        hud: false,
     };
     match args.screenshot.clone() {
         Some(path) if args.server.is_some() => {
@@ -279,7 +282,11 @@ fn run() -> Result<()> {
                 models,
                 streamer,
                 walker,
-                view,
+                view: View { hud: true, ..view },
+                buttons: Default::default(),
+                outlined: None,
+                shown_hotbar: None,
+                shown_cracks: Vec::new(),
                 state: None,
                 keys: Default::default(),
                 last_frame: Instant::now(),
@@ -368,6 +375,13 @@ struct App {
     view: View,
     state: Option<WindowState>,
     keys: std::collections::HashSet<winit::keyboard::KeyCode>,
+    /// Mouse buttons held while the mouse is captured.
+    buttons: walk::Buttons,
+    /// The block the outline is drawn around, and its state.
+    outlined: Option<(glam::IVec3, u32)>,
+    /// What the hotbar and the cracks last showed.
+    shown_hotbar: Option<mc_render::hud::Hotbar>,
+    shown_cracks: Vec<([i32; 3], u32, u8)>,
     last_frame: Instant,
     captured: bool,
 }
@@ -490,6 +504,40 @@ impl winit::application::ApplicationHandler for App {
                 self.captured = grab.is_ok();
                 state.window.set_cursor_visible(!self.captured);
             }
+            WindowEvent::MouseInput {
+                state: pressed,
+                button,
+                ..
+            } => {
+                use winit::event::MouseButton;
+                let down = pressed == ElementState::Pressed;
+                match button {
+                    MouseButton::Left => self.buttons.attack = down,
+                    MouseButton::Right => self.buttons.use_item = down,
+                    _ => {}
+                }
+                let click = match button {
+                    MouseButton::Left => Some(walk::Click::Attack),
+                    MouseButton::Right => Some(walk::Click::Use),
+                    MouseButton::Middle => Some(walk::Click::Pick),
+                    _ => None,
+                };
+                if down && let (Some(click), Some(walker)) = (click, &mut self.walker) {
+                    walker.click(click);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.captured => {
+                let lines = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                };
+                // Scrolling down moves right along the hotbar.
+                if let Some(walker) = &mut self.walker
+                    && lines != 0.0
+                {
+                    walker.scroll(if lines < 0.0 { 1 } else { -1 });
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
                     if code == winit::keyboard::KeyCode::Escape
@@ -500,6 +548,24 @@ impl winit::application::ApplicationHandler for App {
                             .set_cursor_grab(winit::window::CursorGrabMode::None);
                         state.window.set_cursor_visible(true);
                         self.captured = false;
+                        self.buttons = Default::default();
+                    }
+                    let digits = [
+                        winit::keyboard::KeyCode::Digit1,
+                        winit::keyboard::KeyCode::Digit2,
+                        winit::keyboard::KeyCode::Digit3,
+                        winit::keyboard::KeyCode::Digit4,
+                        winit::keyboard::KeyCode::Digit5,
+                        winit::keyboard::KeyCode::Digit6,
+                        winit::keyboard::KeyCode::Digit7,
+                        winit::keyboard::KeyCode::Digit8,
+                        winit::keyboard::KeyCode::Digit9,
+                    ];
+                    if event.state == ElementState::Pressed
+                        && let Some(slot) = digits.iter().position(|&k| k == code)
+                        && let Some(walker) = &mut self.walker
+                    {
+                        walker.select(slot as u8);
                     }
                     match event.state {
                         ElementState::Pressed => self.keys.insert(code),
@@ -532,6 +598,11 @@ impl winit::application::ApplicationHandler for App {
                                 walker.chunk(key, blocks);
                             }
                         }
+                        stream::Update::Blocks(changes) => {
+                            if let Some(walker) = &mut self.walker {
+                                walker.blocks(&changes);
+                            }
+                        }
                         stream::Update::Server(event) => {
                             if let Some(walker) = &mut self.walker {
                                 walker.server_event(event);
@@ -549,13 +620,39 @@ impl winit::application::ApplicationHandler for App {
                 match &mut self.walker {
                     Some(walker) => {
                         let camera = &mut self.args.camera;
-                        let input = if self.captured {
-                            walk::input(&self.keys)
+                        let (input, buttons) = if self.captured {
+                            (walk::input(&self.keys), self.buttons)
                         } else {
                             Default::default()
                         };
-                        if let Some(eye) = walker.frame(dt, input, camera.yaw, camera.pitch) {
+                        if let Some(eye) =
+                            walker.frame(dt, input, buttons, camera.yaw, camera.pitch)
+                        {
                             camera.eye = eye;
+                        }
+                        if let Some(state) = &mut self.state {
+                            let renderer = &mut state.renderer;
+                            let target = walker.target();
+                            if target != self.outlined {
+                                self.outlined = target;
+                                renderer.set_outline(&walker.outline_edges());
+                            }
+                            let hotbar = Some(walker.hotbar());
+                            if hotbar != self.shown_hotbar {
+                                renderer.set_hotbar(hotbar.clone());
+                                self.shown_hotbar = hotbar;
+                            }
+                            let cracks = walker.cracks();
+                            if cracks != self.shown_cracks {
+                                let vertices: Vec<_> = cracks
+                                    .iter()
+                                    .flat_map(|&(pos, block, stage)| {
+                                        mc_render::hud::cracks(&self.models, block, pos, stage)
+                                    })
+                                    .collect();
+                                renderer.set_cracks(&vertices);
+                                self.shown_cracks = cracks;
+                            }
                         }
                     }
                     None => self.fly(dt),

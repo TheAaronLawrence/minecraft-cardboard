@@ -54,7 +54,29 @@ fn redstone(power: u32) -> [f32; 3] {
     [r, g, b].map(|c| (c * 255.0).floor() / 255.0)
 }
 
-fn rgb(c: u32) -> [f32; 3] {
+/// A colour map, such as `grass`, from `textures/colormap`.
+pub(crate) fn colormap(res: &Resources, name: &str) -> Result<image::RgbaImage> {
+    Ok(
+        image::open(res.asset_path("textures", &format!("colormap/{name}"), "png"))
+            .with_context(|| format!("colormap {name}"))?
+            .to_rgba8(),
+    )
+}
+
+/// `GrassColor.get` / `FoliageColor.get`: the map's colour for a climate, where humidity is
+/// scaled by temperature.
+pub(crate) fn lookup(map: &image::RgbaImage, temperature: f32, downfall: f32) -> [f32; 3] {
+    let (t, d) = (temperature.clamp(0.0, 1.0), downfall.clamp(0.0, 1.0));
+    let (x, y) = (((1.0 - t) * 255.0) as u32, ((1.0 - d * t) * 255.0) as u32);
+    let p = map.get_pixel(x.min(255), y.min(255));
+    [
+        p[0] as f32 / 255.0,
+        p[1] as f32 / 255.0,
+        p[2] as f32 / 255.0,
+    ]
+}
+
+pub(crate) fn rgb(c: u32) -> [f32; 3] {
     [
         (c >> 16 & 0xFF) as f32 / 255.0,
         (c >> 8 & 0xFF) as f32 / 255.0,
@@ -83,26 +105,9 @@ pub struct Biomes {
 impl Biomes {
     /// Loads the named biomes' colours from their data files.
     pub fn load(res: &Resources, names: impl IntoIterator<Item = String>) -> Result<Self> {
-        let colormap = |name: &str| -> Result<image::RgbaImage> {
-            Ok(
-                image::open(res.asset_path("textures", &format!("colormap/{name}"), "png"))
-                    .with_context(|| format!("colormap {name}"))?
-                    .to_rgba8(),
-            )
-        };
+        let colormap = |name: &str| colormap(res, name);
         let (grass_map, foliage_map) = (colormap("grass")?, colormap("foliage")?);
         let dry_foliage_map = colormap("dry_foliage")?;
-        let lookup = |map: &image::RgbaImage, temperature: f32, downfall: f32| {
-            // GrassColor.get / FoliageColor.get: humidity is scaled by temperature.
-            let (t, d) = (temperature.clamp(0.0, 1.0), downfall.clamp(0.0, 1.0));
-            let (x, y) = (((1.0 - t) * 255.0) as u32, ((1.0 - d * t) * 255.0) as u32);
-            let p = map.get_pixel(x.min(255), y.min(255));
-            [
-                p[0] as f32 / 255.0,
-                p[1] as f32 / 255.0,
-                p[2] as f32 / 255.0,
-            ]
-        };
 
         let mut colors = HashMap::new();
         for name in names {

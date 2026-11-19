@@ -11,6 +11,8 @@ struct Uniforms {
     params: vec4<f32>,
     // x: vanilla's `GameTime`, the day's progress, (ticks % 24000) / 24000.
     time: vec4<f32>,
+    // Width and height in pixels, outline width in pixels, GUI scale.
+    screen: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -218,4 +220,93 @@ fn fs_portal(in: PortalOut) -> @location(0) vec4<f32> {
     }
     let fog = smoothstep(u.params.x, u.params.y, in.distance);
     return vec4<f32>(mix(color, u.fog_color.rgb, fog), 1.0);
+}
+
+// The block outline: vanilla's `rendertype_lines`. Each corner of an edge's quad is placed
+// on screen from the edge's end and direction, then pushed sideways by half the line width
+// in pixels, so lines are equally thick at any distance. `VIEW_SCALE` pulls them a hair
+// toward the camera so they draw over the faces they lie on.
+const VIEW_SCALE: f32 = 1.0 - 1.0 / 256.0;
+
+struct LineIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) dir: vec3<f32>,
+    @location(2) side: f32,
+};
+
+@vertex
+fn vs_line(in: LineIn) -> @builtin(position) vec4<f32> {
+    let eye = u.eye.xyz;
+    let start = u.view_proj * vec4<f32>(eye + (in.pos - eye) * VIEW_SCALE, 1.0);
+    let end = u.view_proj * vec4<f32>(eye + (in.pos + in.dir - eye) * VIEW_SCALE, 1.0);
+    let ndc1 = start.xyz / start.w;
+    let ndc2 = end.xyz / end.w;
+    let screen = u.screen.xy;
+    let dir = normalize((ndc2.xy - ndc1.xy) * screen);
+    var offset = vec2<f32>(-dir.y, dir.x) * u.screen.z / screen;
+    if offset.x < 0.0 {
+        offset = -offset;
+    }
+    return vec4<f32>((ndc1 + vec3<f32>(offset * in.side, 0.0)) * start.w, start.w);
+}
+
+@fragment
+fn fs_line() -> @location(0) vec4<f32> {
+    // `ARGB.black(102)`.
+    return vec4<f32>(0.0, 0.0, 0.0, 102.0 / 255.0);
+}
+
+// The crosshair: `hud/crosshair.png`, a 15 × 15 sprite whose plus sign runs 3 to 11 along
+// row and column 7, blitted at the GUI's centre, scaled by the GUI scale.
+@fragment
+fn fs_crosshair(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let scale = u.screen.w;
+    let gui = ceil(u.screen.xy / scale);
+    let origin = floor((gui - 15.0) / 2.0) * scale;
+    let t = floor((p.xy - origin) / scale);
+    let across = t.y == 7.0 && t.x >= 3.0 && t.x <= 11.0;
+    let down = t.x == 7.0 && t.y >= 3.0 && t.y <= 11.0;
+    if !(across || down) {
+        discard;
+    }
+    return vec4<f32>(1.0);
+}
+
+// The HUD: positions are in GUI pixels, which the GUI scale turns into screen pixels, and
+// sprites are sampled at full size.
+struct GuiOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_gui(in: VertexIn) -> GuiOut {
+    var out: GuiOut;
+    let screen = in.pos.xy * u.screen.w / u.screen.xy;
+    // Nearer (larger z) is smaller depth.
+    out.clip = vec4<f32>(screen.x * 2.0 - 1.0, 1.0 - screen.y * 2.0, 0.5 - in.pos.z / 1000.0, 1.0);
+    out.uv = in.uv;
+    out.color = in.color;
+    return out;
+}
+
+@fragment
+fn fs_gui(in: GuiOut) -> @location(0) vec4<f32> {
+    let c = textureSampleLevel(atlas, atlas_sampler, in.uv, 0.0) * in.color;
+    if c.a < 0.1 {
+        discard;
+    }
+    return c;
+}
+
+// Cracks: `rendertype_crumbling`, whose blend doubles the crack texture's colour times
+// what's beneath, so mid grey leaves it as it was.
+@fragment
+fn fs_crack(in: VertexOut) -> @location(0) vec4<f32> {
+    let c = textureSample(atlas, atlas_sampler, in.uv);
+    if c.a < 0.1 {
+        discard;
+    }
+    return vec4<f32>(c.rgb, 1.0);
 }

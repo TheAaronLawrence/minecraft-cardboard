@@ -22,6 +22,8 @@ pub struct Registry {
     item_ids: HashMap<String, u32>,
     /// Indexed by block entity type id.
     block_entity_types: Vec<String>,
+    /// Indexed by data component type id.
+    component_types: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -166,6 +168,8 @@ impl Registry {
 
         let block_entity_types =
             names_by_id(&protocol_ids(&registries, "minecraft:block_entity_type")?);
+        let component_types =
+            names_by_id(&protocol_ids(&registries, "minecraft:data_component_type")?);
 
         Ok(Self {
             block_ids,
@@ -174,6 +178,7 @@ impl Registry {
             items,
             item_ids,
             block_entity_types,
+            component_types,
         })
     }
 
@@ -216,6 +221,11 @@ impl Registry {
     /// A block entity type's name, such as `minecraft:chest`, from its protocol id.
     pub fn block_entity_type(&self, id: u32) -> Option<&str> {
         self.block_entity_types.get(id as usize).map(String::as_str)
+    }
+
+    /// A data component type's name, such as `minecraft:damage`, from its protocol id.
+    pub fn component_type(&self, id: u32) -> Option<&str> {
+        self.component_types.get(id as usize).map(String::as_str)
     }
 
     pub fn item_count(&self) -> u32 {

@@ -19,10 +19,13 @@ const TARGET: &str = "x86_64-pc-windows-gnu";
 const LINKER: &str = "x86_64-w64-mingw32-gcc";
 const EXE: &str = "minecraft-cardboard.exe";
 
-/// What the client reads beside its exe (see `mc_assets::locate`). Sounds and language
-/// files aren't used yet, so they stay out and the zip stays small.
+/// What the client reads beside its exe (see `mc_assets::locate`), as folders or files.
+/// Sounds and other languages aren't used yet, so they stay out and the zip stays small.
 const FILES: &[&str] = &[
     "resources/assets/minecraft/blockstates",
+    "resources/assets/minecraft/font/include/default.json",
+    "resources/assets/minecraft/items",
+    "resources/assets/minecraft/lang/en_us.json",
     "resources/assets/minecraft/models",
     "resources/assets/minecraft/textures",
     "resources/data",
@@ -156,6 +159,11 @@ fn commit(repo: &Path) -> Result<String> {
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+    if from.is_file() {
+        std::fs::create_dir_all(to.parent().unwrap())?;
+        std::fs::copy(from, to)?;
+        return Ok(());
+    }
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from).with_context(|| format!("{}", from.display()))? {
         let entry = entry?;
@@ -196,6 +204,10 @@ fn zip_dir(base: &Path, name: &str, zip_path: &Path) -> Result<()> {
 }
 
 fn collect(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if dir.is_file() {
+        files.push(dir.to_owned());
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.is_dir() {
