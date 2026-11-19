@@ -118,6 +118,68 @@ pub struct Walker {
     clicks: [u32; 3],
     /// Air, cave air and void air.
     airs: [u32; 3],
+    /// `GameType`'s id; survival and adventure (0 and 2) show the hearts, food and XP.
+    game_mode: u8,
+    hardcore: bool,
+    health: Health,
+    food: i32,
+    saturation: f32,
+    xp_progress: f32,
+    xp_level: i32,
+}
+
+/// The player's health as `LocalPlayer` keeps it, and what `Hud` keeps to blink the hearts
+/// when it changes.
+struct Health {
+    value: f32,
+    /// `LocalPlayer.flashOnSetHealth`: the first health the server sends doesn't flash.
+    flash: bool,
+    /// `LivingEntity.damageCooldownTime`, counted down each tick.
+    damage_cooldown: u32,
+    /// `Hud.tickCount`.
+    tick: i32,
+    last: i32,
+    display: i32,
+    last_time: std::time::Instant,
+    blink_until: i32,
+}
+
+impl Health {
+    /// `LocalPlayer.hurtTo`.
+    fn hurt_to(&mut self, health: f32) {
+        if self.flash {
+            let damage = self.value - health;
+            if damage < 0.0 {
+                self.damage_cooldown = 10;
+            } else if damage > 0.0 {
+                self.damage_cooldown = 20;
+            }
+        }
+        self.flash = true;
+        self.value = health;
+    }
+
+    /// The part of `Hud.extractPlayerHealth` that runs each frame: when the health changes
+    /// while hurt or healing, the hearts blink, and the old health shows for a second.
+    /// Returns the health, the old health and whether the hearts blink now.
+    fn frame(&mut self) -> (i32, i32, bool) {
+        let current = self.value.ceil() as i32;
+        let blink = self.blink_until > self.tick && (self.blink_until - self.tick) / 3 % 2 == 1;
+        let now = std::time::Instant::now();
+        if current < self.last && self.damage_cooldown > 0 {
+            self.last_time = now;
+            self.blink_until = self.tick + 20;
+        } else if current > self.last && self.damage_cooldown > 0 {
+            self.last_time = now;
+            self.blink_until = self.tick + 10;
+        }
+        if now.duration_since(self.last_time).as_millis() > 1000 {
+            self.display = current;
+            self.last_time = now;
+        }
+        self.last = current;
+        (current, self.display, blink)
+    }
 }
 
 impl Walker {
@@ -164,6 +226,23 @@ impl Walker {
             others_mining: HashMap::new(),
             clicks: [0; 3],
             airs,
+            game_mode: 0,
+            hardcore: false,
+            // A new `LocalPlayer`'s: full health and food, saturation 5.
+            health: Health {
+                value: 20.0,
+                flash: false,
+                damage_cooldown: 0,
+                tick: 0,
+                last: 0,
+                display: 0,
+                last_time: std::time::Instant::now(),
+                blink_until: 0,
+            },
+            food: 20,
+            saturation: 5.0,
+            xp_progress: 0.0,
+            xp_level: 0,
         })
     }
 
@@ -183,7 +262,26 @@ impl Walker {
 
     pub fn server_event(&mut self, event: mc_protocol::Event) {
         match event {
-            mc_protocol::Event::Login { entity_id } => self.entity_id = entity_id,
+            mc_protocol::Event::Login {
+                entity_id,
+                hardcore,
+                game_mode,
+            } => {
+                (self.entity_id, self.hardcore, self.game_mode) = (entity_id, hardcore, game_mode);
+            }
+            mc_protocol::Event::GameMode(mode) => self.game_mode = mode,
+            // `ClientPacketListener.handleSetHealth`.
+            mc_protocol::Event::Health {
+                health,
+                food,
+                saturation,
+            } => {
+                self.health.hurt_to(health);
+                (self.food, self.saturation) = (food, saturation);
+            }
+            mc_protocol::Event::Experience { progress, level } => {
+                (self.xp_progress, self.xp_level) = (progress, level);
+            }
             mc_protocol::Event::Abilities {
                 flying,
                 may_fly,
@@ -230,11 +328,27 @@ impl Walker {
         self.selected = (self.selected as i32 + steps).rem_euclid(9) as u8;
     }
 
-    /// What the hotbar shows.
-    pub fn hotbar(&self) -> mc_render::hud::Hotbar {
+    /// What the hotbar shows, and in survival and adventure (`GameType.isSurvival`) the
+    /// hearts, food and experience above it. Call it once a frame: the hearts blink from
+    /// the frame the health changes. Max health is always 20, as attributes aren't read yet.
+    pub fn hotbar(&mut self) -> mc_render::hud::Hotbar {
+        let (health, old_health, blink) = self.health.frame();
+        let vitals = matches!(self.game_mode, 0 | 2).then(|| mc_render::hud::Vitals {
+            tick: self.health.tick,
+            health,
+            old_health,
+            blink,
+            max_health: 20.0,
+            hardcore: self.hardcore,
+            food: self.food,
+            saturation: self.saturation,
+            xp_progress: self.xp_progress,
+            xp_level: self.xp_level,
+        });
         mc_render::hud::Hotbar {
             slots: self.hotbar.clone(),
             selected: self.selected,
+            vitals,
         }
     }
 
@@ -300,6 +414,9 @@ impl Walker {
         self.since_tick += dt;
         while self.since_tick >= TICK {
             self.since_tick -= TICK;
+            // `Hud.tick` and `LivingEntity.baseTick`'s countdown.
+            self.health.tick = self.health.tick.wrapping_add(1);
+            self.health.damage_cooldown = self.health.damage_cooldown.saturating_sub(1);
             (self.player.yaw, self.player.pitch) = (yaw, pitch);
             if let Err(e) = self.tick_hands(buttons) {
                 eprintln!("sending block actions: {e:#}");

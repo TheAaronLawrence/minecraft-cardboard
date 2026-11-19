@@ -20,9 +20,25 @@ use std::sync::mpsc::{Receiver, Sender};
 
 /// What the server tells the game, in the order it arrives.
 pub enum Event {
-    /// The player has joined the world as this entity.
+    /// The player has joined the world as this entity, in this game mode (`GameType`'s id:
+    /// survival 0, creative 1, adventure 2, spectator 3), on a hardcore server or not.
     Login {
         entity_id: i32,
+        hardcore: bool,
+        game_mode: u8,
+    },
+    /// The player's game mode changed (`GameType`'s id), on respawning or by command.
+    GameMode(u8),
+    /// The player's health, food level and saturation.
+    Health {
+        health: f32,
+        food: i32,
+        saturation: f32,
+    },
+    /// The player's experience: progress through the level (0 to 1) and the level.
+    Experience {
+        progress: f32,
+        level: i32,
     },
     /// What the player may do: fly (creative), and whether it is flying, at what speed;
     /// and break blocks instantly (creative).
@@ -371,7 +387,7 @@ fn play(
                 // Entity id, hardcore, the level names, max players, view and simulation
                 // distances, and three flags come before the spawn info's dimension type.
                 let entity_id = r.i32()?;
-                r.bool()?;
+                let hardcore = r.bool()?;
                 for _ in 0..r.count()? {
                     r.string()?;
                 }
@@ -387,7 +403,42 @@ fn play(
                     .get(index)
                     .context("the login's dimension type isn't in the registry data")?;
                 dimension = Some(chunk::Dimension::new(name, data.as_ref())?);
-                tx.send(Event::Login { entity_id }).is_ok()
+                tx.send(Event::Login {
+                    entity_id,
+                    hardcore,
+                    game_mode: spawn_game_mode(&mut r)?,
+                })
+                .is_ok()
+            }
+            "respawn" => {
+                // The same spawn info as the login's, from its dimension type on. Changing
+                // dimension isn't supported yet, but the game mode can change too.
+                r.varint()?;
+                tx.send(Event::GameMode(spawn_game_mode(&mut r)?)).is_ok()
+            }
+            "game_event" => {
+                // `ClientboundGameEventPacket.CHANGE_GAME_MODE`, its parameter rounded as
+                // `handleGameEvent` does.
+                let (event, param) = (r.u8()?, r.f32()?);
+                event != 3
+                    || tx
+                        .send(Event::GameMode((param + 0.5).floor() as u8))
+                        .is_ok()
+            }
+            "set_health" => tx
+                .send(Event::Health {
+                    health: r.f32()?,
+                    food: r.varint()?,
+                    saturation: r.f32()?,
+                })
+                .is_ok(),
+            "set_experience" => {
+                let progress = r.f32()?;
+                tx.send(Event::Experience {
+                    progress,
+                    level: r.varint()?,
+                })
+                .is_ok()
             }
             "player_abilities" => {
                 // Flags: invulnerable 1, flying 2, may fly 4, instant build 8.
@@ -572,6 +623,14 @@ fn play(
             return Ok("the game closed the connection".into());
         }
     }
+}
+
+/// The game mode from a `CommonPlayerSpawnInfo`, read from just after its dimension type:
+/// the dimension's name and the hashed seed come first.
+fn spawn_game_mode(r: &mut Reader) -> Result<u8> {
+    r.string()?;
+    r.i64()?;
+    Ok(r.varint()? as u8)
 }
 
 /// An `ItemStack.OPTIONAL_STREAM_CODEC` stack: its item and count, or `None` for an empty

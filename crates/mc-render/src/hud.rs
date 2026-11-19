@@ -1,6 +1,7 @@
 //! The HUD drawn over the world: the hotbar with its items and their counts, as vanilla's
-//! `Gui.renderItemHotbar` lays it out, in GUI pixels (screen pixels divided by the GUI
-//! scale). Also the cracks over a block being mined, as vanilla's crumbling overlay draws
+//! `Gui.renderItemHotbar` lays it out, and in survival the hearts, food and experience bar
+//! above it, as `Hud.extractPlayerHealth` and `ExperienceBar` do, in GUI pixels (screen
+//! pixels divided by the GUI scale). Also the cracks over a block being mined, as vanilla's crumbling overlay draws
 //! them. Everything samples the block atlas, which holds the HUD's sprites and the font.
 
 use crate::atlas::Atlas;
@@ -15,6 +16,43 @@ use std::sync::Arc;
 const HOTBAR: &str = "minecraft:gui/sprites/hud/hotbar";
 const SELECTION: &str = "minecraft:gui/sprites/hud/hotbar_selection";
 const FONT: &str = "minecraft:font/ascii";
+const XP_BACKGROUND: &str = "hud/experience_bar_background";
+const XP_PROGRESS: &str = "hud/experience_bar_progress";
+const FOOD: [&str; 3] = ["hud/food_empty", "hud/food_half", "hud/food_full"];
+
+/// `Hud.HeartType`'s sprites for a container or a normal heart, which come in hardcore,
+/// half and blinking forms; a container has no half form.
+fn heart(container: bool, hardcore: bool, half: bool, blink: bool) -> String {
+    let blink = if blink { "_blinking" } else { "" };
+    if container {
+        let hardcore = if hardcore { "_hardcore" } else { "" };
+        format!("hud/heart/container{hardcore}{blink}")
+    } else {
+        let hardcore = if hardcore { "hardcore_" } else { "" };
+        let size = if half { "half" } else { "full" };
+        format!("hud/heart/{hardcore}{size}{blink}")
+    }
+}
+
+/// The survival HUD's sprites, named as vanilla's `Identifier`s for them are.
+fn vitals_sprites() -> Vec<String> {
+    let mut names: Vec<String> = [XP_BACKGROUND, XP_PROGRESS]
+        .into_iter()
+        .chain(FOOD)
+        .map(str::to_owned)
+        .collect();
+    for i in 0..16 {
+        let bit = |b: u32| i & 1 << b != 0;
+        names.push(heart(bit(0), bit(1), bit(2), bit(3)));
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn gui_sprite(name: &str) -> String {
+    format!("minecraft:gui/sprites/{name}")
+}
 
 /// Depths in GUI pixels toward the viewer: sprites behind the items, which sit around 0,
 /// and text in front of them.
@@ -31,6 +69,7 @@ pub(crate) fn sprites() -> Vec<String> {
         .map(str::to_owned)
         .into_iter()
         .chain((0..10).map(crack_sprite))
+        .chain(vitals_sprites().iter().map(|n| gui_sprite(n)))
         .collect()
 }
 
@@ -44,6 +83,8 @@ pub struct HudArt {
     /// Each character's cell in `font/ascii.png` (16 × 16 cells of 8 × 8) and advance.
     glyphs: HashMap<char, (u8, u8)>,
     cracks: [[f32; 4]; 10],
+    /// The survival HUD's sprites, by vanilla's name for them.
+    vitals: HashMap<String, [f32; 4]>,
 }
 
 impl HudArt {
@@ -59,6 +100,13 @@ impl HudArt {
             font: atlas.sprite(FONT).rect,
             glyphs: glyphs(res)?,
             cracks: std::array::from_fn(|i| atlas.sprite(&crack_sprite(i as u8)).rect),
+            vitals: vitals_sprites()
+                .into_iter()
+                .map(|n| {
+                    let rect = atlas.sprite(&gui_sprite(&n)).rect;
+                    (n, rect)
+                })
+                .collect(),
         })
     }
 }
@@ -102,11 +150,34 @@ fn glyphs(res: &mc_assets::Resources) -> Result<HashMap<char, (u8, u8)>> {
     Ok(glyphs)
 }
 
-/// What the hotbar shows: each slot's item name and count, and the slot selected.
+/// What the hotbar shows: each slot's item name and count, and the slot selected; and in
+/// survival and adventure, what's above it.
 #[derive(Clone, Default, PartialEq)]
 pub struct Hotbar {
     pub slots: [Option<(String, i32)>; 9],
     pub selected: u8,
+    pub vitals: Option<Vitals>,
+}
+
+/// What the hearts, food and experience bar show, as `Hud.extractPlayerHealth` works them
+/// out each frame.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct Vitals {
+    /// `Hud.tickCount`, which seeds the hearts' and food's shaking.
+    pub tick: i32,
+    /// Health in half hearts, rounded up.
+    pub health: i32,
+    /// The health shown a moment ago (`displayHealth`), which blinking hearts show.
+    pub old_health: i32,
+    /// Whether the hearts are in the bright half of a blink, after the health changed.
+    pub blink: bool,
+    pub max_health: f32,
+    pub hardcore: bool,
+    pub food: i32,
+    pub saturation: f32,
+    /// Progress through the level, 0 to 1, and the level.
+    pub xp_progress: f32,
+    pub xp_level: i32,
 }
 
 /// Quads in GUI pixels. Vertices are `Vertex`es whose x and y are in GUI pixels, whose z is
@@ -148,27 +219,38 @@ impl GuiMesh {
 
     /// `Font.drawString` with its shadow: one GUI pixel down and right, a quarter as bright.
     fn text(&mut self, art: &HudArt, text: &str, x: f32, y: f32, rgb: [f32; 3]) {
-        for (offset, scale, z) in [(1.0, 0.25, TEXT), (0.0, 1.0, TEXT + 1.0)] {
-            let mut pen = x;
-            for c in text.chars() {
-                let Some(&(cell, advance)) = art.glyphs.get(&c) else {
-                    continue;
-                };
-                if c != ' ' {
-                    let [u0, v0, u1, v1] = art.font;
-                    let (du, dv) = ((u1 - u0) / 16.0, (v1 - v0) / 16.0);
-                    let (col, row) = ((cell % 16) as f32, (cell / 16) as f32);
-                    let rect = [
-                        u0 + du * col,
-                        v0 + dv * row,
-                        u0 + du * (col + 1.0),
-                        v0 + dv * (row + 1.0),
-                    ];
-                    let color = [rgb[0] * scale, rgb[1] * scale, rgb[2] * scale, 1.0];
-                    self.blit(pen + offset, y + offset, z, 8.0, 8.0, rect, color);
-                }
-                pen += advance as f32;
+        let [r, g, b] = rgb;
+        self.glyphs(
+            art,
+            text,
+            x + 1.0,
+            y + 1.0,
+            TEXT,
+            [r * 0.25, g * 0.25, b * 0.25],
+        );
+        self.glyphs(art, text, x, y, TEXT + 1.0, rgb);
+    }
+
+    /// `Font.drawString` without a shadow.
+    fn glyphs(&mut self, art: &HudArt, text: &str, x: f32, y: f32, z: f32, rgb: [f32; 3]) {
+        let mut pen = x;
+        for c in text.chars() {
+            let Some(&(cell, advance)) = art.glyphs.get(&c) else {
+                continue;
+            };
+            if c != ' ' {
+                let [u0, v0, u1, v1] = art.font;
+                let (du, dv) = ((u1 - u0) / 16.0, (v1 - v0) / 16.0);
+                let (col, row) = ((cell % 16) as f32, (cell / 16) as f32);
+                let rect = [
+                    u0 + du * col,
+                    v0 + dv * row,
+                    u0 + du * (col + 1.0),
+                    v0 + dv * (row + 1.0),
+                ];
+                self.blit(pen, y, z, 8.0, 8.0, rect, [rgb[0], rgb[1], rgb[2], 1.0]);
             }
+            pen += advance as f32;
         }
     }
 
@@ -320,7 +402,100 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
             mesh.text(art, &text, x + 19.0 - 2.0 - w, y + 6.0 + 3.0, [1.0; 3]);
         }
     }
+    if let Some(vitals) = &hotbar.vitals {
+        mesh.vitals(art, vitals, width as i32, height as i32);
+    }
     mesh
+}
+
+impl GuiMesh {
+    /// `Hud.extractHearts` and `extractFood` (without absorption, armour, air or effects),
+    /// then `ExperienceBar.extractBackground` and `ContextualBar.extractExperienceLevel`, for
+    /// a GUI `width` × `height` GUI pixels. Each sprite goes a little in front of the one
+    /// before, so they overlap as vanilla draws them, in order.
+    fn vitals(&mut self, art: &HudArt, v: &Vitals, width: i32, height: i32) {
+        let mut z = BACK + 2.0;
+        let mut sprite = |mesh: &mut Self, name: &str, x: i32, y: i32, w: i32, h: i32| {
+            let rect = art.vitals[name];
+            mesh.blit(x as f32, y as f32, z, w as f32, h as f32, rect, [1.0; 4]);
+            z += 0.01;
+        };
+        // `extractPlayerHealth`.
+        let mut random = crate::bake::JavaRandom::new(i64::from(v.tick.wrapping_mul(312_871)));
+        let (x_left, x_right, y_base) = (width / 2 - 91, width / 2 + 91, height - 39);
+        let max_health = v.max_health.max(v.old_health.max(v.health) as f32);
+        let rows = (max_health / 2.0 / 10.0).ceil() as i32;
+        let row_height = (10 - (rows - 2)).max(3);
+
+        // `extractHearts`.
+        let containers = (max_health / 2.0).ceil() as i32;
+        for i in (0..containers).rev() {
+            let (x, mut y) = (x_left + i % 10 * 8, y_base - i / 10 * row_height);
+            if v.health <= 4 {
+                y += random.next_int(2);
+            }
+            sprite(self, &heart(true, v.hardcore, false, v.blink), x, y, 9, 9);
+            let halves = i * 2;
+            if v.blink && halves < v.old_health {
+                let half = halves + 1 == v.old_health;
+                sprite(self, &heart(false, v.hardcore, half, true), x, y, 9, 9);
+            }
+            if halves < v.health {
+                let half = halves + 1 == v.health;
+                sprite(self, &heart(false, v.hardcore, half, false), x, y, 9, 9);
+            }
+        }
+
+        // `extractFood`.
+        let [empty, half, full] = FOOD;
+        for i in 0..10 {
+            let mut y = y_base;
+            if v.saturation <= 0.0 && v.tick % (v.food * 3 + 1) == 0 {
+                y += random.next_int(3) - 1;
+            }
+            let x = x_right - i * 8 - 9;
+            sprite(self, empty, x, y, 9, 9);
+            if i * 2 + 1 < v.food {
+                sprite(self, full, x, y, 9, 9);
+            }
+            if i * 2 + 1 == v.food {
+                sprite(self, half, x, y, 9, 9);
+            }
+        }
+
+        // `ExperienceBar.extractBackground`; `getXpNeededForNextLevel` is never 0.
+        let (left, top) = ((width - 182) / 2, height - 24 - 5);
+        let progress = (v.xp_progress * 183.0) as i32;
+        sprite(self, XP_BACKGROUND, left, top, 182, 5);
+        if progress > 0 {
+            // The sprite's left `progress` pixels, at their own size.
+            let [u0, v0, u1, v1] = art.vitals[XP_PROGRESS];
+            let u1 = u0 + (u1 - u0) * progress.min(182) as f32 / 182.0;
+            self.blit(
+                left as f32,
+                top as f32,
+                z,
+                progress as f32,
+                5.0,
+                [u0, v0, u1, v1],
+                [1.0; 4],
+            );
+        }
+
+        // `ContextualBar.extractExperienceLevel`: the level in green, outlined in black.
+        if v.xp_level > 0 {
+            let text = v.xp_level.to_string();
+            let x = (width - Self::text_width(art, &text) as i32) / 2;
+            let y = height - 24 - 9 - 2;
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (x, y) = ((x + dx) as f32, (y + dy) as f32);
+                self.glyphs(art, &text, x, y, TEXT, [0.0; 3]);
+            }
+            // 0xFF80FF20.
+            let green = [128.0 / 255.0, 1.0, 32.0 / 255.0];
+            self.glyphs(art, &text, x as f32, y as f32, TEXT + 1.0, green);
+        }
+    }
 }
 
 /// The crack overlay on a block being mined at `pos` with this state, at `stage` 0 to 9:
