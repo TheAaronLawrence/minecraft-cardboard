@@ -1,7 +1,9 @@
 //! Blocks vanilla draws in code with entity models (`ModelPart` cubes) rather than block
-//! models: banners, shulker boxes, and mob heads. The boxes, texture offsets, poses and
-//! transforms are 26.3's `BannerModel`, `BannerFlagModel`, `ShulkerModel`, `SkullModel`,
-//! `PiglinHeadModel` and `DragonHeadModel`, and their block entity renderers.
+//! models: banners, shulker boxes, mob heads, decorated pots, conduits and copper golem
+//! statues, plus the end portal and gateway surfaces. The boxes, texture offsets, poses and
+//! transforms are 26.3's (`BannerModel`, `ShulkerModel`, `SkullModel`, `PiglinHeadModel`,
+//! `DragonHeadModel`, `DecoratedPotRenderer`, `ConduitRenderer`, `CopperGolemModel`'s pose
+//! layers) and their block entity renderers.
 
 use crate::atlas::{Atlas, Sprite};
 use crate::bake::{self, BakedModel, Dir, Quad};
@@ -33,6 +35,13 @@ const DYE_RGB: [u32; 16] = [
     0x169C9C, 0x8932B8, 0x3C44AA, 0x835432, 0x5E7C16, 0xB02E26, 0x1D1D21,
 ];
 
+const POT_BASE: &str = "minecraft:entity/decorated_pot/decorated_pot_base";
+const POT_SIDE: &str = "minecraft:entity/decorated_pot/decorated_pot_side";
+const CONDUIT: &str = "minecraft:entity/conduit/base";
+/// Vanilla draws portals with a parallax star shader; until we write one, they show the
+/// end sky texture, tinted dark teal by `PORTAL_TINT`.
+const PORTAL: &str = "minecraft:environment/end_sky";
+pub const PORTAL_TINT: [f32; 3] = [0.15, 0.3, 0.32];
 const BANNER_BASE: &str = "minecraft:entity/banner/banner_base";
 const BANNER_FLAG: &str = "minecraft:entity/banner/base";
 const SKULLS: [(&str, &str); 7] = [
@@ -59,6 +68,11 @@ pub fn sprites() -> Vec<String> {
             .map(|c| format!("minecraft:entity/shulker/shulker_{c}")),
     );
     out.extend(SKULLS.iter().map(|(_, s)| s.to_string()));
+    out.extend([POT_BASE, POT_SIDE, CONDUIT, PORTAL].map(str::to_owned));
+    out.extend(
+        ["", "_exposed", "_weathered", "_oxidized"]
+            .map(|age| format!("minecraft:entity/copper_golem/copper_golem{age}")),
+    );
     out
 }
 
@@ -80,6 +94,8 @@ struct Cube {
     /// `CubeDeformation`: grows the box on every side without moving its texture.
     grow: f32,
     mirror: bool,
+    /// Only this face (an index into `FACES`), as `addBox` with a set of visible faces.
+    only: Option<usize>,
 }
 
 const fn cube(from: [f32; 3], size: [f32; 3], tex: [f32; 2]) -> Cube {
@@ -89,7 +105,28 @@ const fn cube(from: [f32; 3], size: [f32; 3], tex: [f32; 2]) -> Cube {
         tex,
         grow: 0.0,
         mirror: false,
+        only: None,
     }
+}
+
+/// `ModelPart.Cube`'s faces in order: down, up, west, north, east, south (in model space),
+/// as corner indices and outward normals.
+const FACES: [([usize; 4], [f32; 3]); 6] = [
+    ([5, 4, 0, 1], [0.0, -1.0, 0.0]),
+    ([2, 3, 7, 6], [0.0, 1.0, 0.0]),
+    ([0, 4, 7, 3], [-1.0, 0.0, 0.0]),
+    ([1, 0, 3, 2], [0.0, 0.0, -1.0]),
+    ([5, 1, 2, 6], [1.0, 0.0, 0.0]),
+    ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
+];
+const NORTH: usize = 3;
+
+/// One part of a model: its parent (an earlier index), `PartPose` offset in pixels and
+/// rotation in radians, and its cubes.
+struct Node {
+    parent: Option<usize>,
+    pose: [f32; 6],
+    cubes: &'static [Cube],
 }
 
 /// `ModelPart.translateAndRotate`: move by the offset in pixels, then turn Z, Y, X.
@@ -111,6 +148,20 @@ struct Builder {
 }
 
 impl Builder {
+    /// Every part's cubes, each placed by its parents' poses under `root`.
+    fn nodes(&mut self, root: Mat4, nodes: &[Node]) {
+        let mut placed: Vec<Mat4> = Vec::with_capacity(nodes.len());
+        for n in nodes {
+            let [x, y, z, rx, ry, rz] = n.pose;
+            let parent = n.parent.map_or(root, |i| placed[i]);
+            let m = parent * pose([x, y, z], [rx, ry, rz]);
+            for c in n.cubes {
+                self.cube(m, c);
+            }
+            placed.push(m);
+        }
+    }
+
     /// `ModelPart.Cube`'s vertices and UVs, placed by `m` (model units of 1/16 into block
     /// space). Each face keeps vanilla's corner-to-UV pairing; the corners are then put in
     /// the winding the mesher expects, since negative scales and mirroring flip it.
@@ -140,20 +191,22 @@ impl Builder {
             u + d + w + d + w
         });
         let (t0, t1, t2) = (t, t + d, t + d + h);
-        let faces = [
-            ([5, 4, 0, 1], [u1, t0, u2, t1]),
-            ([2, 3, 7, 6], [u2, t1, u22, t0]),
-            ([0, 4, 7, 3], [u0, t1, u1, t2]),
-            ([1, 0, 3, 2], [u1, t1, u2, t2]),
-            ([5, 1, 2, 6], [u2, t1, u3, t2]),
-            ([4, 5, 6, 7], [u3, t1, u4, t2]),
+        let uvs = [
+            [u1, t0, u2, t1],
+            [u2, t1, u22, t0],
+            [u0, t1, u1, t2],
+            [u1, t1, u2, t2],
+            [u2, t1, u3, t2],
+            [u3, t1, u4, t2],
         ];
         let normal_m = Mat3::from_mat4(m).inverse().transpose();
-        let center = (min + max) / 2.0;
         let [su0, sv0, su1, sv1] = self.sprite.rect;
         let [tw, th] = self.tex_size;
         let to_atlas = |u: f32, v: f32| [su0 + (su1 - su0) * u / tw, sv0 + (sv1 - sv0) * v / th];
-        for (idx, [a, b, c2, d2]) in faces {
+        for (face, ((idx, normal), [a, b, c2, d2])) in FACES.iter().zip(uvs).enumerate() {
+            if c.only.is_some_and(|o| o != face) {
+                continue;
+            }
             // `Polygon`: corners take (u2,v1), (u1,v1), (u1,v2), (u2,v2).
             let uv = [
                 to_atlas(c2, b),
@@ -162,10 +215,10 @@ impl Builder {
                 to_atlas(c2, d2),
             ];
             let local = idx.map(|i| p[i]);
-            let face_center = local.iter().copied().sum::<Vec3>() / 4.0;
-            let out = face_center - center;
-            if out.length_squared() < 1e-8 {
-                continue;
+            // Mirroring moves the west face to the east and back.
+            let mut out = Vec3::from(*normal);
+            if c.mirror {
+                out.x = -out.x;
             }
             let outward = (normal_m * out).normalize();
             let mut pos = local.map(|q| bake::snap(m.transform_point3(q / 16.0)));
@@ -201,7 +254,52 @@ pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Bake
             .unwrap_or(0.0)
             * 22.5
     };
-    let quads = if banner_color(name).is_some() {
+    let quads = if name == "decorated_pot" {
+        decorated_pot(atlas, value("facing")?)
+    } else if name == "conduit" {
+        // Inactive: just the shell, as without its block entity it can't be active.
+        let mut b = Builder {
+            quads: Vec::new(),
+            sprite: atlas.sprite(CONDUIT),
+            tex_size: [32.0, 16.0],
+            tint: -1,
+        };
+        b.cube(
+            Mat4::from_translation(Vec3::splat(0.5)),
+            &cube([-3.0, -3.0, -3.0], [6.0, 6.0, 6.0], [0.0, 0.0]),
+        );
+        b.quads
+    } else if name == "end_portal" || name == "end_gateway" {
+        portal(atlas, name == "end_portal")
+    } else if let Some(age) = name
+        .strip_prefix("waxed_")
+        .unwrap_or(name)
+        .strip_suffix("copper_golem_statue")
+    {
+        let sprite = match age.strip_suffix('_') {
+            Some(age) => format!("minecraft:entity/copper_golem/copper_golem_{age}"),
+            None => "minecraft:entity/copper_golem/copper_golem".to_owned(),
+        };
+        let nodes = match value("copper_golem_pose")? {
+            "sitting" => GOLEM_SITTING,
+            "running" => GOLEM_RUNNING,
+            "star" => GOLEM_STAR,
+            _ => GOLEM_STANDING,
+        };
+        // `CopperGolemStatueBlockRenderer`, then the statue model's root: y 0, half a turn
+        // about Z, which stands the model upright on the block's floor.
+        let root = Mat4::from_translation(Vec3::new(0.5, 0.0, 0.5))
+            * Mat4::from_rotation_y(-y_rot(opposite(value("facing")?)).to_radians())
+            * Mat4::from_rotation_z(PI);
+        let mut b = Builder {
+            quads: Vec::new(),
+            sprite: atlas.sprite(&sprite),
+            tex_size: [64.0, 64.0],
+            tint: -1,
+        };
+        b.nodes(root, nodes);
+        b.quads
+    } else if banner_color(name).is_some() {
         let wall = name.ends_with("_wall_banner");
         let deg = if wall {
             y_rot(value("facing")?)
@@ -279,6 +377,114 @@ fn banner(atlas: &Atlas, wall: bool, deg: f32) -> Vec<Quad> {
         &cube([-10.0, 0.0, -2.0], [20.0, 40.0, 1.0], [0.0, 0.0]),
     );
     flag.quads
+}
+
+fn decorated_pot(atlas: &Atlas, facing: &str) -> Vec<Quad> {
+    let center = Vec3::new(0.5, 0.5, 0.5);
+    let root = Mat4::from_translation(center)
+        * Mat4::from_rotation_y((180.0 - y_rot(facing)).to_radians())
+        * Mat4::from_translation(-center);
+    let mut b = Builder {
+        quads: Vec::new(),
+        sprite: atlas.sprite(POT_BASE),
+        tex_size: [32.0, 32.0],
+        tint: -1,
+    };
+    b.nodes(root, POT);
+    // Each side is one face, which a pottery sherd would retexture; plain sides here.
+    let mut sides = Builder {
+        quads: b.quads,
+        sprite: atlas.sprite(POT_SIDE),
+        tex_size: [16.0, 16.0],
+        tint: -1,
+    };
+    sides.nodes(root, POT_SIDES);
+    sides.quads
+}
+
+const POT_LID: Cube = cube([0.0, 0.0, 0.0], [14.0, 0.0, 14.0], [-14.0, 13.0]);
+const POT: &[Node] = &[
+    Node {
+        parent: None,
+        pose: [0.0, 37.0, 16.0, PI, 0.0, 0.0],
+        cubes: &[
+            Cube {
+                grow: -0.1,
+                ..cube([4.0, 17.0, 4.0], [8.0, 3.0, 8.0], [0.0, 0.0])
+            },
+            Cube {
+                grow: 0.2,
+                ..cube([5.0, 20.0, 5.0], [6.0, 1.0, 6.0], [0.0, 5.0])
+            },
+        ],
+    },
+    Node {
+        parent: None,
+        pose: [1.0, 16.0, 1.0, 0.0, 0.0, 0.0],
+        cubes: &[POT_LID],
+    },
+    Node {
+        parent: None,
+        pose: [1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        cubes: &[POT_LID],
+    },
+];
+const POT_SIDE_FACE: Cube = Cube {
+    only: Some(NORTH),
+    ..cube([0.0, 0.0, 0.0], [14.0, 16.0, 0.0], [1.0, 0.0])
+};
+const POT_SIDES: &[Node] = &[
+    // back, left, right, front
+    Node {
+        parent: None,
+        pose: [15.0, 16.0, 1.0, 0.0, 0.0, PI],
+        cubes: &[POT_SIDE_FACE],
+    },
+    Node {
+        parent: None,
+        pose: [1.0, 16.0, 1.0, 0.0, -FRAC_PI_2, PI],
+        cubes: &[POT_SIDE_FACE],
+    },
+    Node {
+        parent: None,
+        pose: [15.0, 16.0, 15.0, 0.0, FRAC_PI_2, PI],
+        cubes: &[POT_SIDE_FACE],
+    },
+    Node {
+        parent: None,
+        pose: [1.0, 16.0, 15.0, PI, 0.0, 0.0],
+        cubes: &[POT_SIDE_FACE],
+    },
+];
+
+/// The portal surface: the end portal's top and bottom faces at 0.75 and 0.375 (its
+/// `TRANSFORMATION` squeezes the unit cube to that slab), and the gateway's whole cube,
+/// culled by solid neighbours.
+fn portal(atlas: &Atlas, end_portal: bool) -> Vec<Quad> {
+    let sprite = atlas.sprite(PORTAL);
+    let (min, max) = if end_portal {
+        (Vec3::new(0.0, 0.375, 0.0), Vec3::new(1.0, 0.75, 1.0))
+    } else {
+        (Vec3::ZERO, Vec3::ONE)
+    };
+    let [u0, v0, u1, v1] = sprite.rect;
+    Dir::ALL
+        .into_iter()
+        .filter(|d| !end_portal || matches!(d, Dir::Up | Dir::Down))
+        .map(|dir| {
+            let pos = bake::corners(dir, min, max);
+            Quad {
+                pos,
+                uv: [[u0, v0], [u0, v1], [u1, v1], [u1, v0]],
+                dir,
+                cull: (!end_portal).then_some(dir),
+                tint: 0,
+                shade: false,
+                layer: sprite.layer,
+                on_face: bake::lies_on_face(&pos, dir),
+            }
+        })
+        .collect()
 }
 
 fn shulker(sprite: Sprite, facing: &str) -> Vec<Quad> {
@@ -429,3 +635,502 @@ fn dir_step(facing: &str) -> [i32; 3] {
     }
     .offset()
 }
+
+// `CopperGolemModel`'s body layers for each statue pose, as decoded from 26.3. Mojang writes
+// some angles rounded, such as -1.5708; they're kept as written.
+#[allow(clippy::approx_constant)]
+const GOLEM_STANDING: &[Node] = &[
+    Node {
+        parent: None,
+        pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-4.0, -6.0, -3.0],
+            size: [8.0, 6.0, 6.0],
+            tex: [0.0, 15.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // body
+    Node {
+        parent: Some(0),
+        pose: [0.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[
+            Cube {
+                from: [-4.0, -5.0, -5.0],
+                size: [8.0, 5.0, 10.0],
+                tex: [0.0, 0.0],
+                grow: 0.015,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-1.0, -2.0, -6.0],
+                size: [2.0, 3.0, 2.0],
+                tex: [56.0, 0.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-1.0, -9.0, -1.0],
+                size: [2.0, 4.0, 2.0],
+                tex: [37.0, 8.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-2.0, -13.0, -2.0],
+                size: [4.0, 4.0, 4.0],
+                tex: [37.0, 0.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+        ],
+    }, // head
+    Node {
+        parent: Some(0),
+        pose: [-4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-3.0, -1.0, -2.0],
+            size: [3.0, 10.0, 4.0],
+            tex: [36.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_arm
+    Node {
+        parent: Some(0),
+        pose: [4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [0.0, -1.0, -2.0],
+            size: [3.0, 10.0, 4.0],
+            tex: [50.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_arm
+    Node {
+        parent: None,
+        pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-4.0, 0.0, -2.0],
+            size: [4.0, 5.0, 4.0],
+            tex: [0.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_leg
+    Node {
+        parent: None,
+        pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [0.0, 0.0, -2.0],
+            size: [4.0, 5.0, 4.0],
+            tex: [16.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_leg
+];
+#[allow(clippy::approx_constant)]
+const GOLEM_RUNNING: &[Node] = &[
+    Node {
+        parent: None,
+        pose: [-1.064, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // body
+    Node {
+        parent: Some(0),
+        pose: [1.1, 0.1, 0.7, 0.1204, -0.0064, -0.0779],
+        cubes: &[Cube {
+            from: [-4.02, -6.116, -3.5],
+            size: [8.0, 6.0, 6.0],
+            tex: [0.0, 15.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // body_r1
+    Node {
+        parent: Some(0),
+        pose: [0.7, -5.6, -1.8, 0.0, 0.0, 0.0],
+        cubes: &[
+            Cube {
+                from: [-4.0, -5.1, -5.0],
+                size: [8.0, 5.0, 10.0],
+                tex: [0.0, 0.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-1.02, -2.1, -6.0],
+                size: [2.0, 3.0, 2.0],
+                tex: [56.0, 0.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-1.02, -9.1, -1.0],
+                size: [2.0, 4.0, 2.0],
+                tex: [37.0, 8.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-2.0, -13.1, -2.0],
+                size: [4.0, 4.0, 4.0],
+                tex: [37.0, 0.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+        ],
+    }, // head
+    Node {
+        parent: Some(0),
+        pose: [-4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // right_arm
+    Node {
+        parent: Some(3),
+        pose: [0.7, -0.248, -1.62, 1.0036, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-3.052, -1.11, -2.036],
+            size: [3.0, 10.0, 4.0],
+            tex: [36.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_arm_r1
+    Node {
+        parent: Some(0),
+        pose: [4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // left_arm
+    Node {
+        parent: Some(5),
+        pose: [0.732, 0.0, 0.0, -0.8715, -0.0535, -0.0449],
+        cubes: &[Cube {
+            from: [0.032, -1.1, -2.0],
+            size: [3.0, 10.0, 4.0],
+            tex: [50.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_arm_r1
+    Node {
+        parent: None,
+        pose: [-3.064, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // right_leg
+    Node {
+        parent: Some(7),
+        pose: [1.048, 0.0, -0.9, -0.8727, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-1.856, -0.1, -1.09],
+            size: [4.0, 5.0, 4.0],
+            tex: [0.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_leg_r1
+    Node {
+        parent: None,
+        pose: [0.936, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // left_leg
+    Node {
+        parent: Some(9),
+        pose: [1.0, 0.0, 0.0, 0.7854, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-2.088, -0.1, -2.0],
+            size: [4.0, 5.0, 4.0],
+            tex: [16.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_leg_r1
+];
+#[allow(clippy::approx_constant)]
+const GOLEM_SITTING: &[Node] = &[
+    Node {
+        parent: None,
+        pose: [0.0, -3.0, 2.325, 0.0, 0.0, 0.0],
+        cubes: &[
+            Cube {
+                from: [-3.0, -4.0, -4.525],
+                size: [6.0, 1.0, 6.0],
+                tex: [3.0, 19.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-4.0, -3.0, -3.525],
+                size: [8.0, 6.0, 6.0],
+                tex: [0.0, 15.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+        ],
+    }, // body
+    Node {
+        parent: Some(0),
+        pose: [0.0, -1.0, -4.325, 0.0, 0.0, -3.1416],
+        cubes: &[Cube {
+            from: [-4.0, -3.0, -2.2],
+            size: [8.0, 6.0, 3.0],
+            tex: [3.0, 18.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // body_r1
+    Node {
+        parent: Some(0),
+        pose: [0.0, -6.0, -0.2, 0.0, 0.0, 0.0],
+        cubes: &[
+            Cube {
+                from: [-1.0, -7.0, -3.3],
+                size: [2.0, 4.0, 2.0],
+                tex: [37.0, 8.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-2.0, -11.0, -4.3],
+                size: [4.0, 4.0, 4.0],
+                tex: [37.0, 0.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-4.0, -3.0, -7.325],
+                size: [8.0, 5.0, 10.0],
+                tex: [0.0, 0.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-1.0, 0.0, -8.325],
+                size: [2.0, 3.0, 2.0],
+                tex: [56.0, 0.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+        ],
+    }, // head
+    Node {
+        parent: Some(0),
+        pose: [-4.0, -5.6, -1.8, 0.4363, 0.0, 0.0],
+        cubes: &[],
+    }, // right_arm
+    Node {
+        parent: Some(3),
+        pose: [0.0, 0.0893, 0.1198, -1.0472, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-3.075, -0.9733, -1.9966],
+            size: [3.0, 10.0, 4.0],
+            tex: [36.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_arm_r1
+    Node {
+        parent: Some(0),
+        pose: [4.0, -5.6, -1.7, 0.4363, 0.0, 0.0],
+        cubes: &[],
+    }, // left_arm
+    Node {
+        parent: Some(5),
+        pose: [0.0, -0.0015, -0.0808, -1.0472, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [0.075, -1.0443, -1.8997],
+            size: [3.0, 10.0, 4.0],
+            tex: [50.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_arm_r1
+    Node {
+        parent: None,
+        pose: [-2.1, -2.1, -2.075, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // right_leg
+    Node {
+        parent: Some(7),
+        pose: [0.05, -1.9, 1.075, -1.5708, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-2.0, 0.975, 0.0],
+            size: [4.0, 5.0, 4.0],
+            tex: [0.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_leg_r1
+    Node {
+        parent: None,
+        pose: [2.0, -2.0, -2.075, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // left_leg
+    Node {
+        parent: Some(9),
+        pose: [0.05, -2.0, 1.075, -1.5708, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-2.0, 0.975, 0.0],
+            size: [4.0, 5.0, 4.0],
+            tex: [16.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_leg_r1
+];
+#[allow(clippy::approx_constant)]
+const GOLEM_STAR: &[Node] = &[
+    Node {
+        parent: None,
+        pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[Cube {
+            from: [-4.0, -6.0, -3.0],
+            size: [8.0, 6.0, 6.0],
+            tex: [0.0, 15.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // body
+    Node {
+        parent: Some(0),
+        pose: [0.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[
+            Cube {
+                from: [-4.0, -5.0, -5.0],
+                size: [8.0, 5.0, 10.0],
+                tex: [0.0, 0.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-1.0, -2.0, -6.0],
+                size: [2.0, 3.0, 2.0],
+                tex: [56.0, 0.0],
+                grow: 0.0,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-1.0, -9.0, -1.0],
+                size: [2.0, 4.0, 2.0],
+                tex: [37.0, 8.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+            Cube {
+                from: [-2.0, -13.0, -2.0],
+                size: [4.0, 4.0, 4.0],
+                tex: [37.0, 0.0],
+                grow: -0.015,
+                mirror: false,
+                only: None,
+            },
+        ],
+    }, // head
+    Node {
+        parent: Some(0),
+        pose: [-4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // right_arm
+    Node {
+        parent: Some(2),
+        pose: [1.0, 1.0, 0.0, 0.0, 0.0, 1.9199],
+        cubes: &[Cube {
+            from: [-1.5, -5.0, -2.0],
+            size: [3.0, 10.0, 4.0],
+            tex: [36.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_arm_r1
+    Node {
+        parent: Some(2),
+        pose: [-1.0, 7.4, -1.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // rightItem
+    Node {
+        parent: Some(0),
+        pose: [4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // left_arm
+    Node {
+        parent: Some(5),
+        pose: [-1.0, 1.0, 0.0, 0.0, 0.0, -1.9199],
+        cubes: &[Cube {
+            from: [-1.5, -5.0, -2.0],
+            size: [3.0, 10.0, 4.0],
+            tex: [50.0, 16.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_arm_r1
+    Node {
+        parent: None,
+        pose: [-3.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // right_leg
+    Node {
+        parent: Some(7),
+        pose: [0.35, 2.0, 0.01, 0.0, 0.0, 0.2618],
+        cubes: &[Cube {
+            from: [-2.0, -2.5, -2.0],
+            size: [4.0, 5.0, 4.0],
+            tex: [0.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // right_leg_r1
+    Node {
+        parent: None,
+        pose: [1.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        cubes: &[],
+    }, // left_leg
+    Node {
+        parent: Some(9),
+        pose: [1.65, 2.0, 0.0, 0.0, 0.0, -0.2618],
+        cubes: &[Cube {
+            from: [-2.0, -2.5, -2.0],
+            size: [4.0, 5.0, 4.0],
+            tex: [16.0, 27.0],
+            grow: 0.0,
+            mirror: false,
+            only: None,
+        }],
+    }, // left_leg_r1
+];

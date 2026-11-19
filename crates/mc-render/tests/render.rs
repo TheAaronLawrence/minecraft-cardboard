@@ -81,8 +81,8 @@ fn a_lone_block_in_the_sky_gets_six_sky_lit_faces() {
     );
 }
 
-/// Every block draws something except the ones vanilla also draws in code that we haven't
-/// written yet, or that are invisible. A block that silently loses its model shows up here.
+/// Every block draws something except invisible ones and fluids, which the fluid mesher
+/// draws. A block that silently loses its model shows up here.
 #[test]
 fn only_known_blocks_draw_nothing() {
     let (_, registry, models) = setup();
@@ -97,14 +97,6 @@ fn only_known_blocks_draw_nothing() {
     ];
     // Drawn by the fluid mesher.
     let fluids = ["water", "lava", "bubble_column"];
-    // Still to do: drawn in code by vanilla's block-entity renderers.
-    let todo = [
-        "decorated_pot",
-        "conduit",
-        "copper_golem_statue",
-        "end_portal",
-        "end_gateway",
-    ];
     let mut empty = Vec::new();
     for block in registry.blocks() {
         let name = block.name.strip_prefix("minecraft:").unwrap();
@@ -115,13 +107,23 @@ fn only_known_blocks_draw_nothing() {
             .flatten()
             .map(|(_, m)| m.quads.len())
             .sum();
-        let known = invisible.contains(&name)
-            || fluids.contains(&name)
-            || todo.iter().any(|t| name.contains(t));
+        let known = invisible.contains(&name) || fluids.contains(&name);
         if quads == 0 && !known {
             empty.push(name.to_owned());
         }
-        let entity_drawn = ["chest", "banner", "shulker_box", "skull", "_head"];
+        // Drawn in code by vanilla's block entity renderers.
+        let entity_drawn = [
+            "chest",
+            "banner",
+            "shulker_box",
+            "skull",
+            "_head",
+            "decorated_pot",
+            "conduit",
+            "copper_golem_statue",
+            "end_portal",
+            "end_gateway",
+        ];
         if entity_drawn.iter().any(|e| name.ends_with(e)) {
             assert!(quads > 0, "{name} draws nothing");
         }
