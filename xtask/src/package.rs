@@ -1,7 +1,7 @@
 //! `cargo xtask package-windows [TAG]`: cross-compiles the client for 64-bit Windows and
 //! writes a release's files to `target/package/`:
 //!
-//! - `minecraft-cardboard-VERSION-windows-x64.zip`: the whole game, with the files it reads
+//! - `minecraft-cardboard-VERSION-windows-x64.zip`: the game and its launcher, the files they read
 //!   at run time and the updater (`update.cmd`, `update.ps1`).
 //! - `...-windows-x64-exe-only.zip`: the exe and updater, for updates that keep the resources.
 //! - `assets.txt`: a fingerprint of the resources, which tells the updater which zip it needs.
@@ -18,6 +18,7 @@ use std::process::Command;
 const TARGET: &str = "x86_64-pc-windows-gnu";
 const LINKER: &str = "x86_64-w64-mingw32-gcc";
 const EXE: &str = "minecraft-cardboard.exe";
+const LAUNCHER: &str = "minecraft-cardboard-launcher.exe";
 
 /// What the client reads beside its exe (see `mc_assets::locate`), as folders or files.
 /// Sounds and other languages aren't used yet, so they stay out and the zip stays small.
@@ -52,7 +53,8 @@ pub fn package_windows(tag: Option<&str>) -> Result<()> {
     let mut build = Command::new(cargo);
     build
         .current_dir(&repo)
-        .args(["build", "--release", "-p", "mc-client", "--target", TARGET]);
+        .args(["build", "--release", "-p", "mc-client", "-p", "mc-launcher"])
+        .args(["--target", TARGET]);
     if std::env::var_os(&linker_var).is_none() {
         build.env(&linker_var, LINKER);
     }
@@ -67,13 +69,15 @@ pub fn package_windows(tag: Option<&str>) -> Result<()> {
         .replace("{commit}", &commit(&repo)?)
         .replace('\n', "\r\n");
     let assets = assets_fingerprint(&repo)?;
-    // What both zips hold: the exe, the updater, and what's installed.
+    // What both zips hold: the game and the launcher, the updater, and what's installed.
     let common = |dir: &Path| -> Result<()> {
         std::fs::create_dir_all(dir)?;
-        std::fs::copy(
-            repo.join("target").join(TARGET).join("release").join(EXE),
-            dir.join(EXE),
-        )?;
+        for exe in [EXE, LAUNCHER] {
+            std::fs::copy(
+                repo.join("target").join(TARGET).join("release").join(exe),
+                dir.join(exe),
+            )?;
+        }
         std::fs::write(dir.join("README.txt"), &readme)?;
         std::fs::write(
             dir.join("update.ps1"),

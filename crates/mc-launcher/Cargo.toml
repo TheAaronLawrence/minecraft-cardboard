@@ -1,0 +1,20 @@
+[package]
+name = "mc-launcher"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "minecraft-cardboard-launcher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+glam = "0.34"
+mc-assets = { path = "../mc-assets" }
+mc-registry = { path = "../mc-registry" }
+mc-render = { path = "../mc-render" }
+pollster = "1"
+serde_json.workspace = true
+wgpu = "30"
+winit = "0.30"

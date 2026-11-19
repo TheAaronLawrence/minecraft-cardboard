@@ -3,6 +3,11 @@
 //! above it, as `Hud.extractPlayerHealth` and `ExperienceBar` do, in GUI pixels (screen
 //! pixels divided by the GUI scale). Also the cracks over a block being mined, as vanilla's crumbling overlay draws
 //! them. Everything samples the block atlas, which holds the HUD's sprites and the font.
+//! Over it all, the death screen, as vanilla's `DeathScreen` and its `TitleConfirmScreen`
+//! lay them out.
+
+pub mod launcher;
+pub mod menu;
 
 use crate::atlas::Atlas;
 use crate::bake::{BlockModels, Dir};
@@ -34,11 +39,23 @@ fn heart(container: bool, hardcore: bool, half: bool, blink: bool) -> String {
     }
 }
 
-/// The survival HUD's sprites, named as vanilla's `Identifier`s for them are.
-fn vitals_sprites() -> Vec<String> {
+/// `AbstractButton.SPRITES`: enabled, disabled and highlighted.
+const BUTTON: [&str; 3] = [
+    "widget/button",
+    "widget/button_disabled",
+    "widget/button_highlighted",
+];
+
+/// Depths in GUI pixels of a screen over the HUD: its background, buttons and text.
+const SCREEN: f32 = 400.0;
+
+/// The GUI sprites drawn by name, named as vanilla's `Identifier`s for them are.
+fn named_sprites() -> Vec<String> {
     let mut names: Vec<String> = [XP_BACKGROUND, XP_PROGRESS]
         .into_iter()
         .chain(FOOD)
+        .chain(BUTTON)
+        .chain(menu::TEXT_FIELD)
         .map(str::to_owned)
         .collect();
     for i in 0..16 {
@@ -69,7 +86,8 @@ pub(crate) fn sprites() -> Vec<String> {
         .map(str::to_owned)
         .into_iter()
         .chain((0..10).map(crack_sprite))
-        .chain(vitals_sprites().iter().map(|n| gui_sprite(n)))
+        .chain(named_sprites().iter().map(|n| gui_sprite(n)))
+        .chain(menu::TEXTURES.map(str::to_owned))
         .collect()
 }
 
@@ -83,11 +101,40 @@ pub struct HudArt {
     /// Each character's cell in `font/ascii.png` (16 × 16 cells of 8 × 8) and advance.
     glyphs: HashMap<char, (u8, u8)>,
     cracks: [[f32; 4]; 10],
-    /// The survival HUD's sprites, by vanilla's name for them.
-    vitals: HashMap<String, [f32; 4]>,
+    /// The GUI sprites drawn by name, by vanilla's name for them, and the menus' textures
+    /// by their full ids.
+    named: HashMap<String, [f32; 4]>,
+    /// The centre of a plain white sprite, for filling with a colour.
+    white: [f32; 2],
+    /// The death screen's English text, by translation key.
+    lang: HashMap<String, String>,
 }
 
 impl HudArt {
+    /// `StringSplitter.splitLines`: `text` broken at spaces into lines at most `max` GUI
+    /// pixels wide, a word wider than that on a line of its own.
+    pub(crate) fn wrap(&self, text: &str, max: i32) -> Vec<String> {
+        let width = |s: &str| GuiMesh::text_width(self, s) as i32;
+        let mut lines = Vec::new();
+        for paragraph in text.split('\n') {
+            let mut line = String::new();
+            for word in paragraph.split(' ') {
+                let candidate = if line.is_empty() {
+                    word.to_owned()
+                } else {
+                    format!("{line} {word}")
+                };
+                if width(&candidate) > max && !line.is_empty() {
+                    lines.push(std::mem::replace(&mut line, word.to_owned()));
+                } else {
+                    line = candidate;
+                }
+            }
+            lines.push(line);
+        }
+        lines
+    }
+
     pub(crate) fn new(
         res: &mc_assets::Resources,
         atlas: &Atlas,
@@ -100,15 +147,46 @@ impl HudArt {
             font: atlas.sprite(FONT).rect,
             glyphs: glyphs(res)?,
             cracks: std::array::from_fn(|i| atlas.sprite(&crack_sprite(i as u8)).rect),
-            vitals: vitals_sprites()
+            named: named_sprites()
                 .into_iter()
                 .map(|n| {
                     let rect = atlas.sprite(&gui_sprite(&n)).rect;
                     (n, rect)
                 })
+                .chain(menu::TEXTURES.map(|id| (id.to_owned(), atlas.sprite(id).rect)))
                 .collect(),
+            white: {
+                let [u0, v0, u1, v1] = atlas.sprite(crate::atlas::WHITE_SPRITE).rect;
+                [(u0 + u1) / 2.0, (v0 + v1) / 2.0]
+            },
+            lang: gui_lang(res)?,
         })
     }
+}
+
+/// The English translations of the keys the death screen and the menus use.
+fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
+    let path = res.asset_path("lang", "minecraft:en_us", "json");
+    let lang: HashMap<String, serde_json::Value> = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("{}", path.display()))?,
+    )?;
+    Ok(lang
+        .into_iter()
+        .filter(|(k, _)| {
+            [
+                "deathScreen.",
+                "addServer.",
+                "selectServer.",
+                "menu.",
+                "connect.",
+                "disconnect.",
+                "gui.",
+            ]
+            .iter()
+            .any(|p| k.starts_with(p))
+        })
+        .filter_map(|(k, v)| Some((k, v.as_str()?.to_owned())))
+        .collect())
 }
 
 /// The default font's `ascii.png` glyphs: which character each cell holds, from the font's
@@ -157,6 +235,91 @@ pub struct Hotbar {
     pub slots: [Option<(String, i32)>; 9],
     pub selected: u8,
     pub vitals: Option<Vitals>,
+    /// The death screen, when the player has died.
+    pub death: Option<DeathScreen>,
+}
+
+/// A screen drawn instead of the HUD.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Screen {
+    Menu(menu::Menu),
+    Launcher(launcher::Launcher),
+}
+
+/// What the death screen shows.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct DeathScreen {
+    pub hardcore: bool,
+    /// The death message, or none when the screen opened without one (such as on joining
+    /// while dead).
+    pub message: Option<String>,
+    pub score: i32,
+    /// The buttons work: a second after the screen (or the confirmation) opened.
+    pub active: bool,
+    /// Showing `TitleConfirmScreen`, which asks before leaving for the title screen.
+    pub confirm: bool,
+    /// Where the mouse is, in GUI pixels, to highlight the button under it.
+    pub mouse: Option<[f32; 2]>,
+}
+
+/// A button on the death screen: x, y, width and height in GUI pixels, and its label's
+/// translation key.
+pub struct Button {
+    pub rect: [i32; 4],
+    pub label: &'static str,
+}
+
+impl Button {
+    pub fn contains(&self, [x, y]: [f32; 2]) -> bool {
+        let [bx, by, w, h] = self.rect.map(|c| c as f32);
+        x >= bx && y >= by && x < bx + w && y < by + h
+    }
+}
+
+/// The death screen's two buttons in a GUI `width` × `height` GUI pixels.
+/// `DeathScreen.init`: Respawn (or Spectate World in hardcore) above Title Screen, 200 wide.
+/// `TitleConfirmScreen`, from `ConfirmScreen.init`: the title, an empty message, then Title
+/// Screen and Respawn side by side, 150 wide and 4 apart, the whole centred on the screen.
+pub fn death_buttons(d: &DeathScreen, width: i32, height: i32) -> [Button; 2] {
+    if d.confirm {
+        let (x, y) = confirm_origin(width, height);
+        [
+            Button {
+                rect: [x, y + CONFIRM_BUTTONS_Y, 150, 20],
+                label: "deathScreen.titleScreen",
+            },
+            Button {
+                rect: [x + 154, y + CONFIRM_BUTTONS_Y, 150, 20],
+                label: "deathScreen.respawn",
+            },
+        ]
+    } else {
+        let respawn = if d.hardcore {
+            "deathScreen.spectate"
+        } else {
+            "deathScreen.respawn"
+        };
+        [
+            Button {
+                rect: [width / 2 - 100, height / 4 + 72, 200, 20],
+                label: respawn,
+            },
+            Button {
+                rect: [width / 2 - 100, height / 4 + 96, 200, 20],
+                label: "deathScreen.titleScreen",
+            },
+        ]
+    }
+}
+
+/// The confirmation's layout, a column 8 apart: the title (9 high), the empty message (0),
+/// and the buttons' row, padded 16 above (36). Its width is the buttons' 304.
+const CONFIRM_HEIGHT: i32 = 9 + 8 + 8 + 16 + 20;
+const CONFIRM_BUTTONS_Y: i32 = 9 + 8 + 8 + 16;
+
+/// `FrameLayout.centerInRectangle`: the confirmation's top left.
+fn confirm_origin(width: i32, height: i32) -> (i32, i32) {
+    ((width - 304) / 2, (height - CONFIRM_HEIGHT) / 2)
 }
 
 /// What the hearts, food and experience bar show, as `Hud.extractPlayerHealth` works them
@@ -219,20 +382,39 @@ impl GuiMesh {
 
     /// `Font.drawString` with its shadow: one GUI pixel down and right, a quarter as bright.
     fn text(&mut self, art: &HudArt, text: &str, x: f32, y: f32, rgb: [f32; 3]) {
-        let [r, g, b] = rgb;
-        self.glyphs(
-            art,
-            text,
-            x + 1.0,
-            y + 1.0,
-            TEXT,
-            [r * 0.25, g * 0.25, b * 0.25],
-        );
-        self.glyphs(art, text, x, y, TEXT + 1.0, rgb);
+        self.shadowed(art, text, x, y, TEXT, 1.0, rgb);
     }
 
-    /// `Font.drawString` without a shadow.
-    fn glyphs(&mut self, art: &HudArt, text: &str, x: f32, y: f32, z: f32, rgb: [f32; 3]) {
+    /// Text with its shadow at depth `z`, `scale` times its size.
+    #[allow(clippy::too_many_arguments)]
+    fn shadowed(
+        &mut self,
+        art: &HudArt,
+        text: &str,
+        x: f32,
+        y: f32,
+        z: f32,
+        scale: f32,
+        rgb: [f32; 3],
+    ) {
+        let [r, g, b] = rgb;
+        let shadow = [r * 0.25, g * 0.25, b * 0.25];
+        self.glyphs(art, text, x + scale, y + scale, z, scale, shadow);
+        self.glyphs(art, text, x, y, z + 0.5, scale, rgb);
+    }
+
+    /// `Font.drawString` without a shadow, `scale` times its size.
+    #[allow(clippy::too_many_arguments)]
+    fn glyphs(
+        &mut self,
+        art: &HudArt,
+        text: &str,
+        x: f32,
+        y: f32,
+        z: f32,
+        scale: f32,
+        rgb: [f32; 3],
+    ) {
         let mut pen = x;
         for c in text.chars() {
             let Some(&(cell, advance)) = art.glyphs.get(&c) else {
@@ -248,9 +430,10 @@ impl GuiMesh {
                     u0 + du * (col + 1.0),
                     v0 + dv * (row + 1.0),
                 ];
-                self.blit(pen, y, z, 8.0, 8.0, rect, [rgb[0], rgb[1], rgb[2], 1.0]);
+                let size = 8.0 * scale;
+                self.blit(pen, y, z, size, size, rect, [rgb[0], rgb[1], rgb[2], 1.0]);
             }
-            pen += advance as f32;
+            pen += advance as f32 * scale;
         }
     }
 
@@ -405,6 +588,9 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
     if let Some(vitals) = &hotbar.vitals {
         mesh.vitals(art, vitals, width as i32, height as i32);
     }
+    if let Some(death) = &hotbar.death {
+        mesh.death_screen(art, death, width as i32, height as i32);
+    }
     mesh
 }
 
@@ -416,7 +602,7 @@ impl GuiMesh {
     fn vitals(&mut self, art: &HudArt, v: &Vitals, width: i32, height: i32) {
         let mut z = BACK + 2.0;
         let mut sprite = |mesh: &mut Self, name: &str, x: i32, y: i32, w: i32, h: i32| {
-            let rect = art.vitals[name];
+            let rect = art.named[name];
             mesh.blit(x as f32, y as f32, z, w as f32, h as f32, rect, [1.0; 4]);
             z += 0.01;
         };
@@ -469,7 +655,7 @@ impl GuiMesh {
         sprite(self, XP_BACKGROUND, left, top, 182, 5);
         if progress > 0 {
             // The sprite's left `progress` pixels, at their own size.
-            let [u0, v0, u1, v1] = art.vitals[XP_PROGRESS];
+            let [u0, v0, u1, v1] = art.named[XP_PROGRESS];
             let u1 = u0 + (u1 - u0) * progress.min(182) as f32 / 182.0;
             self.blit(
                 left as f32,
@@ -489,11 +675,142 @@ impl GuiMesh {
             let y = height - 24 - 9 - 2;
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let (x, y) = ((x + dx) as f32, (y + dy) as f32);
-                self.glyphs(art, &text, x, y, TEXT, [0.0; 3]);
+                self.glyphs(art, &text, x, y, TEXT, 1.0, [0.0; 3]);
             }
             // 0xFF80FF20.
             let green = [128.0 / 255.0, 1.0, 32.0 / 255.0];
-            self.glyphs(art, &text, x as f32, y as f32, TEXT + 1.0, green);
+            self.glyphs(art, &text, x as f32, y as f32, TEXT + 1.0, 1.0, green);
+        }
+    }
+}
+
+impl GuiMesh {
+    /// `DeathScreen.extractRenderState`, or `TitleConfirmScreen`'s over the same background.
+    fn death_screen(&mut self, art: &HudArt, d: &DeathScreen, width: i32, height: i32) {
+        let lang = |key: &str| art.lang.get(key).map_or(key, String::as_str).to_owned();
+        let width_of = |text: &str| Self::text_width(art, text) as i32;
+        let white = [1.0; 3];
+        // `extractDeathBackground`: 0x60500000 at the top to 0xA0803030 at the bottom.
+        self.gradient(
+            art,
+            width as f32,
+            height as f32,
+            [0x50, 0, 0, 0x60],
+            [0x80, 0x30, 0x30, 0xa0],
+        );
+        let z = SCREEN + 2.0;
+        if d.confirm {
+            let (x, y) = confirm_origin(width, height);
+            let title = lang("deathScreen.quit.confirm");
+            // A `StringWidget` centred in the column, as wide as the buttons (the title is
+            // narrower).
+            let x = x + (304 - width_of(&title)) / 2;
+            self.shadowed(art, &title, x as f32, y as f32, z, 1.0, white);
+        } else {
+            // The title at twice the size, centred on a quarter of the width in its own
+            // scaled coordinates, at y 30 in them.
+            let key = if d.hardcore {
+                "deathScreen.title.hardcore"
+            } else {
+                "deathScreen.title"
+            };
+            let title = lang(key);
+            let left = width / 2 / 2 - width_of(&title) / 2;
+            self.shadowed(art, &title, (left * 2) as f32, 60.0, z, 2.0, white);
+            if let Some(message) = &d.message {
+                let x = width / 2 - width_of(message) / 2;
+                self.shadowed(art, message, x as f32, 85.0, z, 1.0, white);
+            }
+            // "Score: %s", the score in yellow (`ChatFormatting.YELLOW`).
+            let format = lang("deathScreen.score.value");
+            let (before, after) = format.split_once("%s").unwrap_or((&format, ""));
+            let score = d.score.to_string();
+            let parts = [
+                (before, white),
+                (&score, [1.0, 1.0, 85.0 / 255.0]),
+                (after, white),
+            ];
+            let total: i32 = parts.iter().map(|(t, _)| width_of(t)).sum();
+            let mut x = width / 2 - total / 2;
+            for (text, rgb) in parts {
+                self.shadowed(art, text, x as f32, 100.0, z, 1.0, rgb);
+                x += width_of(text);
+            }
+        }
+        for button in death_buttons(d, width, height) {
+            self.button(art, &button, d.active, d.mouse);
+        }
+    }
+
+    /// `Button.extractContents`: the nine-sliced sprite, then the label centred on it, grey
+    /// when inactive (`AbstractWidget.WithInactiveMessage`).
+    fn button(&mut self, art: &HudArt, b: &Button, active: bool, mouse: Option<[f32; 2]>) {
+        let hovered = mouse.is_some_and(|m| b.contains(m));
+        let sprite = match (active, hovered) {
+            (true, false) => BUTTON[0],
+            (false, _) => BUTTON[1],
+            (true, true) => BUTTON[2],
+        };
+        let [x, y, w, h] = b.rect;
+        let [u0, v0, u1, v1] = art.named[sprite];
+        // The sprites are 200 × 20 with a 3-pixel border, and buttons are no wider or
+        // taller: the left part up to the right border, then the right border.
+        let u = |px: i32| u0 + (u1 - u0) * px as f32 / 200.0;
+        let z = SCREEN + 1.0;
+        let white = [1.0; 4];
+        self.blit(
+            x as f32,
+            y as f32,
+            z,
+            (w - 3) as f32,
+            h as f32,
+            [u0, v0, u(w - 3), v1],
+            white,
+        );
+        self.blit(
+            (x + w - 3) as f32,
+            y as f32,
+            z,
+            3.0,
+            h as f32,
+            [u(197), v0, u1, v1],
+            white,
+        );
+        // `ActiveTextCollector.defaultScrollingHelper` for a label that fits.
+        let label = art.lang.get(b.label).map_or(b.label, String::as_str);
+        let text_width = Self::text_width(art, label) as i32;
+        let left = x + w / 2 - text_width / 2;
+        let top = (y + y + h - 9) / 2 + 1;
+        // 0xA0A0A0 when inactive.
+        let rgb = if active { [1.0; 3] } else { [160.0 / 255.0; 3] };
+        self.shadowed(art, label, left as f32, top as f32, SCREEN + 2.0, 1.0, rgb);
+    }
+
+    /// `GuiGraphicsExtractor.fill`: a rectangle (x, y, width, height) in one colour.
+    fn rect(&mut self, art: &HudArt, [x, y, w, h]: [i32; 4], z: f32, color: [u8; 4]) {
+        let (x0, y0, x1, y1) = (x as f32, y as f32, (x + w) as f32, (y + h) as f32);
+        for [px, py] in [[x0, y0], [x0, y1], [x1, y1], [x1, y0]] {
+            self.vertices.push(Vertex {
+                pos: [px, py, z],
+                uv: art.white,
+                color,
+                light: [0; 4],
+            });
+        }
+    }
+
+    /// `GuiGraphicsExtractor.fillGradient` over the whole screen, from `top` to `bottom`
+    /// (RGBA bytes).
+    fn gradient(&mut self, art: &HudArt, width: f32, height: f32, top: [u8; 4], bottom: [u8; 4]) {
+        let corners = [[0.0, 0.0], [0.0, height], [width, height], [width, 0.0]];
+        let colors = [top, bottom, bottom, top];
+        for ([x, y], color) in corners.into_iter().zip(colors) {
+            self.vertices.push(Vertex {
+                pos: [x, y, SCREEN],
+                uv: art.white,
+                color,
+                light: [0; 4],
+            });
         }
     }
 }

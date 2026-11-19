@@ -52,7 +52,19 @@ cargo run --release -p mc-client -- --server localhost:25565 --name cardboard
 Joins a vanilla 26.3 server instead, and draws the chunks it sends. On a server you walk
 with vanilla's movement and collision: WASD, Space to jump, Shift to sneak, Ctrl to sprint,
 and double-tap Space to fly where the server allows it. Only offline-mode servers
-(`online-mode=false`) work so far. Swimming isn't simulated yet.
+(`online-mode=false`) work so far. Swimming isn't simulated yet. In survival the HUD shows
+hearts, food and experience, and dying opens the death screen.
+
+```sh
+cargo build --release -p mc-client && cargo run --release -p mc-launcher
+```
+
+Opens the launcher, styled after Mojang's: set a player name and press Play. It starts the
+`minecraft-cardboard` beside it, remembers the name in `launcher.json` beside it, and comes
+back when the game closes. Started without `--world` or `--server`, the game opens on its
+title screen: Singleplayer opens the test world, and Multiplayer asks for a server's
+address, remembered as vanilla does in `options.txt`. Leaving a server, or losing the
+connection, comes back to the menus.
 
 ## Crates
 
@@ -65,6 +77,7 @@ and double-tap Space to fly where the server allows it. Only offline-mode server
 - `mc-physics`: the player's movement and collision, as vanilla's
 - `mc-render`: texture atlas, model baking, chunk meshing with smooth lighting, wgpu renderer
 - `mc-client`: the `minecraft-cardboard` binary
+- `mc-launcher`: the `minecraft-cardboard-launcher` binary, which starts the game
 
 ## Checks
 

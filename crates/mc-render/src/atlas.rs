@@ -59,11 +59,14 @@ impl Atlas {
         let mut meta: HashMap<String, (Strategy, f32)> = HashMap::new();
         let mut ids: Vec<String> = ids.into_iter().map(|id| normalize(&id)).collect();
         ids.push(MISSING_SPRITE.to_owned());
+        ids.push(WHITE_SPRITE.to_owned());
         ids.sort();
         ids.dedup();
         for id in ids {
             let image = if id == MISSING_SPRITE {
                 None
+            } else if id == WHITE_SPRITE {
+                Some(image::RgbaImage::from_pixel(16, 16, image::Rgba([255; 4])))
             } else {
                 meta.insert(id.clone(), mipmap_meta(res, &id));
                 load_first_frame(res, &id)
@@ -165,6 +168,10 @@ fn load_first_frame(res: &Resources, id: &str) -> Option<image::RgbaImage> {
             .to_image(),
     )
 }
+
+/// A plain white sprite, for filling rectangles with a vertex colour, as vanilla's GUI
+/// does with no texture.
+pub(crate) const WHITE_SPRITE: &str = "cardboard:white";
 
 fn missing_texture() -> image::RgbaImage {
     image::RgbaImage::from_fn(16, 16, |x, y| {

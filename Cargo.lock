@@ -1100,6 +1100,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mc-launcher"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "glam",
+ "mc-assets",
+ "mc-registry",
+ "mc-render",
+ "pollster",
+ "serde_json",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
 name = "mc-nbt"
 version = "0.0.1"
 dependencies = [

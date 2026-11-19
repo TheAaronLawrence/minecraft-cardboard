@@ -21,14 +21,29 @@ use std::sync::mpsc::{Receiver, Sender};
 /// What the server tells the game, in the order it arrives.
 pub enum Event {
     /// The player has joined the world as this entity, in this game mode (`GameType`'s id:
-    /// survival 0, creative 1, adventure 2, spectator 3), on a hardcore server or not.
+    /// survival 0, creative 1, adventure 2, spectator 3), on a hardcore server or not, and
+    /// whether dying shows the death screen (the `immediate_respawn` game rule is off).
     Login {
         entity_id: i32,
         hardcore: bool,
         game_mode: u8,
+        show_death_screen: bool,
     },
-    /// The player's game mode changed (`GameType`'s id), on respawning or by command.
+    /// The player's game mode changed (`GameType`'s id) by command.
     GameMode(u8),
+    /// The player respawned, in this game mode.
+    Respawn {
+        game_mode: u8,
+    },
+    /// The `immediate_respawn` game rule changed: whether dying shows the death screen.
+    ShowDeathScreen(bool),
+    /// A player died: their entity id and the death message, in English.
+    Died {
+        entity_id: i32,
+        message: String,
+    },
+    /// The player's score (`Player.DATA_SCORE_ID`), which the death screen shows.
+    Score(i32),
     /// The player's health, food level and saturation.
     Health {
         health: f32,
@@ -105,6 +120,11 @@ impl Outbox {
             .get(&format!("minecraft:{name}"))
             .with_context(|| format!("no serverbound {name} packet"))?;
         self.writer.send(*id, body)
+    }
+
+    /// Leaves the server: closes the connection, as quitting does.
+    pub fn close(&self) {
+        self.writer.close();
     }
 }
 
@@ -368,6 +388,7 @@ fn play(
     let mut dimension: Option<chunk::Dimension> = None;
     let mut position = ([0.0f64; 3], 0.0f32, 0.0f32);
     let mut loaded = false;
+    let mut own_id = i32::MIN;
     loop {
         let (id, body) = conn.recv()?;
         let mut r = Reader::new(&body);
@@ -394,19 +415,20 @@ fn play(
                 for _ in 0..3 {
                     r.varint()?;
                 }
-                for _ in 0..3 {
-                    r.bool()?;
-                }
+                // Reduced debug info, whether to show the death screen, limited crafting.
+                let show_death_screen = [r.bool()?, r.bool()?, r.bool()?][1];
                 let index = r.count()?;
                 let (name, data) = config
                     .entries("minecraft:dimension_type")
                     .get(index)
                     .context("the login's dimension type isn't in the registry data")?;
                 dimension = Some(chunk::Dimension::new(name, data.as_ref())?);
+                own_id = entity_id;
                 tx.send(Event::Login {
                     entity_id,
                     hardcore,
                     game_mode: spawn_game_mode(&mut r)?,
+                    show_death_screen,
                 })
                 .is_ok()
             }
@@ -414,17 +436,38 @@ fn play(
                 // The same spawn info as the login's, from its dimension type on. Changing
                 // dimension isn't supported yet, but the game mode can change too.
                 r.varint()?;
-                tx.send(Event::GameMode(spawn_game_mode(&mut r)?)).is_ok()
+                // The server waits for the client to load again before the player can move.
+                loaded = false;
+                tx.send(Event::Respawn {
+                    game_mode: spawn_game_mode(&mut r)?,
+                })
+                .is_ok()
             }
             "game_event" => {
                 // `ClientboundGameEventPacket.CHANGE_GAME_MODE`, its parameter rounded as
-                // `handleGameEvent` does.
+                // `handleGameEvent` does; and `IMMEDIATE_RESPAWN`, where 0 shows the death
+                // screen.
                 let (event, param) = (r.u8()?, r.f32()?);
-                event != 3
-                    || tx
+                match event {
+                    3 => tx
                         .send(Event::GameMode((param + 0.5).floor() as u8))
-                        .is_ok()
+                        .is_ok(),
+                    11 => tx.send(Event::ShowDeathScreen(param == 0.0)).is_ok(),
+                    _ => true,
+                }
             }
+            "player_combat_kill" => {
+                let entity_id = r.varint()?;
+                tx.send(Event::Died {
+                    entity_id,
+                    message: message_text(r.nbt()?),
+                })
+                .is_ok()
+            }
+            "set_entity_data" if r.varint()? == own_id => match player_score(&mut r)? {
+                Some(score) => tx.send(Event::Score(score)).is_ok(),
+                None => true,
+            },
             "set_health" => tx
                 .send(Event::Health {
                     health: r.f32()?,
@@ -625,6 +668,67 @@ fn play(
     }
 }
 
+/// `Player.DATA_SCORE_ID` from a `ClientboundSetEntityDataPacket`'s values, if it holds
+/// it. Each value is its index, its `EntityDataSerializers` id and the value; the score is
+/// index 18 (after `Entity`'s 8, `LivingEntity`'s 7, `Avatar`'s 2 and `Player`'s absorption),
+/// a `VAR_INT`. A serializer this can't skip ends the read without it.
+fn player_score(r: &mut Reader) -> Result<Option<i32>> {
+    const SCORE: u8 = 18;
+    loop {
+        let index = r.u8()?;
+        if index == 0xff {
+            return Ok(None);
+        }
+        let serializer = r.varint()?;
+        if index == SCORE && serializer == 1 {
+            return Ok(Some(r.varint()?));
+        }
+        match serializer {
+            0 => {
+                r.u8()?;
+            }
+            // Ints, directions, optional ints, poses and arms.
+            1 | 12 | 19 | 20 | 42 => {
+                r.varint()?;
+            }
+            2 => {
+                r.varlong()?;
+            }
+            3 => {
+                r.f32()?;
+            }
+            4 => {
+                r.string()?;
+            }
+            5 => {
+                r.nbt()?;
+            }
+            6 => {
+                if r.bool()? {
+                    r.nbt()?;
+                }
+            }
+            8 => {
+                r.bool()?;
+            }
+            9 => {
+                r.take(12)?;
+            }
+            10 => {
+                r.i64()?;
+            }
+            11 => {
+                if r.bool()? {
+                    r.i64()?;
+                }
+            }
+            // An empty particle list, as a player without effects has.
+            17 if r.count()? == 0 => {}
+            _ => return Ok(None),
+        }
+    }
+}
+
 /// The game mode from a `CommonPlayerSpawnInfo`, read from just after its dimension type:
 /// the dimension's name and the hashed seed come first.
 fn spawn_game_mode(r: &mut Reader) -> Result<u8> {
@@ -684,13 +788,7 @@ fn item_stack(r: &mut Reader, registry: &Registry) -> Result<Option<(String, i32
 /// A disconnect reason as a player reads it: the chat component in English, plus how to
 /// fix it when the fix is on the player's side.
 fn reason(component: &serde_json::Value) -> String {
-    let lang = std::fs::read(mc_assets::locate(
-        "resources/assets/minecraft/lang/en_us.json",
-    ))
-    .ok()
-    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    .unwrap_or_default();
-    let text = component_text(component, &lang);
+    let text = component_text(component, &english());
     let hint = match component["translate"].as_str().unwrap_or_default() {
         "multiplayer.disconnect.not_whitelisted" => {
             "Run `whitelist off` in the server console, or `whitelist add <name>` for this name."
@@ -727,7 +825,8 @@ fn component_text(
         Value::Object(_) => String::new(),
         other => return other.to_string(),
     };
-    if let Some(text) = c["text"].as_str() {
+    // A string in a list of mixed tags is a compound with an empty key.
+    if let Some(text) = c["text"].as_str().or(c[""].as_str()) {
         out.push_str(text);
     } else if let Some(key) = c["translate"].as_str() {
         let args: Vec<String> = c["with"]
@@ -772,6 +871,24 @@ fn fill(format: &str, args: &[String]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// The English translations, or none if they can't be read.
+fn english() -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read(mc_assets::locate(
+        "resources/assets/minecraft/lang/en_us.json",
+    ))
+    .ok()
+    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    .unwrap_or_default()
+}
+
+/// A chat component sent as NBT, as English text without its styles.
+fn message_text(tag: Option<mc_nbt::Tag>) -> String {
+    component_text(
+        &tag.as_ref().map_or(serde_json::Value::Null, nbt_json),
+        &english(),
+    )
 }
 
 fn nbt_reason(tag: Option<mc_nbt::Tag>) -> String {

@@ -85,7 +85,7 @@ fn color(c: u32) -> [f32; 4] {
 
 /// Vanilla's automatic GUI scale: the largest that leaves the screen at least 320 × 240
 /// GUI pixels (`Window.calculateScale` with the setting at 0).
-fn gui_scale(width: u32, height: u32) -> u32 {
+pub fn gui_scale(width: u32, height: u32) -> u32 {
     let mut scale = 1;
     while scale < width
         && scale < height
@@ -114,6 +114,8 @@ pub struct Renderer {
     crack: wgpu::RenderPipeline,
     hud_art: crate::hud::HudArt,
     hotbar: Option<crate::hud::Hotbar>,
+    /// A screen drawn instead of the HUD: the game's menus, or the launcher.
+    screen: Option<crate::hud::Screen>,
     /// The cracks over blocks being mined, and their index count.
     crack_vertices: Option<(wgpu::Buffer, u32)>,
     /// The outline around the block the player looks at, and its index count.
@@ -554,6 +556,7 @@ impl Renderer {
             crack,
             hud_art: models.hud.clone(),
             hotbar: None,
+            screen: None,
             crack_vertices: None,
             outline_vertices: None,
             bind_group,
@@ -618,6 +621,11 @@ impl Renderer {
     /// The hotbar to draw over the world, or none.
     pub fn set_hotbar(&mut self, hotbar: Option<crate::hud::Hotbar>) {
         self.hotbar = hotbar;
+    }
+
+    /// The screen to draw over everything instead of the HUD, or none.
+    pub fn set_screen(&mut self, screen: Option<crate::hud::Screen>) {
+        self.screen = screen;
     }
 
     /// Draws these crack quads (from `hud::cracks`) over blocks being mined.
@@ -730,8 +738,15 @@ impl Renderer {
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
         let scale = gui_scale(width, height);
-        let gui_mesh = match (&self.hotbar, view.hud) {
-            (Some(hotbar), true) => crate::hud::hotbar(
+        let (gui_width, gui_height) = (width.div_ceil(scale), height.div_ceil(scale));
+        let gui_mesh = match (&self.screen, &self.hotbar, view.hud) {
+            (Some(crate::hud::Screen::Menu(menu)), ..) => {
+                crate::hud::menu::menu(&self.hud_art, menu, gui_width, gui_height)
+            }
+            (Some(crate::hud::Screen::Launcher(launcher)), ..) => {
+                crate::hud::launcher::launcher(&self.hud_art, launcher, gui_width, gui_height)
+            }
+            (None, Some(hotbar), true) => crate::hud::hotbar(
                 &self.hud_art,
                 hotbar,
                 width.div_ceil(scale),

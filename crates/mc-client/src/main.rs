@@ -11,11 +11,16 @@
 //! In the window: click to capture the mouse, WASD to move, Space and Shift to go up and
 //! down, Ctrl to fly faster, Esc to release the mouse. On a server, left click mines, right
 //! click places or uses, middle click picks the block, and 1 to 9 or the wheel choose the
-//! hotbar slot.
+//! hotbar slot. Dying opens the death screen, whose buttons respawn or leave.
+//!
+//! Without `--world` or `--server`, the window opens on the title screen: Singleplayer opens
+//! the test world, and Multiplayer asks for a server's address (remembered in `options.txt`
+//! beside the exe). Leaving a world, or losing the connection, comes back to the menus.
 
 use anyhow::{Context, Result, bail};
 use glam::Vec3;
 use mc_render::bake::BlockModels;
+use mc_render::hud::menu;
 
 mod skins;
 mod stream;
@@ -27,8 +32,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[derive(Clone)]
 struct Args {
     world: PathBuf,
+    /// `--world` was given, so the window opens that world rather than the title screen.
+    world_given: bool,
     server: Option<String>,
     name: String,
     /// `--pos` and `--look` were given, so they win over the server's placement.
@@ -45,6 +53,7 @@ struct Args {
 fn parse_args() -> Result<Args> {
     let mut args = Args {
         world: mc_assets::locate("fixtures/worlds/test-world"),
+        world_given: false,
         server: None,
         name: "cardboard".into(),
         pos_given: false,
@@ -73,7 +82,7 @@ fn parse_args() -> Result<Args> {
     while let Some(flag) = it.next() {
         let mut value = || it.next().with_context(|| format!("{flag} needs a value"));
         match flag.as_str() {
-            "--world" => args.world = value()?.into(),
+            "--world" => (args.world, args.world_given) = (value()?.into(), true),
             "--server" => args.server = Some(value()?),
             "--name" => args.name = value()?,
             "--pos" => match numbers(&value()?)?[..] {
@@ -114,7 +123,8 @@ struct Scene {
     outbox: Option<mc_protocol::Outbox>,
 }
 
-fn load_scene(args: &Args) -> Result<Scene> {
+/// Fails when the resources the game reads aren't where it looks.
+fn check_resources() -> Result<()> {
     let root = mc_assets::default_root();
     anyhow::ensure!(
         root.join("reports/blocks.json").exists(),
@@ -122,6 +132,12 @@ fn load_scene(args: &Args) -> Result<Scene> {
          the whole of it, then run minecraft-cardboard.exe from the extracted folder.",
         root.display()
     );
+    Ok(())
+}
+
+fn load_scene(args: &Args) -> Result<Scene> {
+    check_resources()?;
+    let root = mc_assets::default_root();
     let res = mc_assets::Resources::new(root);
     let registry = Arc::new(mc_registry::Registry::vanilla()?);
     let (source, view, outbox) = match &args.server {
@@ -225,7 +241,6 @@ fn report_failure(message: &str) {
 
 fn run() -> Result<()> {
     let mut args = parse_args()?;
-    let scene = load_scene(&args)?;
     let view = View {
         distance: (args.distance * 16) as f32,
         ticks: args.ticks,
@@ -233,6 +248,7 @@ fn run() -> Result<()> {
     };
     match args.screenshot.clone() {
         Some(path) if args.server.is_some() => {
+            let scene = load_scene(&args)?;
             let models = scene.models.clone();
             let mut streamer = spawn_streamer(scene, &args);
             let mut renderer = Renderer::headless(&models)?;
@@ -245,6 +261,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some(path) => {
+            let scene = load_scene(&args)?;
             let mut renderer = Renderer::headless(&scene.models)?;
             let started = Instant::now();
             let mesher = Mesher::new(&scene.models, &scene.biomes, &scene.registry);
@@ -270,18 +287,21 @@ fn run() -> Result<()> {
             Ok(())
         }
         None => {
+            check_resources()?;
+            // The menus draw with the GUI's sprites and font, from a bake of their own.
+            let res = mc_assets::Resources::new(mc_assets::default_root());
+            let registry = mc_registry::Registry::vanilla()?;
+            let menu_models = Arc::new(BlockModels::bake(&res, &registry, &[])?);
             let event_loop = winit::event_loop::EventLoop::new()?;
-            let models = scene.models.clone();
-            let walker = match scene.outbox.clone() {
-                Some(outbox) => Some(walk::Walker::new(outbox, &scene.registry)?),
-                None => None,
-            };
-            let streamer = spawn_streamer(scene, &args);
             let mut app = App {
+                start: args.clone(),
                 args,
-                models,
-                streamer,
-                walker,
+                models: menu_models.clone(),
+                menu_models,
+                streamer: None,
+                walker: None,
+                menu: None,
+                loading: None,
                 view: View { hud: true, ..view },
                 buttons: Default::default(),
                 outlined: None,
@@ -291,10 +311,48 @@ fn run() -> Result<()> {
                 keys: Default::default(),
                 last_frame: Instant::now(),
                 captured: false,
+                cursor: None,
+                focused_at: Instant::now(),
             };
+            if app.start.server.is_some() || app.start.world_given {
+                app.play(app.start.server.clone());
+            } else {
+                app.menu = Some(menu::Menu::default());
+            }
             event_loop.run_app(&mut app)?;
             Ok(())
         }
+    }
+}
+
+/// `options.txt` beside the exe, where vanilla keeps its options.
+fn options_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.join("options.txt")))
+        .unwrap_or_else(|| "options.txt".into())
+}
+
+/// `Options.lastMpIp`, saved as vanilla saves it: `lastServer:` in `options.txt`.
+fn last_server() -> String {
+    std::fs::read_to_string(options_path())
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("lastServer:"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn save_last_server(address: &str) {
+    let old = std::fs::read_to_string(options_path()).unwrap_or_default();
+    let mut lines: Vec<String> = old
+        .lines()
+        .filter(|l| !l.starts_with("lastServer:"))
+        .map(str::to_owned)
+        .collect();
+    lines.push(format!("lastServer:{address}"));
+    if let Err(e) = std::fs::write(options_path(), lines.join("\n") + "\n") {
+        eprintln!("saving options.txt: {e}");
     }
 }
 
@@ -367,11 +425,23 @@ struct WindowState {
 }
 
 struct App {
+    /// The arguments the game started with, which each world starts from.
+    start: Args,
     args: Args,
+    /// The models the world in play was baked with, or the menus' when there's none.
     models: Arc<BlockModels>,
-    streamer: stream::Streamer,
+    /// The models the menus draw with.
+    menu_models: Arc<BlockModels>,
+    /// The world in play, if any.
+    streamer: Option<stream::Streamer>,
     /// On a server the player walks with vanilla's physics; on a save the camera flies.
     walker: Option<walk::Walker>,
+    /// The menu screen showing, when not playing.
+    menu: Option<menu::Menu>,
+    /// A world loading or a server being joined, in the background.
+    loading: Option<std::sync::mpsc::Receiver<Result<Scene>>>,
+    /// When the menu's text box was last focused or edited, which restarts its blink.
+    focused_at: Instant,
     view: View,
     state: Option<WindowState>,
     keys: std::collections::HashSet<winit::keyboard::KeyCode>,
@@ -384,6 +454,26 @@ struct App {
     shown_cracks: Vec<([i32; 3], u32, u8)>,
     last_frame: Instant,
     captured: bool,
+    /// Where the mouse pointer is in the window, in pixels.
+    cursor: Option<[f32; 2]>,
+}
+
+impl WindowState {
+    /// Lets go of the mouse.
+    fn release(&self) {
+        let _ = self
+            .window
+            .set_cursor_grab(winit::window::CursorGrabMode::None);
+        self.window.set_cursor_visible(true);
+    }
+
+    /// The GUI's size and the pointer's place in it, in GUI pixels.
+    fn gui(&self, cursor: Option<[f32; 2]>) -> (i32, i32, Option<[f32; 2]>) {
+        let (w, h) = (self.config.width, self.config.height);
+        let scale = mc_render::gpu::gui_scale(w, h);
+        let mouse = cursor.map(|c| c.map(|v| v / scale as f32));
+        (w.div_ceil(scale) as i32, h.div_ceil(scale) as i32, mouse)
+    }
 }
 
 impl App {
@@ -432,6 +522,169 @@ impl App {
             renderer,
         });
         Ok(())
+    }
+
+    /// Starts loading the test world (or `--world`), or joining `server`, in the
+    /// background, showing the loading screen meanwhile.
+    fn play(&mut self, server: Option<String>) {
+        let mut args = self.start.clone();
+        let key = if server.is_some() {
+            "connect.connecting"
+        } else {
+            "connect.joining"
+        };
+        args.server = server;
+        self.args = args.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_scene(&args));
+        });
+        self.loading = Some(rx);
+        let menu = self.menu.get_or_insert_with(Default::default);
+        menu.screen = menu::Screen::Connecting(key);
+    }
+
+    /// The world finished loading: draw it with a renderer for its models.
+    fn enter_world(&mut self, scene: Scene) -> Result<()> {
+        let state = self.state.as_mut().context("no window")?;
+        self.walker = match scene.outbox.clone() {
+            Some(outbox) => Some(walk::Walker::new(outbox, &scene.registry)?),
+            None => None,
+        };
+        state.renderer = Renderer::new(
+            state.renderer.device.clone(),
+            state.renderer.queue.clone(),
+            state.config.format,
+            &scene.models,
+        );
+        self.models = scene.models.clone();
+        self.streamer = Some(spawn_streamer(scene, &self.args));
+        self.menu = None;
+        (self.outlined, self.shown_hotbar) = (None, None);
+        self.shown_cracks.clear();
+        self.view.ticks = self.args.ticks;
+        Ok(())
+    }
+
+    /// Leaves the world in play (closing the server connection) for this menu screen.
+    fn leave_world(&mut self, screen: menu::Screen) {
+        if let Some(walker) = &self.walker {
+            walker.leave();
+        }
+        (self.walker, self.streamer, self.loading) = (None, None, None);
+        if let Some(state) = &mut self.state {
+            state.release();
+            state.renderer = Renderer::new(
+                state.renderer.device.clone(),
+                state.renderer.queue.clone(),
+                state.config.format,
+                &self.menu_models,
+            );
+        }
+        self.models = self.menu_models.clone();
+        (self.captured, self.buttons) = (false, Default::default());
+        self.keys.clear();
+        self.menu = Some(menu::Menu {
+            screen,
+            ..Default::default()
+        });
+    }
+
+    /// Where a menu goes back to: Direct Connection from joining a server, the title
+    /// screen from everything else.
+    fn back_screen(&self) -> menu::Screen {
+        match self.menu.as_ref().map(|m| &m.screen) {
+            Some(menu::Screen::DirectConnect) | None => menu::Screen::Title,
+            Some(_) if self.args.server.is_some() => menu::Screen::DirectConnect,
+            Some(_) => menu::Screen::Title,
+        }
+    }
+
+    fn menu_action(
+        &mut self,
+        action: menu::Action,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) {
+        let back = self.back_screen();
+        let Some(m) = &mut self.menu else { return };
+        match action {
+            menu::Action::Singleplayer => self.play(None),
+            menu::Action::Multiplayer => {
+                m.screen = menu::Screen::DirectConnect;
+                m.address = menu::Field::new(&last_server());
+                self.focused_at = Instant::now();
+            }
+            menu::Action::Options => {}
+            menu::Action::Quit => event_loop.exit(),
+            menu::Action::Join => {
+                let address = m.address.value.trim().to_owned();
+                if menu::valid_address(&address) {
+                    save_last_server(&address);
+                    self.play(Some(address));
+                }
+            }
+            menu::Action::Back => {
+                self.loading = None;
+                let screen = back;
+                if screen == menu::Screen::DirectConnect {
+                    m.address = menu::Field::new(&last_server());
+                }
+                m.screen = screen;
+            }
+        }
+    }
+
+    fn menu_click(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        let Some(state) = &self.state else { return };
+        let (width, height, Some(mouse)) = state.gui(self.cursor) else {
+            return;
+        };
+        let Some(m) = &mut self.menu else { return };
+        let art = &self.menu_models.hud;
+        if m.screen == menu::Screen::DirectConnect {
+            let rect = menu::address_rect(width);
+            let [x, y, w, h] = rect.map(|c| c as f32);
+            if mouse[0] >= x && mouse[1] >= y && mouse[0] < x + w && mouse[1] < y + h {
+                m.address.cursor = menu::clicked_position(art, &m.address, rect, mouse[0]);
+                self.focused_at = Instant::now();
+            }
+        }
+        let action = menu::buttons(m, art, width, height)
+            .into_iter()
+            .find(|(_, button, active)| *active && button.contains(mouse))
+            .map(|(action, ..)| action);
+        if let Some(action) = action {
+            self.menu_action(action, event_loop);
+        }
+    }
+
+    /// A key on a menu: Direct Connection's box edits as `EditBox` does, Enter joins and
+    /// Esc goes back.
+    fn menu_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(m) = &mut self.menu else { return };
+        if m.screen != menu::Screen::DirectConnect {
+            return;
+        }
+        let field = &mut m.address;
+        match &event.logical_key {
+            Key::Named(NamedKey::Enter) => return self.menu_action(menu::Action::Join, event_loop),
+            Key::Named(NamedKey::Escape) => {
+                return self.menu_action(menu::Action::Back, event_loop);
+            }
+            Key::Named(NamedKey::Backspace) => field.backspace(),
+            Key::Named(NamedKey::Delete) => field.delete(),
+            Key::Named(NamedKey::ArrowLeft) => field.step(-1),
+            Key::Named(NamedKey::ArrowRight) => field.step(1),
+            Key::Named(NamedKey::Home) => field.home(),
+            Key::Named(NamedKey::End) => field.end(),
+            _ => field.insert(event.text.as_deref().unwrap_or(""), 128),
+        }
+        self.focused_at = Instant::now();
     }
 
     fn fly(&mut self, dt: f32) {
@@ -489,10 +742,38 @@ impl winit::application::ApplicationHandler for App {
                     .surface
                     .configure(&state.renderer.device, &state.config);
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some([position.x as f32, position.y as f32]);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } if self.menu.is_some() => self.menu_click(event_loop),
+            WindowEvent::KeyboardInput { event, .. }
+                if self.menu.is_some() && event.state == ElementState::Pressed =>
+            {
+                self.menu_key(&event, event_loop);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } if self.walker.as_ref().is_some_and(walk::Walker::screen_open) => {
+                let (width, height, mouse) = state.gui(self.cursor);
+                if let (Some(walker), Some(mouse)) = (&mut self.walker, mouse)
+                    && walker.click_screen(mouse, width, height) == walk::ScreenAction::Quit
+                {
+                    self.leave_world(menu::Screen::Title);
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 ..
-            } if !self.captured => {
+            } if !self.captured
+                && self.menu.is_none()
+                && !self.walker.as_ref().is_some_and(walk::Walker::screen_open) =>
+            {
                 let grab = state
                     .window
                     .set_cursor_grab(winit::window::CursorGrabMode::Locked)
@@ -543,12 +824,12 @@ impl winit::application::ApplicationHandler for App {
                     if code == winit::keyboard::KeyCode::Escape
                         && event.state == ElementState::Pressed
                     {
-                        let _ = state
-                            .window
-                            .set_cursor_grab(winit::window::CursorGrabMode::None);
-                        state.window.set_cursor_visible(true);
+                        state.release();
                         self.captured = false;
                         self.buttons = Default::default();
+                        if let Some(walker) = &mut self.walker {
+                            walker.escape();
+                        }
                     }
                     let digits = [
                         winit::keyboard::KeyCode::Digit1,
@@ -579,8 +860,33 @@ impl winit::application::ApplicationHandler for App {
                 self.last_frame = now;
                 // 20 game ticks a second.
                 self.view.ticks += dt * 20.0;
+                if let Some(loading) = &self.loading {
+                    match loading.try_recv() {
+                        Ok(Ok(scene)) => {
+                            self.loading = None;
+                            if let Err(e) = self.enter_world(scene) {
+                                eprintln!("entering the world: {e:#}");
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!("couldn't join: {e:#}");
+                            self.leave_world(menu::Screen::Disconnected {
+                                title: "connect.failed",
+                                reason: format!("{e:#}"),
+                            });
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => self.loading = None,
+                    }
+                }
+                let updates: Vec<_> = self
+                    .streamer
+                    .as_ref()
+                    .map(|s| s.updates().collect())
+                    .unwrap_or_default();
+                let mut lost = None;
                 let Some(state) = &mut self.state else { return };
-                for update in self.streamer.updates() {
+                for update in updates {
                     match update {
                         stream::Update::Mesh(key, mesh) => state.renderer.upload_chunk(key, &mesh),
                         stream::Update::Remove(key) => state.renderer.remove_chunk(key),
@@ -610,12 +916,16 @@ impl winit::application::ApplicationHandler for App {
                         }
                         stream::Update::Disconnected(reason) => {
                             eprintln!("disconnected: {reason}");
-                            state.window.set_title(&format!(
-                                "minecraft-cardboard 0.0.1 (disconnected: {reason})"
-                            ));
+                            lost = Some(reason);
                         }
                         stream::Update::Idle => {}
                     }
+                }
+                if let Some(reason) = lost {
+                    self.leave_world(menu::Screen::Disconnected {
+                        title: "disconnect.lost",
+                        reason,
+                    });
                 }
                 match &mut self.walker {
                     Some(walker) => {
@@ -631,13 +941,23 @@ impl winit::application::ApplicationHandler for App {
                             camera.eye = eye;
                         }
                         if let Some(state) = &mut self.state {
+                            let mut hotbar = walker.hotbar();
+                            if let Some(death) = &mut hotbar.death {
+                                // A screen frees the mouse, as `Gui.setScreen` does.
+                                if self.captured {
+                                    state.release();
+                                    self.captured = false;
+                                    self.buttons = Default::default();
+                                }
+                                death.mouse = state.gui(self.cursor).2;
+                            }
+                            let hotbar = Some(hotbar);
                             let renderer = &mut state.renderer;
                             let target = walker.target();
                             if target != self.outlined {
                                 self.outlined = target;
                                 renderer.set_outline(&walker.outline_edges());
                             }
-                            let hotbar = Some(walker.hotbar());
                             if hotbar != self.shown_hotbar {
                                 renderer.set_hotbar(hotbar.clone());
                                 self.shown_hotbar = hotbar;
@@ -655,10 +975,20 @@ impl winit::application::ApplicationHandler for App {
                             }
                         }
                     }
-                    None => self.fly(dt),
+                    None if self.streamer.is_some() => self.fly(dt),
+                    None => {}
                 }
-                self.streamer.follow(self.args.camera.eye);
+                if let Some(streamer) = &mut self.streamer {
+                    streamer.follow(self.args.camera.eye);
+                }
                 let Some(state) = &mut self.state else { return };
+                let screen = self.menu.clone().map(|mut m| {
+                    m.mouse = state.gui(self.cursor).2;
+                    // `TextCursorUtils.isCursorVisible`: on for 300 ms, off for 300.
+                    m.cursor_on = (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2);
+                    mc_render::hud::Screen::Menu(m)
+                });
+                state.renderer.set_screen(screen);
                 let frame = match state.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,

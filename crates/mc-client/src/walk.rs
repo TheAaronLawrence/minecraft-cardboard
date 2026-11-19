@@ -126,6 +126,31 @@ pub struct Walker {
     saturation: f32,
     xp_progress: f32,
     xp_level: i32,
+    /// `LocalPlayer.showDeathScreen`: false when the `immediate_respawn` game rule is on.
+    show_death_screen: bool,
+    /// `Player.getScore`, which the death screen shows.
+    score: i32,
+    /// The death screen, while it's open.
+    death: Option<Death>,
+    /// A respawn was asked for and the server hasn't respawned the player yet.
+    respawning: bool,
+}
+
+/// The open death screen: its message, ticks since it (or its confirmation) opened, and
+/// whether it's asking to confirm leaving.
+struct Death {
+    message: Option<String>,
+    ticks: u32,
+    confirm: bool,
+}
+
+/// What a click on the death screen asks the game to do.
+#[derive(PartialEq, Eq, Debug)]
+pub enum ScreenAction {
+    None,
+    /// Title Screen: leaves the game, which takes the player back to the launcher when the
+    /// launcher started it.
+    Quit,
 }
 
 /// The player's health as `LocalPlayer` keeps it, and what `Hud` keeps to blink the hearts
@@ -243,6 +268,10 @@ impl Walker {
             saturation: 5.0,
             xp_progress: 0.0,
             xp_level: 0,
+            show_death_screen: true,
+            score: 0,
+            death: None,
+            respawning: false,
         })
     }
 
@@ -266,8 +295,29 @@ impl Walker {
                 entity_id,
                 hardcore,
                 game_mode,
+                show_death_screen,
             } => {
                 (self.entity_id, self.hardcore, self.game_mode) = (entity_id, hardcore, game_mode);
+                self.show_death_screen = show_death_screen;
+            }
+            mc_protocol::Event::ShowDeathScreen(show) => self.show_death_screen = show,
+            mc_protocol::Event::Score(score) => self.score = score,
+            // `ClientPacketListener.handlePlayerCombatKill`.
+            mc_protocol::Event::Died { entity_id, message } if entity_id == self.entity_id => {
+                if self.show_death_screen {
+                    self.open_death_screen(Some(message));
+                } else {
+                    self.respawn();
+                }
+            }
+            // `handleRespawn`: a new player, whose first health doesn't flash, and the death
+            // screen closes.
+            mc_protocol::Event::Respawn { game_mode } => {
+                self.game_mode = game_mode;
+                self.death = None;
+                self.respawning = false;
+                self.health.value = 20.0;
+                self.health.flash = false;
             }
             mc_protocol::Event::GameMode(mode) => self.game_mode = mode,
             // `ClientPacketListener.handleSetHealth`.
@@ -328,6 +378,106 @@ impl Walker {
         self.selected = (self.selected as i32 + steps).rem_euclid(9) as u8;
     }
 
+    fn open_death_screen(&mut self, message: Option<String>) {
+        self.death = Some(Death {
+            message,
+            ticks: 0,
+            confirm: false,
+        });
+    }
+
+    /// `LocalPlayer.respawn`: asks the server to respawn the player.
+    fn respawn(&mut self) {
+        // `ServerboundClientCommandPacket.Action.PERFORM_RESPAWN`.
+        if let Err(e) = self.outbox.send("client_command", &[0]) {
+            eprintln!("asking to respawn: {e:#}");
+        }
+        self.respawning = true;
+    }
+
+    fn dead(&self) -> bool {
+        self.health.value <= 0.0
+    }
+
+    /// Whether the death screen is open, so the mouse is free to click its buttons.
+    pub fn screen_open(&self) -> bool {
+        self.death.is_some()
+    }
+
+    /// A click at `mouse` (GUI pixels) on the death screen, in a GUI `width` × `height`.
+    /// `DeathScreen.init`'s and `TitleConfirmScreen`'s buttons.
+    pub fn click_screen(&mut self, mouse: [f32; 2], width: i32, height: i32) -> ScreenAction {
+        let Some(screen) = self.death_screen() else {
+            return ScreenAction::None;
+        };
+        if !screen.active {
+            return ScreenAction::None;
+        }
+        let buttons = mc_render::hud::death_buttons(&screen, width, height);
+        let Some(pressed) = buttons.iter().position(|b| b.contains(mouse)) else {
+            return ScreenAction::None;
+        };
+        match (screen.confirm, pressed) {
+            // Respawn (or Spectate World): the button stops working until the server
+            // respawns the player.
+            (false, 0) => {
+                self.respawn();
+                if let Some(death) = &mut self.death {
+                    death.ticks = 0;
+                }
+                ScreenAction::None
+            }
+            // Title Screen: hardcore leaves at once; otherwise ask first.
+            (false, _) if self.hardcore => ScreenAction::Quit,
+            (false, _) => {
+                if let Some(death) = &mut self.death {
+                    (death.confirm, death.ticks) = (true, 0);
+                }
+                ScreenAction::None
+            }
+            (true, 0) => ScreenAction::Quit,
+            (true, _) => {
+                self.cancel_quit();
+                ScreenAction::None
+            }
+        }
+    }
+
+    /// Leaves the server, closing the connection.
+    pub fn leave(&self) {
+        self.outbox.close();
+    }
+
+    /// Esc: closes the confirmation once its buttons work, choosing Respawn, as
+    /// `ConfirmScreen.keyPressed` does; the death screen itself stays open.
+    pub fn escape(&mut self) {
+        if self.death_screen().is_some_and(|s| s.confirm && s.active) {
+            self.cancel_quit();
+        }
+    }
+
+    /// `TitleConfirmScreen`'s Respawn: respawns, and since the player is still dead until
+    /// the server says otherwise, `Gui.setScreen(null)` opens a new death screen without a
+    /// message.
+    fn cancel_quit(&mut self) {
+        self.respawn();
+        self.open_death_screen(None);
+    }
+
+    fn death_screen(&self) -> Option<mc_render::hud::DeathScreen> {
+        let death = self.death.as_ref()?;
+        Some(mc_render::hud::DeathScreen {
+            hardcore: self.hardcore,
+            message: death.message.clone(),
+            score: self.score,
+            // `DeathScreen.tick` turns them on after 20 ticks, as `ConfirmScreen.setDelay(20)`
+            // does; a pressed Respawn stays off.
+            active: death.ticks >= 20 && !(self.respawning && !death.confirm),
+            confirm: death.confirm,
+            mouse: None,
+        })
+    }
+
     /// What the hotbar shows, and in survival and adventure (`GameType.isSurvival`) the
     /// hearts, food and experience above it. Call it once a frame: the hearts blink from
     /// the frame the health changes. Max health is always 20, as attributes aren't read yet.
@@ -349,6 +499,7 @@ impl Walker {
             slots: self.hotbar.clone(),
             selected: self.selected,
             vitals,
+            death: self.death_screen(),
         }
     }
 
@@ -417,11 +568,28 @@ impl Walker {
             // `Hud.tick` and `LivingEntity.baseTick`'s countdown.
             self.health.tick = self.health.tick.wrapping_add(1);
             self.health.damage_cooldown = self.health.damage_cooldown.saturating_sub(1);
+            if let Some(death) = &mut self.death {
+                death.ticks += 1;
+            }
+            self.previous = self.player.pos;
+            if self.dead() {
+                // `Minecraft.tick`: a dead player with no screen gets the death screen
+                // (`Gui.setScreen(null)`), or respawns at once when it isn't shown.
+                if self.death.is_none() && !self.respawning {
+                    if self.show_death_screen {
+                        self.open_death_screen(None);
+                    } else {
+                        self.respawn();
+                    }
+                }
+                // A dead player doesn't move or act; the server ignores it until it
+                // respawns.
+                continue;
+            }
             (self.player.yaw, self.player.pitch) = (yaw, pitch);
             if let Err(e) = self.tick_hands(buttons) {
                 eprintln!("sending block actions: {e:#}");
             }
-            self.previous = self.player.pos;
             self.player.tick(input, &self.collision, &self.blocks);
             if let Err(e) = self.send_changes(input) {
                 eprintln!("sending movement: {e:#}");

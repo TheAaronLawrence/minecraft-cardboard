@@ -57,6 +57,13 @@ impl Connection {
 }
 
 impl Writer {
+    /// Closes the connection both ways, which also ends the thread reading it.
+    pub fn close(&self) {
+        if let Ok(stream) = self.stream.lock() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     pub fn send(&self, id: i32, body: &[u8]) -> Result<()> {
         let mut packet = Vec::with_capacity(body.len() + 5);
         packet.put_varint(id);

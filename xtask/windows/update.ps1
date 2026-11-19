@@ -55,7 +55,7 @@ try {
         Write-Host "Already up to date ($current)."
         return
     }
-    if (Get-Process -Name 'minecraft-cardboard' -ErrorAction SilentlyContinue) {
+    if (Get-Process -Name 'minecraft-cardboard', 'minecraft-cardboard-launcher' -ErrorAction SilentlyContinue) {
         throw 'minecraft-cardboard is running. Close it, then run the update again.'
     }
     $from = if ($current) { $current } else { 'an unknown version' }
