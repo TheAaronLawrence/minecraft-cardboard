@@ -1,5 +1,14 @@
-//! `cargo xtask package-windows`: cross-compiles the client for 64-bit Windows and zips it
-//! with the files it reads at run time, into `target/package/`.
+//! `cargo xtask package-windows [TAG]`: cross-compiles the client for 64-bit Windows and
+//! writes a release's files to `target/package/`:
+//!
+//! - `minecraft-cardboard-VERSION-windows-x64.zip`: the whole game, with the files it reads
+//!   at run time and the updater (`update.cmd`, `update.ps1`).
+//! - `...-windows-x64-exe-only.zip`: the exe and updater, for updates that keep the resources.
+//! - `assets.txt`: a fingerprint of the resources, which tells the updater which zip it needs.
+//!
+//! TAG is the GitHub release tag the files are for, written to `version.txt` so the updater
+//! knows what's installed. Publish them with
+//! `gh release create TAG target/package/*.zip target/package/assets.txt --prerelease`.
 
 use anyhow::{Context, Result, ensure};
 use std::io::Write;
@@ -21,10 +30,11 @@ const FILES: &[&str] = &[
     "fixtures/worlds/test-world",
 ];
 
-pub fn package_windows() -> Result<()> {
+pub fn package_windows(tag: Option<&str>) -> Result<()> {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let version = env!("CARGO_PKG_VERSION");
     let name = format!("minecraft-cardboard-{version}-windows-x64");
+    let exe_only = format!("{name}-exe-only");
 
     ensure!(
         Command::new(LINKER).arg("--version").output().is_ok(),
@@ -46,33 +56,82 @@ pub fn package_windows() -> Result<()> {
     run(&mut build)?;
 
     let out = repo.join("target/package");
-    let dir = out.join(&name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
+    if out.exists() {
+        std::fs::remove_dir_all(&out)?;
     }
-    std::fs::create_dir_all(&dir)?;
-    std::fs::copy(
-        repo.join("target").join(TARGET).join("release").join(EXE),
-        dir.join(EXE),
-    )?;
-    for path in FILES {
-        copy_dir(&repo.join(path), &dir.join(path))?;
-    }
-    let readme = include_str!("../windows-README.txt")
+    let readme = include_str!("../windows/README.txt")
         .replace("{version}", version)
         .replace("{commit}", &commit(&repo)?)
         .replace('\n', "\r\n");
-    std::fs::write(dir.join("README.txt"), readme)?;
+    let assets = assets_fingerprint(&repo)?;
+    // What both zips hold: the exe, the updater, and what's installed.
+    let common = |dir: &Path| -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::copy(
+            repo.join("target").join(TARGET).join("release").join(EXE),
+            dir.join(EXE),
+        )?;
+        std::fs::write(dir.join("README.txt"), &readme)?;
+        std::fs::write(
+            dir.join("update.ps1"),
+            include_str!("../windows/update.ps1").replace('\n', "\r\n"),
+        )?;
+        std::fs::write(
+            dir.join("update.cmd"),
+            include_str!("../windows/update.cmd"),
+        )?;
+        if let Some(tag) = tag {
+            std::fs::write(dir.join("version.txt"), tag)?;
+        }
+        Ok(())
+    };
 
-    let zip_path = out.join(format!("{name}.zip"));
-    zip_dir(&out, &name, &zip_path)?;
-    let size = std::fs::metadata(&zip_path)?.len();
-    println!(
-        "{}: {:.1} MB",
-        zip_path.display(),
-        size as f64 / 1_000_000.0
-    );
+    let dir = out.join(&name);
+    common(&dir)?;
+    for path in FILES {
+        copy_dir(&repo.join(path), &dir.join(path))?;
+    }
+    std::fs::write(dir.join("assets.txt"), &assets)?;
+    common(&out.join(&exe_only))?;
+    std::fs::write(out.join("assets.txt"), &assets)?;
+
+    for folder in [&name, &exe_only] {
+        let zip_path = out.join(format!("{folder}.zip"));
+        zip_dir(&out, folder, &zip_path)?;
+        let size = std::fs::metadata(&zip_path)?.len();
+        println!(
+            "{}: {:.1} MB",
+            zip_path.display(),
+            size as f64 / 1_000_000.0
+        );
+    }
+    if tag.is_none() {
+        println!("no tag given, so the zips have no version.txt and the updater will update them");
+    }
     Ok(())
+}
+
+/// A hash of every file in `FILES`, names and contents, so it changes exactly when a
+/// release's resources do.
+fn assets_fingerprint(repo: &Path) -> Result<String> {
+    let mut files = Vec::new();
+    for path in FILES {
+        collect(&repo.join(path), &mut files)?;
+    }
+    files.sort();
+    let mut hash = sha1_smol::Sha1::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(repo)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = std::fs::read(&file)?;
+        hash.update(relative.as_bytes());
+        hash.update(&[0]);
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
+    }
+    Ok(hash.digest().to_string())
 }
 
 fn run(command: &mut Command) -> Result<()> {

@@ -1,6 +1,6 @@
 //! Project tasks. `cargo xtask fetch-assets [version]` copies Mojang's assets for a
 //! vanilla Java Edition version into `resources/`, which is committed to the repo.
-//! `cargo xtask package-windows` builds the Windows zip (see `package.rs`).
+//! `cargo xtask package-windows [tag]` builds a Windows release (see `package.rs`).
 
 mod package;
 
@@ -22,10 +22,10 @@ fn main() -> Result<()> {
         Some("fetch-assets") => fetch_assets(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
         Some("gen-reports") => gen_reports(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
         Some("gen-world") => gen_world(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
-        Some("package-windows") => package::package_windows(),
+        Some("package-windows") => package::package_windows(args.get(1).map(String::as_str)),
         _ => bail!(
             "usage: cargo xtask fetch-assets|gen-reports|gen-world [version], \
-             or cargo xtask package-windows"
+             or cargo xtask package-windows [tag]"
         ),
     }
 }
