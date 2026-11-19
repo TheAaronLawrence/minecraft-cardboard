@@ -15,8 +15,14 @@ pub enum Tint {
     Fixed([f32; 3]),
 }
 
-pub fn block_tint(name: &str) -> Option<Tint> {
+pub fn block_tint(name: &str, properties: &[(&str, &str)]) -> Option<Tint> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    let int = |p: &str| {
+        properties
+            .iter()
+            .find(|(n, _)| *n == p)
+            .and_then(|(_, v)| v.parse::<u32>().ok())
+    };
     Some(match name {
         "grass_block" | "short_grass" | "tall_grass" | "fern" | "large_fern" | "potted_fern"
         | "sugar_cane" | "bush" | "pink_petals" | "wildflowers" => Tint::Grass,
@@ -24,12 +30,28 @@ pub fn block_tint(name: &str) -> Option<Tint> {
         | "mangrove_leaves" | "vine" => Tint::Foliage,
         "leaf_litter" => Tint::DryFoliage,
         "attached_melon_stem" | "attached_pumpkin_stem" => Tint::Fixed(rgb(0xE0C71C)),
+        // `BlockTintSources.stem`: green turning yellow as it grows.
+        "melon_stem" | "pumpkin_stem" => {
+            let age = int("age")?;
+            Tint::Fixed(rgb((age * 32) << 16 | (255 - age * 8) << 8 | (age * 4)))
+        }
+        "redstone_wire" => Tint::Fixed(redstone(int("power")?)),
         "birch_leaves" => Tint::Fixed(rgb(0x80A755)),
         "spruce_leaves" => Tint::Fixed(rgb(0x619961)),
         "lily_pad" => Tint::Fixed(rgb(0x208030)),
         "water" | "bubble_column" | "water_cauldron" => Tint::Water,
         _ => return crate::entity_model::banner_color(name).map(Tint::Fixed),
     })
+}
+
+/// `RedstoneWireBlock.COLORS`: dark red when unpowered, brightening to orange-red at 15.
+fn redstone(power: u32) -> [f32; 3] {
+    let f = power as f32 / 15.0;
+    let r = f * 0.6 + if f > 0.0 { 0.4 } else { 0.3 };
+    let g = (f * f * 0.7 - 0.5).clamp(0.0, 1.0);
+    let b = (f * f * 0.6 - 0.7).clamp(0.0, 1.0);
+    // `ARGB.colorFromFloat` truncates each channel to a byte.
+    [r, g, b].map(|c| (c * 255.0).floor() / 255.0)
 }
 
 fn rgb(c: u32) -> [f32; 3] {
@@ -149,4 +171,28 @@ impl Biomes {
 fn to_u32(c: [f32; 3]) -> u32 {
     let [r, g, b] = c.map(|v| (v * 255.0).round() as u32);
     r << 16 | g << 8 | b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixed(name: &str, properties: &[(&str, &str)]) -> u32 {
+        match block_tint(name, properties) {
+            Some(Tint::Fixed(c)) => to_u32(c),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+
+    /// Wire colours as 26.3's `RedstoneWireBlock.getColorForPower` returns them (float
+    /// rounding makes full power 0xFF3200), and a grown stem matching the attached stem's
+    /// constant.
+    #[test]
+    fn state_dependent_tints() {
+        assert_eq!(fixed("redstone_wire", &[("power", "0")]), 0x4C0000);
+        assert_eq!(fixed("redstone_wire", &[("power", "7")]), 0xAD0000);
+        assert_eq!(fixed("redstone_wire", &[("power", "15")]), 0xFF3200);
+        assert_eq!(fixed("pumpkin_stem", &[("age", "0")]), 0x00FF00);
+        assert_eq!(fixed("melon_stem", &[("age", "7")]), 0xE0C71C);
+    }
 }

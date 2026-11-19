@@ -129,7 +129,7 @@ fn state_infos(registry: &Registry) -> Vec<StateInfo> {
             );
             infos.push(StateInfo {
                 block: block.id,
-                tint: block_tint(name),
+                tint: block_tint(name, &values),
                 fluid,
                 offset,
                 air: name.ends_with("air") && block.properties.is_empty(),
