@@ -11,6 +11,8 @@
 use anyhow::{Context, Result, bail};
 use glam::Vec3;
 use mc_render::bake::BlockModels;
+
+mod skins;
 use mc_render::gpu::{Camera, Renderer, View};
 use mc_render::mesh::{Mesh, Mesher, WorldView};
 use mc_render::tint::Biomes;
@@ -83,11 +85,8 @@ struct Scene {
 }
 
 fn load_scene(args: &Args) -> Result<Scene> {
-    let started = Instant::now();
     let res = mc_assets::Resources::new(mc_assets::default_root());
     let registry = mc_registry::Registry::vanilla()?;
-    let models = BlockModels::bake(&res, &registry)?;
-    let baked = started.elapsed();
     let mut world = mc_world::World::open(&args.world);
     let eye = args.camera.eye;
     // One chunk more than drawn, so the outermost drawn chunks have neighbours to cull against.
@@ -98,6 +97,14 @@ fn load_scene(args: &Args) -> Result<Scene> {
         eye.z.floor() as i32,
         args.distance + 1,
     )?;
+    // Player heads' skins go in the atlas, so they're fetched before baking.
+    let skins = skins::fetch(
+        view.block_entities()
+            .filter_map(|e| mc_render::entity_model::Profile::from_tag(e.get("profile")?)),
+    );
+    let started = Instant::now();
+    let models = BlockModels::bake(&res, &registry, &skins)?;
+    let baked = started.elapsed();
     let biomes = Biomes::load(
         &res,
         view.biome_names()

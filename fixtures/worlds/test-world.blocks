@@ -41,3 +41,9 @@
 -81 250 1 minecraft:oxidized_copper_golem_statue[copper_golem_pose=star,facing=south,waterlogged=false]
 -84 250 1 minecraft:end_portal
 -87 250 1 minecraft:end_gateway
+# Block entity data, in a column along x = 24 facing east.
+24 250 -8 minecraft:white_banner[rotation=12]{patterns:[{pattern:"minecraft:stripe_top",color:"red"},{pattern:"minecraft:creeper",color:"black"},{pattern:"minecraft:border",color:"blue"}]}
+24 250 -11 minecraft:yellow_wall_banner[facing=east]{patterns:[{pattern:"minecraft:gradient",color:"purple"}]}
+24 250 -14 minecraft:decorated_pot[cracked=false,facing=east,waterlogged=false]{sherds:{back:"minecraft:angler_pottery_sherd",left:"minecraft:brick",right:"minecraft:heart_pottery_sherd",front:{id:"minecraft:skull_pottery_sherd"}}}
+24 250 -17 minecraft:player_head[powered=false,rotation=4]{profile:{name:"Notch"}}
+24 250 -20 minecraft:player_head[powered=false,rotation=4]{profile:{id:[I;1,2,3,4]}}

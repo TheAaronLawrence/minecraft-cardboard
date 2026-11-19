@@ -43,10 +43,15 @@ pub fn normalize(id: &str) -> String {
 }
 
 impl Atlas {
-    /// Loads and packs the sprites. A sprite without a texture file, and the built-in
-    /// `missingno`, become the purple and black checkerboard.
-    pub fn build(res: &Resources, ids: impl IntoIterator<Item = String>) -> Result<Self> {
-        let mut images: Vec<(String, image::RgbaImage)> = Vec::new();
+    /// Loads and packs the sprites, plus `extra` images that aren't resource files, such as
+    /// downloaded skins. A sprite without a texture file, and the built-in `missingno`,
+    /// become the purple and black checkerboard.
+    pub fn build(
+        res: &Resources,
+        ids: impl IntoIterator<Item = String>,
+        extra: &[(String, image::RgbaImage)],
+    ) -> Result<Self> {
+        let mut images: Vec<(String, image::RgbaImage)> = extra.to_vec();
         let mut ids: Vec<String> = ids.into_iter().map(|id| normalize(&id)).collect();
         ids.push(MISSING_SPRITE.to_owned());
         ids.sort();
@@ -116,6 +121,10 @@ impl Atlas {
             levels,
             sprites,
         })
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.sprites.contains_key(&normalize(id))
     }
 
     pub fn sprite(&self, id: &str) -> Sprite {

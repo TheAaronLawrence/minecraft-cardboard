@@ -7,7 +7,7 @@ use mc_render::tint::Biomes;
 fn setup() -> (mc_assets::Resources, mc_registry::Registry, BlockModels) {
     let res = mc_assets::Resources::new(mc_assets::default_root());
     let registry = mc_registry::Registry::vanilla().unwrap();
-    let models = BlockModels::bake(&res, &registry).unwrap();
+    let models = BlockModels::bake(&res, &registry, &[]).unwrap();
     (res, registry, models)
 }
 
@@ -129,4 +129,37 @@ fn only_known_blocks_draw_nothing() {
         }
     }
     assert!(empty.is_empty(), "blocks that draw nothing: {empty:?}");
+}
+
+/// Block entity data placed in the test world changes what's drawn: the white banner's
+/// creeper pattern, and the pot's skull sherd on its front.
+#[test]
+fn block_entity_data_draws_patterns_and_sherds() {
+    let (res, registry, models) = setup();
+    let mut world = mc_world::World::open(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/worlds/test-world"
+    ));
+    let view = WorldView::load(&mut world, &registry, 24, -12, 1).unwrap();
+    let biomes = Biomes::load(&res, view.biome_names()).unwrap();
+    let mesh = Mesher::new(&models, &biomes, &registry).mesh_world(&view);
+    let uses = |sprite: &str, block: [f32; 3]| {
+        let r = models.atlas.sprite(sprite).rect;
+        mesh.opaque
+            .iter()
+            .chain(&mesh.cutout)
+            .chain(&mesh.translucent)
+            .filter(|v| (0..3).all(|i| (v.pos[i] - block[i] - 0.5).abs() < 1.5))
+            .any(|v| (r[0]..=r[2]).contains(&v.uv[0]) && (r[1]..=r[3]).contains(&v.uv[1]))
+    };
+    assert!(uses("entity/banner/creeper", [24.0, 250.0, -8.0]));
+    assert!(uses(
+        "entity/decorated_pot/skull_pottery_pattern",
+        [24.0, 250.0, -14.0]
+    ));
+    // A plain pot elsewhere doesn't pick up a sherd.
+    assert!(!uses(
+        "entity/decorated_pot/skull_pottery_pattern",
+        [24.0, 250.0, -2.0]
+    ));
 }

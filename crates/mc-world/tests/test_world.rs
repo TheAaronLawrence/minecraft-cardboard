@@ -28,7 +28,10 @@ fn placed_blocks_read_back_as_placed() {
     {
         let mut parts = line.splitn(4, ' ');
         let [x, y, z]: [i32; 3] = std::array::from_fn(|_| parts.next().unwrap().parse().unwrap());
-        let expected = parse_state(&registry, parts.next().unwrap());
+        // Block entity data, such as `{patterns:[...]}`, follows the state.
+        let state = parts.next().unwrap();
+        let state = state.split_once('{').map_or(state, |(state, _)| state);
+        let expected = parse_state(&registry, state);
         let chunk = world
             .chunk(&registry, x.div_euclid(16), z.div_euclid(16))
             .unwrap()

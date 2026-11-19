@@ -105,6 +105,8 @@ pub struct Chunk {
     /// Bottom to top, one per 16 blocks of height. The first may be below the world's floor
     /// and the last above its ceiling: vanilla keeps one extra each way for light.
     pub sections: Vec<Section>,
+    /// Each block entity's saved data, such as a banner's `patterns`, by world position.
+    pub block_entities: HashMap<[i32; 3], Compound>,
 }
 
 #[derive(Debug)]
@@ -159,11 +161,26 @@ impl Chunk {
             })
             .collect::<Result<Vec<_>>>()?;
         sections.sort_by_key(|s| s.y);
+        let block_entities = root
+            .get("block_entities")
+            .and_then(Tag::as_list)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|tag| {
+                let entity = unwrap_list_item(tag).as_compound()?;
+                let pos = ["x", "y", "z"].map(|k| entity.get(k).and_then(Tag::as_i64));
+                let [Some(x), Some(y), Some(z)] = pos else {
+                    return None;
+                };
+                Some(([x as i32, y as i32, z as i32], entity.clone()))
+            })
+            .collect();
         Ok(Self {
             x,
             z,
             status,
             sections,
+            block_entities,
         })
     }
 

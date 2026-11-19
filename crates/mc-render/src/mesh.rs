@@ -66,6 +66,8 @@ struct StateInfo {
     /// Plants vanilla nudges sideways by a per-position amount.
     offset: bool,
     air: bool,
+    /// Its block entity's data can change how it looks (see `entity_model::uses_data`).
+    data: bool,
 }
 
 fn state_infos(registry: &Registry) -> Vec<StateInfo> {
@@ -113,6 +115,7 @@ fn state_infos(registry: &Registry) -> Vec<StateInfo> {
                 fluid,
                 offset,
                 air: name.ends_with("air") && block.properties.is_empty(),
+                data: crate::entity_model::uses_data(name),
             });
         }
     }
@@ -145,6 +148,16 @@ impl WorldView {
         }
         let air = registry.block("minecraft:air").expect("air").default_state;
         Ok(Self { chunks, air })
+    }
+
+    /// The saved data of the block entity at a block, if it has one.
+    pub fn block_entity(&self, x: i32, y: i32, z: i32) -> Option<&mc_nbt::Compound> {
+        self.chunk(x, z)?.block_entities.get(&[x, y, z])
+    }
+
+    /// Every loaded block entity's saved data.
+    pub fn block_entities(&self) -> impl Iterator<Item = &mc_nbt::Compound> + '_ {
+        self.chunks.values().flat_map(|c| c.block_entities.values())
     }
 
     pub fn biome_names(&self) -> impl Iterator<Item = String> + '_ {
@@ -205,14 +218,16 @@ impl WorldView {
 pub struct Mesher<'a> {
     models: &'a BlockModels,
     biomes: &'a Biomes,
+    registry: &'a Registry,
     infos: Vec<StateInfo>,
 }
 
 impl<'a> Mesher<'a> {
-    pub fn new(models: &'a BlockModels, biomes: &'a Biomes, registry: &Registry) -> Self {
+    pub fn new(models: &'a BlockModels, biomes: &'a Biomes, registry: &'a Registry) -> Self {
         Self {
             models,
             biomes,
+            registry,
             infos: state_infos(registry),
         }
     }
@@ -275,6 +290,16 @@ impl<'a> Mesher<'a> {
             origin += Vec3::new(nudge(0), 0.0, nudge(8));
         }
 
+        if let Some(quads) = self.block_entity_quads(view, state, x, y, z) {
+            for (quad, color) in &quads {
+                self.emit_quad(view, mesh, quad, origin, [x, y, z], *color, false);
+            }
+            if let Some((fluid, level)) = info.fluid {
+                self.mesh_fluid(view, mesh, (fluid, level), [x, y, z]);
+            }
+            return;
+        }
+
         let mut random = JavaRandom::new(bake::position_seed(x, y, z));
         let part_seed = if model.parts.len() > 1 {
             Some(random.next_long())
@@ -317,6 +342,24 @@ impl<'a> Mesher<'a> {
         if let Some((fluid, level)) = info.fluid {
             self.mesh_fluid(view, mesh, (fluid, level), [x, y, z]);
         }
+    }
+
+    /// The block drawn from its block entity's data, when that data changes its look.
+    fn block_entity_quads(
+        &self,
+        view: &WorldView,
+        state: u32,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Option<Vec<(Quad, [f32; 3])>> {
+        if !self.infos[state as usize].data {
+            return None;
+        }
+        let data = view.block_entity(x, y, z)?;
+        let block = self.registry.block_of_state(state)?;
+        let values = block.property_values(state);
+        crate::entity_model::with_data(&block.name, &values, data, &self.models.atlas)
     }
 
     /// Vanilla's default biome blend: the average over the 5×5 columns around the block.

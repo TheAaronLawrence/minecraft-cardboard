@@ -122,7 +122,13 @@ pub const WATER_FLOW_SPRITE: &str = "minecraft:block/water_flow";
 pub const LAVA_FLOW_SPRITE: &str = "minecraft:block/lava_flow";
 
 impl BlockModels {
-    pub fn bake(res: &Resources, registry: &Registry) -> Result<Self> {
+    /// `extra_sprites` are images to add to the atlas under their ids, such as the skins of
+    /// the world's player heads (see `entity_model::skin_sprite`).
+    pub fn bake(
+        res: &Resources,
+        registry: &Registry,
+        extra_sprites: &[(String, image::RgbaImage)],
+    ) -> Result<Self> {
         // Load each block's blockstate file and every model it can pick.
         let mut files = Vec::new();
         let mut models: HashMap<String, Model> = HashMap::new();
@@ -152,8 +158,8 @@ impl BlockModels {
             files.push(file);
         }
         sprites.extend(crate::chest::SPRITES.iter().map(|s| s.to_string()));
-        sprites.extend(crate::entity_model::sprites());
-        let atlas = Atlas::build(res, sprites)?;
+        sprites.extend(crate::entity_model::sprites(res));
+        let atlas = Atlas::build(res, sprites, extra_sprites)?;
 
         let mut baked: HashMap<(String, i32, i32, bool), Arc<BakedModel>> = HashMap::new();
         let mut states = Vec::with_capacity(registry.state_count() as usize);

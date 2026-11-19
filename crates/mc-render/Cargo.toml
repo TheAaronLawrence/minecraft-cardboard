@@ -10,6 +10,7 @@ bytemuck = { version = "1", features = ["derive"] }
 glam = "0.34"
 image = { version = "0.25", default-features = false, features = ["png"] }
 mc-assets = { path = "../mc-assets" }
+mc-nbt = { path = "../mc-nbt" }
 mc-registry = { path = "../mc-registry" }
 mc-world = { path = "../mc-world" }
 pollster = "1"

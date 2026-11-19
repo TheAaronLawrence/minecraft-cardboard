@@ -8,6 +8,8 @@
 use crate::atlas::{Atlas, Sprite};
 use crate::bake::{self, BakedModel, Dir, Quad};
 use glam::{Mat3, Mat4, Quat, Vec3};
+use mc_assets::Resources;
+use mc_nbt::{Compound, Tag};
 use std::f32::consts::{FRAC_PI_2, PI};
 
 const COLORS: [&str; 16] = [
@@ -54,13 +56,55 @@ const SKULLS: [(&str, &str); 7] = [
     ("creeper", "minecraft:entity/creeper/creeper"),
     ("dragon", "minecraft:entity/enderdragon/dragon"),
     ("piglin", "minecraft:entity/piglin/piglin"),
-    // A head without a profile wears the default skin.
-    ("player", "minecraft:entity/player/wide/steve"),
+    // A head without a profile wears `DefaultPlayerSkin.getDefaultSkin`.
+    ("player", "minecraft:entity/player/slim/steve"),
 ];
 
+/// `DefaultPlayerSkin.DEFAULT_SKINS`, in order.
+const DEFAULT_SKINS: [&str; 18] = [
+    "minecraft:entity/player/slim/alex",
+    "minecraft:entity/player/slim/ari",
+    "minecraft:entity/player/slim/efe",
+    "minecraft:entity/player/slim/kai",
+    "minecraft:entity/player/slim/makena",
+    "minecraft:entity/player/slim/noor",
+    "minecraft:entity/player/slim/steve",
+    "minecraft:entity/player/slim/sunny",
+    "minecraft:entity/player/slim/zuri",
+    "minecraft:entity/player/wide/alex",
+    "minecraft:entity/player/wide/ari",
+    "minecraft:entity/player/wide/efe",
+    "minecraft:entity/player/wide/kai",
+    "minecraft:entity/player/wide/makena",
+    "minecraft:entity/player/wide/noor",
+    "minecraft:entity/player/wide/steve",
+    "minecraft:entity/player/wide/sunny",
+    "minecraft:entity/player/wide/zuri",
+];
+
+/// `DefaultPlayerSkin.get(UUID)`: `UUID.hashCode` picks one of the default skins.
+pub fn default_skin(id: u128) -> &'static str {
+    let hilo = (id >> 64) as u64 ^ id as u64;
+    let hash = (hilo >> 32) as i32 ^ hilo as i32;
+    DEFAULT_SKINS[hash.rem_euclid(DEFAULT_SKINS.len() as i32) as usize]
+}
+
 /// Every texture these models use, so the atlas loads them.
-pub fn sprites() -> Vec<String> {
-    let mut out = vec![BANNER_BASE.to_owned(), BANNER_FLAG.to_owned()];
+pub fn sprites(res: &Resources) -> Vec<String> {
+    // Every banner pattern and pottery pattern, which block entity data can name.
+    let mut out: Vec<String> = ["minecraft:entity/banner", "minecraft:entity/decorated_pot"]
+        .iter()
+        .flat_map(|dir| {
+            let path = res.asset_path("textures", &format!("{dir}/x"), "png");
+            let files = path.parent().and_then(|d| std::fs::read_dir(d).ok());
+            files
+                .into_iter()
+                .flatten()
+                .filter_map(|f| f.ok()?.file_name().into_string().ok())
+                .filter_map(move |f| Some(format!("{dir}/{}", f.strip_suffix(".png")?)))
+        })
+        .collect();
+    out.extend([BANNER_BASE.to_owned(), BANNER_FLAG.to_owned()]);
     out.push("minecraft:entity/shulker/shulker".to_owned());
     out.extend(
         COLORS
@@ -69,6 +113,7 @@ pub fn sprites() -> Vec<String> {
     );
     out.extend(SKULLS.iter().map(|(_, s)| s.to_string()));
     out.extend([POT_BASE, POT_SIDE, CONDUIT, PORTAL].map(str::to_owned));
+    out.extend(DEFAULT_SKINS.map(str::to_owned));
     out.extend(
         ["", "_exposed", "_weathered", "_oxidized"]
             .map(|age| format!("minecraft:entity/copper_golem/copper_golem{age}")),
@@ -78,9 +123,14 @@ pub fn sprites() -> Vec<String> {
 
 /// The dye colour a banner's flag is tinted with, from its block name.
 pub fn banner_color(name: &str) -> Option<[f32; 3]> {
-    let color = name
-        .strip_suffix("_wall_banner")
-        .or_else(|| name.strip_suffix("_banner"))?;
+    dye_rgb(
+        name.strip_suffix("_wall_banner")
+            .or_else(|| name.strip_suffix("_banner"))?,
+    )
+}
+
+/// A dye's texture diffuse colour, by name, such as `light_blue`.
+fn dye_rgb(color: &str) -> Option<[f32; 3]> {
     let i = COLORS.iter().position(|c| *c == color)?;
     let c = DYE_RGB[i];
     Some([16, 8, 0].map(|s| (c >> s & 0xFF) as f32 / 255.0))
@@ -247,15 +297,8 @@ impl Builder {
 pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<BakedModel> {
     let name = block.strip_prefix("minecraft:").unwrap_or(block);
     let value = |p: &str| values.iter().find(|(n, _)| *n == p).map(|(_, v)| *v);
-    // `RotationSegment.convertToDegrees` for ground blocks, `Direction.toYRot` for walls.
-    let segment = || {
-        value("rotation")
-            .and_then(|r| r.parse::<f32>().ok())
-            .unwrap_or(0.0)
-            * 22.5
-    };
     let quads = if name == "decorated_pot" {
-        decorated_pot(atlas, value("facing")?)
+        decorated_pot(atlas, value("facing")?, [POT_SIDE; 4])
     } else if name == "conduit" {
         // Inactive: just the shell, as without its block entity it can't be active.
         let mut b = Builder {
@@ -300,12 +343,7 @@ pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Bake
         b.nodes(root, nodes);
         b.quads
     } else if banner_color(name).is_some() {
-        let wall = name.ends_with("_wall_banner");
-        let deg = if wall {
-            y_rot(value("facing")?)
-        } else {
-            segment()
-        };
+        let (wall, deg) = banner_pose(name, values)?;
         banner(atlas, wall, deg)
     } else if let Some(color) = name.strip_suffix("shulker_box") {
         let color = color.strip_suffix('_');
@@ -315,21 +353,12 @@ pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Bake
         };
         shulker(atlas.sprite(&sprite), value("facing").unwrap_or("up"))
     } else {
-        let (kind, wall) = skull_kind(name)?;
-        let sprite = atlas.sprite(SKULLS.iter().find(|(k, _)| *k == kind)?.1);
-        let root = if wall {
-            let facing = value("facing")?;
-            let [sx, _, sz] = dir_step(facing);
-            Mat4::from_translation(Vec3::new(
-                0.5 - 0.25 * sx as f32,
-                0.25,
-                0.5 - 0.25 * sz as f32,
-            )) * Mat4::from_rotation_y(-y_rot(opposite(facing)).to_radians())
-        } else {
-            Mat4::from_translation(Vec3::new(0.5, 0.0, 0.5))
-                * Mat4::from_rotation_y(-segment().to_radians())
-        } * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
-        skull(sprite, kind, root)
+        let (kind, _) = skull_kind(name)?;
+        skull(
+            atlas.sprite(SKULLS.iter().find(|(k, _)| *k == kind)?.1),
+            kind,
+            skull_root(name, values)?,
+        )
     };
     // Block entities are lit flat, without ambient occlusion.
     Some(BakedModel {
@@ -338,10 +367,48 @@ pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Bake
     })
 }
 
-fn banner(atlas: &Atlas, wall: bool, deg: f32) -> Vec<Quad> {
-    let root = Mat4::from_translation(Vec3::new(0.5, 0.0, 0.5))
+/// `RotationSegment.convertToDegrees` of a ground block's `rotation`.
+fn segment_degrees(values: &[(&str, &str)]) -> f32 {
+    let rotation = values.iter().find(|(n, _)| *n == "rotation");
+    rotation
+        .and_then(|(_, r)| r.parse::<f32>().ok())
+        .unwrap_or(0.0)
+        * 22.5
+}
+
+/// Whether a banner hangs on a wall, and how far it's turned: `Direction.toYRot` of a wall
+/// banner's facing, or a ground banner's rotation segment.
+fn banner_pose(name: &str, values: &[(&str, &str)]) -> Option<(bool, f32)> {
+    let wall = name.ends_with("_wall_banner");
+    let deg = if wall {
+        y_rot(values.iter().find(|(n, _)| *n == "facing")?.1)
+    } else {
+        segment_degrees(values)
+    };
+    Some((wall, deg))
+}
+
+fn banner_root(deg: f32) -> Mat4 {
+    Mat4::from_translation(Vec3::new(0.5, 0.0, 0.5))
         * Mat4::from_rotation_y(-deg.to_radians())
-        * Mat4::from_scale(Vec3::new(2.0 / 3.0, -2.0 / 3.0, -2.0 / 3.0));
+        * Mat4::from_scale(Vec3::new(2.0 / 3.0, -2.0 / 3.0, -2.0 / 3.0))
+}
+
+/// `BannerFlagModel`: the flag's pose and box, which every pattern layer is drawn on.
+fn banner_flag(wall: bool) -> (Mat4, Cube) {
+    let offset = if wall {
+        [0.0, -20.5, 10.5]
+    } else {
+        [0.0, -44.0, 0.0]
+    };
+    (
+        pose(offset, [0.0; 3]),
+        cube([-10.0, 0.0, -2.0], [20.0, 40.0, 1.0], [0.0, 0.0]),
+    )
+}
+
+fn banner(atlas: &Atlas, wall: bool, deg: f32) -> Vec<Quad> {
+    let root = banner_root(deg);
     let mut b = Builder {
         quads: Vec::new(),
         sprite: atlas.sprite(BANNER_BASE),
@@ -367,19 +434,14 @@ fn banner(atlas: &Atlas, wall: bool, deg: f32) -> Vec<Quad> {
         tex_size: [64.0, 64.0],
         tint: 0,
     };
-    let offset = if wall {
-        [0.0, -20.5, 10.5]
-    } else {
-        [0.0, -44.0, 0.0]
-    };
-    flag.cube(
-        root * pose(offset, [0.0; 3]),
-        &cube([-10.0, 0.0, -2.0], [20.0, 40.0, 1.0], [0.0, 0.0]),
-    );
+    let (flag_pose, flag_cube) = banner_flag(wall);
+    flag.cube(root * flag_pose, &flag_cube);
     flag.quads
 }
 
-fn decorated_pot(atlas: &Atlas, facing: &str) -> Vec<Quad> {
+/// `sides` are the side sprites, in the order the block entity lists its sherds: back, left,
+/// right, front.
+fn decorated_pot(atlas: &Atlas, facing: &str, sides: [&str; 4]) -> Vec<Quad> {
     let center = Vec3::new(0.5, 0.5, 0.5);
     let root = Mat4::from_translation(center)
         * Mat4::from_rotation_y((180.0 - y_rot(facing)).to_radians())
@@ -391,15 +453,18 @@ fn decorated_pot(atlas: &Atlas, facing: &str) -> Vec<Quad> {
         tint: -1,
     };
     b.nodes(root, POT);
-    // Each side is one face, which a pottery sherd would retexture; plain sides here.
-    let mut sides = Builder {
-        quads: b.quads,
-        sprite: atlas.sprite(POT_SIDE),
-        tex_size: [16.0, 16.0],
-        tint: -1,
-    };
-    sides.nodes(root, POT_SIDES);
-    sides.quads
+    let mut quads = b.quads;
+    for (node, sprite) in POT_SIDES.iter().zip(sides) {
+        let mut side = Builder {
+            quads,
+            sprite: atlas.sprite(sprite),
+            tex_size: [16.0, 16.0],
+            tint: -1,
+        };
+        side.nodes(root, std::slice::from_ref(node));
+        quads = side.quads;
+    }
+    quads
 }
 
 const POT_LID: Cube = cube([0.0, 0.0, 0.0], [14.0, 0.0, 14.0], [-14.0, 13.0]);
@@ -536,6 +601,203 @@ fn skull_kind(name: &str) -> Option<(&'static str, bool)> {
     };
     let kind = SKULLS.iter().find(|(k, _)| *k == base)?.0;
     Some((kind, wall))
+}
+
+/// `SkullBlockRenderer`'s transform: ground heads turned by their rotation segment, wall
+/// heads pushed against the wall behind them.
+fn skull_root(name: &str, values: &[(&str, &str)]) -> Option<Mat4> {
+    let (_, wall) = skull_kind(name)?;
+    let root = if wall {
+        let facing = values.iter().find(|(n, _)| *n == "facing")?.1;
+        let [sx, _, sz] = dir_step(facing);
+        Mat4::from_translation(Vec3::new(
+            0.5 - 0.25 * sx as f32,
+            0.25,
+            0.5 - 0.25 * sz as f32,
+        )) * Mat4::from_rotation_y(-y_rot(opposite(facing)).to_radians())
+    } else {
+        Mat4::from_translation(Vec3::new(0.5, 0.0, 0.5))
+            * Mat4::from_rotation_y(-segment_degrees(values).to_radians())
+    };
+    Some(root * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0)))
+}
+
+/// Whether a block entity's data can change how the block looks, so the mesher should
+/// look it up.
+pub fn uses_data(block: &str) -> bool {
+    let name = block.strip_prefix("minecraft:").unwrap_or(block);
+    banner_color(name).is_some()
+        || name == "decorated_pot"
+        || name == "player_head"
+        || name == "player_wall_head"
+}
+
+/// Quads for a block whose block entity data changes how it looks: a banner's patterns, a
+/// decorated pot's sherds, or a player head's skin, each quad with its colour. `None` when
+/// the data changes nothing, so the block's baked model stands.
+pub fn with_data(
+    block: &str,
+    values: &[(&str, &str)],
+    data: &Compound,
+    atlas: &Atlas,
+) -> Option<Vec<(Quad, [f32; 3])>> {
+    let name = block.strip_prefix("minecraft:").unwrap_or(block);
+    let white = [1.0; 3];
+    let plain = |quads: Vec<Quad>| quads.into_iter().map(|q| (q, white)).collect();
+    if let Some(base) = banner_color(name) {
+        // `BannerRenderer`: the base colour, then each pattern layer in order over it.
+        let patterns = data.get("patterns")?.as_list()?;
+        if patterns.is_empty() {
+            return None;
+        }
+        let (wall, deg) = banner_pose(name, values)?;
+        let mut out: Vec<(Quad, [f32; 3])> = banner(atlas, wall, deg)
+            .into_iter()
+            .map(|q| {
+                let color = if q.tint >= 0 { base } else { white };
+                (q, color)
+            })
+            .collect();
+        let (flag_pose, flag_cube) = banner_flag(wall);
+        for (i, layer) in patterns.iter().filter_map(Tag::as_compound).enumerate() {
+            // A pattern is a registry id, or written out inline with its asset id.
+            let asset = match layer.get("pattern") {
+                Some(Tag::String(id)) => id.as_str(),
+                Some(Tag::Compound(p)) => p.get("asset_id").and_then(Tag::as_str)?,
+                _ => continue,
+            };
+            let (namespace, path) = asset.split_once(':').unwrap_or(("minecraft", asset));
+            let color = layer
+                .get("color")
+                .and_then(Tag::as_str)
+                .and_then(dye_rgb)
+                .unwrap_or(white);
+            let mut b = Builder {
+                quads: Vec::new(),
+                sprite: atlas.sprite(&format!("{namespace}:entity/banner/{path}")),
+                tex_size: [64.0, 64.0],
+                tint: -1,
+            };
+            // Vanilla draws the layers on the same box in order; each one here sits a
+            // hair outside the last so the depth test keeps them in that order.
+            let layered = Cube {
+                grow: 0.02 * (i + 1) as f32,
+                ..flag_cube
+            };
+            b.cube(banner_root(deg) * flag_pose, &layered);
+            out.extend(b.quads.into_iter().map(|q| (q, color)));
+        }
+        Some(out)
+    } else if name == "decorated_pot" {
+        // `PotDecorations`: an item per side, as a bare id or an item stack `{id: ...}`.
+        let sherds = data.get("sherds")?.as_compound()?;
+        // `DecoratedPotPatterns.getPatternFromItem`: each sherd item has its pattern; a
+        // brick (or anything else) leaves the side plain.
+        let sprites: Vec<String> = ["back", "left", "right", "front"]
+            .iter()
+            .map(|side| {
+                let item = match sherds.get(*side) {
+                    Some(Tag::String(id)) => id.as_str(),
+                    Some(Tag::Compound(stack)) => {
+                        stack.get("id").and_then(Tag::as_str).unwrap_or_default()
+                    }
+                    _ => "",
+                };
+                let (namespace, path) = item.split_once(':').unwrap_or(("minecraft", item));
+                path.strip_suffix("_pottery_sherd")
+                    .map(|p| format!("{namespace}:entity/decorated_pot/{p}_pottery_pattern"))
+                    .filter(|s| atlas.contains(s))
+                    .unwrap_or_else(|| POT_SIDE.to_owned())
+            })
+            .collect();
+        if sprites.iter().all(|s| s == POT_SIDE) {
+            return None;
+        }
+        let sides = [0, 1, 2, 3].map(|i| sprites[i].as_str());
+        Some(plain(decorated_pot(
+            atlas,
+            values.iter().find(|(n, _)| *n == "facing")?.1,
+            sides,
+        )))
+    } else {
+        // The downloaded skin, if the client fetched one; otherwise the default skin for
+        // the profile's UUID, which an unresolved name-only profile has as nil (0).
+        let profile = Profile::from_tag(data.get("profile")?)?;
+        let sprite = skin_sprite(&profile);
+        let sprite = if atlas.contains(&sprite) {
+            sprite
+        } else {
+            default_skin(profile.id.unwrap_or(0)).to_owned()
+        };
+        Some(plain(skull(
+            atlas.sprite(&sprite),
+            "player",
+            skull_root(name, values)?,
+        )))
+    }
+}
+
+/// A player head's `profile`: a name, or a compound with any of a name, a UUID, and the
+/// signed `textures` property that says where the skin is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Profile {
+    pub name: Option<String>,
+    pub id: Option<u128>,
+    /// Base64 JSON with `textures.SKIN.url`.
+    pub textures: Option<String>,
+}
+
+impl Profile {
+    pub fn from_tag(tag: &Tag) -> Option<Self> {
+        if let Some(name) = tag.as_str() {
+            return Some(Self {
+                name: Some(name.to_owned()),
+                id: None,
+                textures: None,
+            });
+        }
+        let c = tag.as_compound()?;
+        let id = match c.get("id") {
+            Some(Tag::IntArray(v)) if v.len() == 4 => Some(
+                v.iter()
+                    .fold(0u128, |acc, &part| acc << 32 | part as u32 as u128),
+            ),
+            _ => None,
+        };
+        let textures = c
+            .get("properties")
+            .and_then(Tag::as_list)
+            .into_iter()
+            .flatten()
+            .filter_map(Tag::as_compound)
+            .find(|p| p.get("name").and_then(Tag::as_str) == Some("textures"))
+            .and_then(|p| p.get("value").and_then(Tag::as_str))
+            .map(str::to_owned);
+        let name = c.get("name").and_then(Tag::as_str).map(str::to_owned);
+        (name.is_some() || id.is_some() || textures.is_some()).then_some(Self {
+            name,
+            id,
+            textures,
+        })
+    }
+}
+
+/// The atlas id a profile's skin is added under, from its UUID or else its name.
+pub fn skin_sprite(profile: &Profile) -> String {
+    match (&profile.id, &profile.name) {
+        (Some(id), _) => format!("cardboard:skin/{id:032x}"),
+        (None, Some(name)) => format!("cardboard:skin/name_{}", name.to_lowercase()),
+        (None, None) => format!(
+            "cardboard:skin/textures_{:016x}",
+            profile.textures.as_deref().map_or(0, fnv1a)
+        ),
+    }
+}
+
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn skull(sprite: Sprite, kind: &str, root: Mat4) -> Vec<Quad> {
@@ -1134,3 +1396,24 @@ const GOLEM_STAR: &[Node] = &[
         }],
     }, // left_leg_r1
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::default_skin;
+
+    /// Java's `UUID.hashCode` folds the halves to a signed int and `floorMod` keeps a
+    /// negative hash in range; the expected skins are worked out by hand from those rules.
+    #[test]
+    fn default_skin_follows_java_uuid_hash() {
+        // Halves 0x00000001_00000002 and 0x00000003_00000004: hash 2 ^ 6 = 4.
+        assert_eq!(
+            default_skin(0x00000001_00000002_00000003_00000004),
+            "minecraft:entity/player/slim/makena"
+        );
+        // Hash 0x80000004 is -2147483644, which floorMod 18 makes 2 (a plain % gives -16).
+        assert_eq!(
+            default_skin(0x00000001_00000002_00000003_80000004),
+            "minecraft:entity/player/slim/efe"
+        );
+    }
+}
