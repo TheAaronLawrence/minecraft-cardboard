@@ -13,8 +13,9 @@ use glam::Vec3;
 use mc_render::bake::BlockModels;
 
 mod skins;
+mod stream;
 use mc_render::gpu::{Camera, Renderer, View};
-use mc_render::mesh::{Mesh, Mesher, WorldView};
+use mc_render::mesh::{Mesher, WorldView};
 use mc_render::tint::Biomes;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,10 +82,14 @@ fn parse_args() -> Result<Args> {
     Ok(args)
 }
 
-/// Everything the renderer needs, built from the resources and the save.
+/// Everything the renderer needs, built from the resources and the save, with the chunks
+/// around the start position already loaded.
 struct Scene {
-    models: BlockModels,
-    mesh: Mesh,
+    models: Arc<BlockModels>,
+    biomes: Arc<Biomes>,
+    registry: Arc<mc_registry::Registry>,
+    world: mc_world::World,
+    view: WorldView,
 }
 
 fn load_scene(args: &Args) -> Result<Scene> {
@@ -107,32 +112,37 @@ fn load_scene(args: &Args) -> Result<Scene> {
         eye.z.floor() as i32,
         args.distance + 1,
     )?;
-    // Player heads' skins go in the atlas, so they're fetched before baking.
+    // Player heads' skins go in the atlas, so they're fetched before baking. Heads streamed
+    // in later wear the default skin for their UUID.
     let skins = skins::fetch(
         view.block_entities()
             .filter_map(|e| mc_render::entity_model::Profile::from_tag(e.get("profile")?)),
     );
     let started = Instant::now();
     let models = BlockModels::bake(&res, &registry, &skins)?;
-    let baked = started.elapsed();
-    let biomes = Biomes::load(
-        &res,
-        view.biome_names()
-            .collect::<std::collections::BTreeSet<_>>(),
-    )?;
-    let mut mesh = Mesher::new(&models, &biomes, &registry).mesh_world(&view);
-    mesh.sort_translucent(eye);
+    // Every biome, since chunks streamed in later can be in any of them.
+    let biome_file = res.data_path("worldgen/biome", "minecraft:plains", "json");
+    let biome_dir = biome_file.parent().context("no biome folder")?;
+    let names: Vec<String> = std::fs::read_dir(biome_dir)
+        .with_context(|| format!("{}", biome_dir.display()))?
+        .filter_map(|e| {
+            let file = e.ok()?.file_name().into_string().ok()?;
+            Some(format!("minecraft:{}", file.strip_suffix(".json")?))
+        })
+        .collect();
+    let biomes = Biomes::load(&res, names)?;
     eprintln!(
-        "baked {} states in {:.1?}; meshed {} quads ({} opaque, {} cutout, {} translucent) in {:.1?}",
+        "baked {} states in {:.1?}",
         models.states.len(),
-        baked,
-        (mesh.opaque.len() + mesh.cutout.len() + mesh.translucent.len()) / 4,
-        mesh.opaque.len() / 4,
-        mesh.cutout.len() / 4,
-        mesh.translucent.len() / 4,
-        started.elapsed() - baked
+        started.elapsed()
     );
-    Ok(Scene { models, mesh })
+    Ok(Scene {
+        models: Arc::new(models),
+        biomes: Arc::new(biomes),
+        registry: Arc::new(registry),
+        world,
+        view,
+    })
 }
 
 fn main() -> std::process::ExitCode {
@@ -179,7 +189,22 @@ fn run() -> Result<()> {
     match &args.screenshot {
         Some(path) => {
             let mut renderer = Renderer::headless(&scene.models)?;
-            renderer.upload(&scene.mesh);
+            let started = Instant::now();
+            let mesher = Mesher::new(&scene.models, &scene.biomes, &scene.registry);
+            let (ex, ez) = stream::chunk_of(args.camera.eye);
+            let mut quads = 0;
+            let keys: Vec<_> = scene.view.chunk_positions().collect();
+            for (cx, cz) in keys {
+                if (cx - ex).abs().max((cz - ez).abs()) > args.distance {
+                    continue;
+                }
+                if let Some(mut mesh) = mesher.mesh_chunk(&scene.view, cx, cz) {
+                    mesh.sort_translucent(args.camera.eye);
+                    quads += mesh.quads();
+                    renderer.upload_chunk((cx, cz), &mesh);
+                }
+            }
+            eprintln!("meshed {quads} quads in {:.1?}", started.elapsed());
             let image = renderer.screenshot(args.size.0, args.size.1, &args.camera, &view)?;
             image
                 .save(path)
@@ -189,9 +214,22 @@ fn run() -> Result<()> {
         }
         None => {
             let event_loop = winit::event_loop::EventLoop::new()?;
+            let models = scene.models.clone();
+            let streamer = stream::Streamer::spawn(
+                stream::Sources {
+                    world: scene.world,
+                    view: scene.view,
+                    models: scene.models,
+                    biomes: scene.biomes,
+                    registry: scene.registry,
+                },
+                args.distance,
+                args.camera.eye,
+            );
             let mut app = App {
                 args,
-                scene,
+                models,
+                streamer,
                 view,
                 state: None,
                 keys: Default::default(),
@@ -213,7 +251,8 @@ struct WindowState {
 
 struct App {
     args: Args,
-    scene: Scene,
+    models: Arc<BlockModels>,
+    streamer: stream::Streamer,
     view: View,
     state: Option<WindowState>,
     keys: std::collections::HashSet<winit::keyboard::KeyCode>,
@@ -259,8 +298,7 @@ impl App {
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
-        let mut renderer = Renderer::new(device, queue, format, &self.scene.models);
-        renderer.upload(&self.scene.mesh);
+        let renderer = Renderer::new(device, queue, format, &self.models);
         self.state = Some(WindowState {
             window,
             surface,
@@ -365,6 +403,14 @@ impl winit::application::ApplicationHandler for App {
                 // 20 game ticks a second.
                 self.view.ticks += dt * 20.0;
                 let Some(state) = &mut self.state else { return };
+                self.streamer.follow(self.args.camera.eye);
+                for update in self.streamer.updates() {
+                    match update {
+                        stream::Update::Mesh(key, mesh) => state.renderer.upload_chunk(key, &mesh),
+                        stream::Update::Remove(key) => state.renderer.remove_chunk(key),
+                        stream::Update::Idle => {}
+                    }
+                }
                 let frame = match state.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,

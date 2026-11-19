@@ -69,6 +69,9 @@ fn color(c: u32) -> [f32; 4] {
     ]
 }
 
+/// A chunk's vertex buffer and index count per layer, if it has any quads in it.
+type ChunkBuffers = [Option<(wgpu::Buffer, u32)>; 4];
+
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -80,9 +83,10 @@ pub struct Renderer {
     bind_group: wgpu::BindGroup,
     portal_bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
-    indices: Option<wgpu::Buffer>,
-    /// Opaque, cutout, translucent and portal vertices, with their index counts.
-    layers: [Option<(wgpu::Buffer, u32)>; 4],
+    /// Six indices per quad, enough for the largest chunk's largest layer.
+    indices: Option<(wgpu::Buffer, u32)>,
+    /// Each chunk's opaque, cutout, translucent and portal vertices, with index counts.
+    chunks: std::collections::HashMap<(i32, i32), ChunkBuffers>,
     depth: Option<(wgpu::TextureView, u32, u32)>,
 }
 
@@ -363,28 +367,32 @@ impl Renderer {
             portal_bind_group,
             uniforms,
             indices: None,
-            layers: [None, None, None, None],
+            chunks: Default::default(),
             depth: None,
         }
     }
 
-    /// Replaces what's drawn with `mesh`.
-    pub fn upload(&mut self, mesh: &Mesh) {
+    /// Draws `mesh` for the chunk at `key` (chunk x, z), replacing what it drew before.
+    pub fn upload_chunk(&mut self, key: (i32, i32), mesh: &Mesh) {
         let lists = [&mesh.opaque, &mesh.cutout, &mesh.translucent, &mesh.portal];
-        let quads = lists.iter().map(|l| l.len() / 4).max().unwrap_or(0);
-        let indices: Vec<u32> = (0..quads as u32)
-            .flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q * 4 + i))
-            .collect();
-        self.indices = Some(
-            self.device
+        let quads = lists.iter().map(|l| l.len() / 4).max().unwrap_or(0) as u32;
+        if self.indices.as_ref().is_none_or(|(_, n)| *n < quads) {
+            // Grow to the next power of two, so a stream of chunks rarely regrows it.
+            let n = quads.next_power_of_two();
+            let indices: Vec<u32> = (0..n)
+                .flat_map(|q| [0, 1, 2, 0, 2, 3].map(|i| q * 4 + i))
+                .collect();
+            let buffer = self
+                .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("indices"),
                     contents: bytemuck::cast_slice(&indices),
                     usage: wgpu::BufferUsages::INDEX,
-                }),
-        );
-        for (slot, vertices) in self.layers.iter_mut().zip(lists) {
-            *slot = (!vertices.is_empty()).then(|| {
+                });
+            self.indices = Some((buffer, n));
+        }
+        let buffers = lists.map(|vertices| {
+            (!vertices.is_empty()).then(|| {
                 let buffer = self
                     .device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -393,8 +401,17 @@ impl Renderer {
                         usage: wgpu::BufferUsages::VERTEX,
                     });
                 (buffer, (vertices.len() / 4 * 6) as u32)
-            });
-        }
+            })
+        });
+        self.chunks.insert(key, buffers);
+    }
+
+    pub fn remove_chunk(&mut self, key: (i32, i32)) {
+        self.chunks.remove(&key);
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
     }
 
     /// Draws a frame into `target`, which is `width` × `height`.
@@ -470,8 +487,15 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_pipeline(&self.sky);
             pass.draw(0..3, 0..1);
-            if let Some(indices) = &self.indices {
+            if let Some((indices, _)) = &self.indices {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                // Translucent chunks blend over what's behind them, so far ones go first.
+                let mut keys: Vec<(i32, i32)> = self.chunks.keys().copied().collect();
+                let distance = |&(cx, cz): &(i32, i32)| {
+                    let center = Vec3::new(cx as f32 * 16.0 + 8.0, 0.0, cz as f32 * 16.0 + 8.0);
+                    (center - camera.eye * Vec3::new(1.0, 0.0, 1.0)).length_squared()
+                };
+                keys.sort_by(|a, b| distance(b).total_cmp(&distance(a)));
                 // Portals are opaque, so they draw before the translucent layer.
                 let order = [
                     (&self.opaque, 0),
@@ -481,10 +505,12 @@ impl Renderer {
                 ];
                 pass.set_bind_group(1, &self.portal_bind_group, &[]);
                 for (pipeline, slot) in order {
-                    if let Some((buffer, count)) = &self.layers[slot] {
-                        pass.set_pipeline(pipeline);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
-                        pass.draw_indexed(0..*count, 0, 0..1);
+                    pass.set_pipeline(pipeline);
+                    for key in &keys {
+                        if let Some((buffer, count)) = &self.chunks[key][slot] {
+                            pass.set_vertex_buffer(0, buffer.slice(..));
+                            pass.draw_indexed(0..*count, 0, 0..1);
+                        }
                     }
                 }
             }

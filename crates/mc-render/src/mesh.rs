@@ -35,6 +35,17 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    pub fn quads(&self) -> usize {
+        (self.opaque.len() + self.cutout.len() + self.translucent.len() + self.portal.len()) / 4
+    }
+
+    fn append(&mut self, other: Mesh) {
+        self.opaque.extend(other.opaque);
+        self.cutout.extend(other.cutout);
+        self.translucent.extend(other.translucent);
+        self.portal.extend(other.portal);
+    }
+
     fn layer(&mut self, layer: Layer) -> &mut Vec<Vertex> {
         match layer {
             Layer::Opaque => &mut self.opaque,
@@ -142,16 +153,41 @@ impl WorldView {
         radius: i32,
     ) -> anyhow::Result<Self> {
         let (ccx, ccz) = (center_x.div_euclid(16), center_z.div_euclid(16));
-        let mut chunks = HashMap::new();
+        let mut view = Self::empty(registry);
         for cx in ccx - radius..=ccx + radius {
             for cz in ccz - radius..=ccz + radius {
                 if let Some(chunk) = world.chunk(registry, cx, cz)? {
-                    chunks.insert((cx, cz), chunk);
+                    view.insert(chunk);
                 }
             }
         }
+        Ok(view)
+    }
+
+    /// No chunks yet; add them with `insert` as they load.
+    pub fn empty(registry: &Registry) -> Self {
         let air = registry.block("minecraft:air").expect("air").default_state;
-        Ok(Self { chunks, air })
+        Self {
+            chunks: HashMap::new(),
+            air,
+        }
+    }
+
+    pub fn insert(&mut self, chunk: Chunk) {
+        self.chunks.insert((chunk.x, chunk.z), chunk);
+    }
+
+    pub fn remove(&mut self, cx: i32, cz: i32) {
+        self.chunks.remove(&(cx, cz));
+    }
+
+    pub fn contains(&self, cx: i32, cz: i32) -> bool {
+        self.chunks.contains_key(&(cx, cz))
+    }
+
+    /// The loaded chunks' positions, in chunk coordinates.
+    pub fn chunk_positions(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
+        self.chunks.keys().copied()
     }
 
     /// The saved data of the block entity at a block, if it has one.
@@ -240,37 +276,47 @@ impl<'a> Mesher<'a> {
     /// edge of the loaded area is drawn against missing terrain.
     pub fn mesh_world(&self, view: &WorldView) -> Mesh {
         let mut mesh = Mesh::default();
-        for (&(cx, cz), chunk) in &view.chunks {
-            if ![(1, 0), (-1, 0), (0, 1), (0, -1)]
-                .iter()
-                .all(|(dx, dz)| view.chunks.contains_key(&(cx + dx, cz + dz)))
+        for &(cx, cz) in view.chunks.keys() {
+            if let Some(chunk) = self.mesh_chunk(view, cx, cz) {
+                mesh.append(chunk);
+            }
+        }
+        mesh
+    }
+
+    /// One chunk's mesh, or `None` when it or one of its four neighbours isn't loaded.
+    pub fn mesh_chunk(&self, view: &WorldView, cx: i32, cz: i32) -> Option<Mesh> {
+        let chunk = view.chunks.get(&(cx, cz))?;
+        if ![(1, 0), (-1, 0), (0, 1), (0, -1)]
+            .iter()
+            .all(|(dx, dz)| view.contains(cx + dx, cz + dz))
+        {
+            return None;
+        }
+        let mut mesh = Mesh::default();
+        for section in &chunk.sections {
+            if matches!(section.blocks, mc_world::Blocks::Uniform(s) if self.infos[s as usize].air)
             {
                 continue;
             }
-            for section in &chunk.sections {
-                if matches!(section.blocks, mc_world::Blocks::Uniform(s) if self.infos[s as usize].air)
-                {
-                    continue;
-                }
-                for ly in 0..16 {
-                    for lz in 0..16 {
-                        for lx in 0..16 {
-                            let state = section.block(lx, ly, lz);
-                            if self.infos[state as usize].air {
-                                continue;
-                            }
-                            let (x, y, z) = (
-                                cx * 16 + lx as i32,
-                                section.y * 16 + ly as i32,
-                                cz * 16 + lz as i32,
-                            );
-                            self.mesh_block(view, &mut mesh, state, x, y, z);
+            for ly in 0..16 {
+                for lz in 0..16 {
+                    for lx in 0..16 {
+                        let state = section.block(lx, ly, lz);
+                        if self.infos[state as usize].air {
+                            continue;
                         }
+                        let (x, y, z) = (
+                            cx * 16 + lx as i32,
+                            section.y * 16 + ly as i32,
+                            cz * 16 + lz as i32,
+                        );
+                        self.mesh_block(view, &mut mesh, state, x, y, z);
                     }
                 }
             }
         }
-        mesh
+        Some(mesh)
     }
 
     fn occludes(&self, state: u32) -> bool {
