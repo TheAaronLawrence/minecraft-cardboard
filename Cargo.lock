@@ -1087,6 +1087,7 @@ dependencies = [
  "glam",
  "image",
  "mc-assets",
+ "mc-physics",
  "mc-protocol",
  "mc-registry",
  "mc-render",
@@ -1104,6 +1105,17 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "indexmap",
+]
+
+[[package]]
+name = "mc-physics"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "glam",
+ "mc-assets",
+ "mc-registry",
+ "serde_json",
 ]
 
 [[package]]

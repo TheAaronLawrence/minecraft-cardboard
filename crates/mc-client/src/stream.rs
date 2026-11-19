@@ -24,6 +24,10 @@ pub enum Update {
     Teleport(Vec3, f32, f32),
     /// The server connection ended, for this reason.
     Disconnected(String),
+    /// A server chunk's blocks by section y, for collision; `None` when it's dropped.
+    Collision((i32, i32), Option<Vec<(i32, mc_world::Blocks)>>),
+    /// Another server event for the game: the login, or the player's abilities.
+    Server(mc_protocol::Event),
 }
 
 /// Where chunks come from.
@@ -243,13 +247,22 @@ fn receive(
     use mc_protocol::Event;
     let update = match event {
         Event::Chunk(chunk) => {
+            let blocks = chunk
+                .sections
+                .iter()
+                .map(|s| (s.y, s.blocks.clone()))
+                .collect();
             // A chunk sent again replaces the old one and is meshed afresh.
             meshed.remove(&(chunk.x, chunk.z));
+            let key = (chunk.x, chunk.z);
             view.insert(chunk);
-            return true;
+            return tx.send(Update::Collision(key, Some(blocks))).is_ok();
         }
         Event::Forget(x, z) => {
             view.remove(x, z);
+            if tx.send(Update::Collision((x, z), None)).is_err() {
+                return false;
+            }
             if !meshed.remove(&(x, z)) {
                 return true;
             }
@@ -261,6 +274,7 @@ fn receive(
             Update::Teleport(Vec3::new(x, y + 1.62, z), yaw, pitch)
         }
         Event::Disconnected(reason) => Update::Disconnected(reason),
+        other => Update::Server(other),
     };
     tx.send(update).is_ok()
 }
@@ -286,7 +300,7 @@ mod tests {
                     assert!(drawn.remove(&key), "removed {key:?}, which wasn't drawn");
                 }
                 Update::Idle => return,
-                Update::Teleport(..) | Update::Disconnected(_) => {}
+                _ => {}
             }
         }
     }

@@ -20,6 +20,16 @@ use std::sync::mpsc::{Receiver, Sender};
 
 /// What the server tells the game, in the order it arrives.
 pub enum Event {
+    /// The player has joined the world as this entity.
+    Login {
+        entity_id: i32,
+    },
+    /// What the player may do: fly (creative), and whether it is flying, at what speed.
+    Abilities {
+        flying: bool,
+        may_fly: bool,
+        flying_speed: f32,
+    },
     /// The server placed the player: feet position, yaw and pitch.
     Position {
         pos: [f64; 3],
@@ -34,9 +44,29 @@ pub enum Event {
 }
 
 /// A connection in the play state. Events arrive on `events` from a background thread,
-/// which also answers keep-alives, pings, teleports and chunk batches.
+/// which also answers keep-alives, pings, teleports and chunk batches; `outbox` sends the
+/// game's own packets.
 pub struct Session {
     pub events: Receiver<Event>,
+    pub outbox: Outbox,
+}
+
+/// Sends play-state packets by name, from any thread.
+#[derive(Clone)]
+pub struct Outbox {
+    writer: connection::Writer,
+    ids: Arc<HashMap<String, i32>>,
+}
+
+impl Outbox {
+    /// `name` without its namespace, such as `move_player_pos`.
+    pub fn send(&self, name: &str, body: &[u8]) -> Result<()> {
+        let id = self
+            .ids
+            .get(&format!("minecraft:{name}"))
+            .with_context(|| format!("no serverbound {name} packet"))?;
+        self.writer.send(*id, body)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -191,6 +221,17 @@ pub fn connect(
     conn.send(packets.id(State::Login, "login_acknowledged")?, &[])?;
 
     let config = configure(&mut conn, &packets, view_distance)?;
+    let outbox = Outbox {
+        writer: conn.writer(),
+        ids: Arc::new(
+            packets
+                .serverbound
+                .iter()
+                .filter(|((state, _), _)| *state == State::Play)
+                .map(|((_, name), id)| (name.clone(), *id))
+                .collect(),
+        ),
+    };
     let (tx, events) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("server connection".into())
@@ -202,7 +243,7 @@ pub fn connect(
             };
             let _ = tx.send(Event::Disconnected(reason));
         })?;
-    Ok(Session { events })
+    Ok(Session { events, outbox })
 }
 
 /// What configuration leaves the play state needing: each synced registry's entries in id
@@ -304,7 +345,7 @@ fn play(
             "login" => {
                 // Entity id, hardcore, the level names, max players, view and simulation
                 // distances, and three flags come before the spawn info's dimension type.
-                r.i32()?;
+                let entity_id = r.i32()?;
                 r.bool()?;
                 for _ in 0..r.count()? {
                     r.string()?;
@@ -321,7 +362,17 @@ fn play(
                     .get(index)
                     .context("the login's dimension type isn't in the registry data")?;
                 dimension = Some(chunk::Dimension::new(name, data.as_ref())?);
-                true
+                tx.send(Event::Login { entity_id }).is_ok()
+            }
+            "player_abilities" => {
+                // Flags: invulnerable 1, flying 2, may fly 4, instant build 8.
+                let flags = r.u8()?;
+                tx.send(Event::Abilities {
+                    flying: flags & 2 != 0,
+                    may_fly: flags & 4 != 0,
+                    flying_speed: r.f32()?,
+                })
+                .is_ok()
             }
             "player_position" => {
                 let teleport = r.varint()?;

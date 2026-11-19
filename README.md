@@ -21,7 +21,9 @@ redistributing these files.
 `resources/reports/` holds what vanilla defines in code rather than data: every block's
 properties and numeric state ids (`blocks.json`), every registry's protocol ids
 (`registries.json`), and every packet's id (`packets.json`); `source.json` records the
-protocol version. They come from vanilla's own data generator, which needs Java 25:
+protocol version. `physics.json` holds every state's collision shape and the blocks'
+friction, speed and jump factors, dumped by `xtask/java/DumpPhysics.java` (this step needs
+a JDK, not just a JRE). They come from vanilla's own data generator, which needs Java 25:
 
 ```sh
 cargo xtask gen-reports         # set JAVA=/path/to/java if it isn't on PATH
@@ -47,9 +49,10 @@ through Mesa's lavapipe Vulkan driver.
 cargo run --release -p mc-client -- --server localhost:25565 --name cardboard
 ```
 
-Joins a vanilla 26.3 server instead, and draws the chunks it sends; the camera starts where
-the server puts the player. Only offline-mode servers (`online-mode=false`) work so far.
-The camera flies freely and doesn't send movement to the server yet.
+Joins a vanilla 26.3 server instead, and draws the chunks it sends. On a server you walk
+with vanilla's movement and collision: WASD, Space to jump, Shift to sneak, Ctrl to sprint,
+and double-tap Space to fly where the server allows it. Only offline-mode servers
+(`online-mode=false`) work so far. Swimming isn't simulated yet.
 
 ## Crates
 
@@ -59,6 +62,7 @@ The camera flies freely and doesn't send movement to the server yet.
 - `mc-world`: saves: region files, chunks, block states, biomes, light
 - `mc-protocol`: the network protocol: framing, compression, login, configuration, and the
   play packets for joining and receiving chunks
+- `mc-physics`: the player's movement and collision, as vanilla's
 - `mc-render`: texture atlas, model baking, chunk meshing with smooth lighting, wgpu renderer
 - `mc-client`: the `minecraft-cardboard` binary
 

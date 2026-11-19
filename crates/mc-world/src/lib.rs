@@ -122,7 +122,7 @@ pub struct Section {
     pub sky_light: Option<Box<[u8; 2048]>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Blocks {
     /// Every block in the section has this state, such as all air.
     Uniform(u32),

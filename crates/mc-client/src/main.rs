@@ -17,6 +17,7 @@ use mc_render::bake::BlockModels;
 
 mod skins;
 mod stream;
+mod walk;
 use mc_render::gpu::{Camera, Renderer, View};
 use mc_render::mesh::{Mesher, WorldView};
 use mc_render::tint::Biomes;
@@ -107,6 +108,8 @@ struct Scene {
     registry: Arc<mc_registry::Registry>,
     source: stream::Source,
     view: WorldView,
+    /// On a server, sends the game's own packets.
+    outbox: Option<mc_protocol::Outbox>,
 }
 
 fn load_scene(args: &Args) -> Result<Scene> {
@@ -119,7 +122,7 @@ fn load_scene(args: &Args) -> Result<Scene> {
     );
     let res = mc_assets::Resources::new(root);
     let registry = Arc::new(mc_registry::Registry::vanilla()?);
-    let (source, view) = match &args.server {
+    let (source, view, outbox) = match &args.server {
         Some(address) => {
             // One chunk more than drawn, so the outermost drawn chunks have neighbours.
             let session = mc_protocol::connect(
@@ -132,6 +135,7 @@ fn load_scene(args: &Args) -> Result<Scene> {
             (
                 stream::Source::Server(session.events),
                 WorldView::empty(&registry),
+                Some(session.outbox),
             )
         }
         None => {
@@ -146,7 +150,7 @@ fn load_scene(args: &Args) -> Result<Scene> {
                 eye.z.floor() as i32,
                 args.distance + 1,
             )?;
-            (stream::Source::Save(world), view)
+            (stream::Source::Save(world), view, None)
         }
     };
     // Player heads' skins go in the atlas, so they're fetched before baking. Heads streamed
@@ -179,6 +183,7 @@ fn load_scene(args: &Args) -> Result<Scene> {
         registry,
         source,
         view,
+        outbox,
     })
 }
 
@@ -264,11 +269,16 @@ fn run() -> Result<()> {
         None => {
             let event_loop = winit::event_loop::EventLoop::new()?;
             let models = scene.models.clone();
+            let walker = match scene.outbox.clone() {
+                Some(outbox) => Some(walk::Walker::new(outbox, &scene.registry)?),
+                None => None,
+            };
             let streamer = spawn_streamer(scene, &args);
             let mut app = App {
                 args,
                 models,
                 streamer,
+                walker,
                 view,
                 state: None,
                 keys: Default::default(),
@@ -318,7 +328,7 @@ fn server_screenshot(
                     (placed, last_mesh) = (true, Instant::now());
                 }
                 stream::Update::Disconnected(reason) => bail!("disconnected: {reason}"),
-                stream::Update::Idle => {}
+                _ => {}
             }
         }
         streamer.follow(args.camera.eye);
@@ -353,6 +363,8 @@ struct App {
     args: Args,
     models: Arc<BlockModels>,
     streamer: stream::Streamer,
+    /// On a server the player walks with vanilla's physics; on a save the camera flies.
+    walker: Option<walk::Walker>,
     view: View,
     state: Option<WindowState>,
     keys: std::collections::HashSet<winit::keyboard::KeyCode>,
@@ -499,11 +511,9 @@ impl winit::application::ApplicationHandler for App {
                 let now = Instant::now();
                 let dt = (now - self.last_frame).as_secs_f32().min(0.1);
                 self.last_frame = now;
-                self.fly(dt);
                 // 20 game ticks a second.
                 self.view.ticks += dt * 20.0;
                 let Some(state) = &mut self.state else { return };
-                self.streamer.follow(self.args.camera.eye);
                 for update in self.streamer.updates() {
                     match update {
                         stream::Update::Mesh(key, mesh) => state.renderer.upload_chunk(key, &mesh),
@@ -512,6 +522,20 @@ impl winit::application::ApplicationHandler for App {
                             self.args.place(eye, yaw, pitch);
                             // Only the first placement is a choice; later ones are moves.
                             (self.args.pos_given, self.args.look_given) = (false, false);
+                            if let Some(walker) = &mut self.walker {
+                                let camera = &self.args.camera;
+                                walker.teleport(eye - Vec3::Y * 1.62, camera.yaw, camera.pitch);
+                            }
+                        }
+                        stream::Update::Collision(key, blocks) => {
+                            if let Some(walker) = &mut self.walker {
+                                walker.chunk(key, blocks);
+                            }
+                        }
+                        stream::Update::Server(event) => {
+                            if let Some(walker) = &mut self.walker {
+                                walker.server_event(event);
+                            }
                         }
                         stream::Update::Disconnected(reason) => {
                             eprintln!("disconnected: {reason}");
@@ -522,6 +546,22 @@ impl winit::application::ApplicationHandler for App {
                         stream::Update::Idle => {}
                     }
                 }
+                match &mut self.walker {
+                    Some(walker) => {
+                        let camera = &mut self.args.camera;
+                        let input = if self.captured {
+                            walk::input(&self.keys)
+                        } else {
+                            Default::default()
+                        };
+                        if let Some(eye) = walker.frame(dt, input, camera.yaw, camera.pitch) {
+                            camera.eye = eye;
+                        }
+                    }
+                    None => self.fly(dt),
+                }
+                self.streamer.follow(self.args.camera.eye);
+                let Some(state) = &mut self.state else { return };
                 let frame = match state.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,

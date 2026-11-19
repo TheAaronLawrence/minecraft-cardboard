@@ -56,8 +56,10 @@ fn version_info(version: &str) -> Result<Value> {
 /// Runs vanilla's data generator on the server jar and copies the reports we use into
 /// `resources/reports/`: every block's properties and state ids, every registry's protocol
 /// ids, and every packet's id in each protocol state. Vanilla defines these in code, so
-/// they aren't in the data packs. `source.json` records the protocol version. Needs
-/// `java` (the version's Java, 25 for 26.3) on PATH, or set JAVA to its path.
+/// they aren't in the data packs. `source.json` records the protocol version. It also
+/// runs `xtask/java/DumpPhysics.java` on the unpacked server for `physics.json`: every state's
+/// collision shape and the blocks' friction, speed and jump factors. Needs a JDK's `java`
+/// (the version's Java, 25 for 26.3) on PATH, or set JAVA to its path.
 fn gen_reports(version: &str) -> Result<()> {
     const REPORTS: [&str; 3] = ["blocks.json", "registries.json", "packets.json"];
     let (work, server_sha1) = server_workdir(version, "gen-reports")?;
@@ -82,6 +84,23 @@ fn gen_reports(version: &str) -> Result<()> {
             &std::fs::read(work.join("out/reports").join(name))?,
         )?;
     }
+    // The data generator unpacked the server and its libraries; run the dumper on them.
+    let mut classpath = Vec::new();
+    collect_jars(&work.join("versions"), &mut classpath)?;
+    collect_jars(&work.join("libraries"), &mut classpath)?;
+    let classpath = std::env::join_paths(classpath)?;
+    let dumper = Path::new(env!("CARGO_MANIFEST_DIR")).join("java/DumpPhysics.java");
+    let status = java()
+        .current_dir(&work)
+        .arg("-cp")
+        .arg(&classpath)
+        .arg(&dumper)
+        .arg(reports.join("physics.json"))
+        .status()?;
+    ensure!(
+        status.success(),
+        "DumpPhysics failed: {status}. It needs a JDK, not just a JRE"
+    );
     // The jar's version.json holds the protocol version a client sends in its handshake.
     let jar = std::fs::read(work.join("server.jar"))?;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(jar))?;
@@ -99,9 +118,21 @@ fn gen_reports(version: &str) -> Result<()> {
         serde_json::to_string_pretty(&source)?.as_bytes(),
     )?;
     println!(
-        "resources/reports/: {} from the {version} data generator",
+        "resources/reports/: {} from the {version} data generator, and physics.json",
         REPORTS.join(", ")
     );
+    Ok(())
+}
+
+fn collect_jars(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_jars(&path, out)?;
+        } else if path.extension().is_some_and(|e| e == "jar") {
+            out.push(path);
+        }
+    }
     Ok(())
 }
 
