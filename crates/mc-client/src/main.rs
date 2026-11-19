@@ -273,22 +273,7 @@ impl App {
     fn fly(&mut self, dt: f32) {
         use winit::keyboard::KeyCode as K;
         let camera = &mut self.args.camera;
-        let yaw = camera.yaw.to_radians();
-        let forward = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
-        let right = Vec3::new(-forward.z, 0.0, forward.x);
-        let mut motion = Vec3::ZERO;
-        for (key, dir) in [
-            (K::KeyW, forward),
-            (K::KeyS, -forward),
-            (K::KeyD, -right),
-            (K::KeyA, right),
-            (K::Space, Vec3::Y),
-            (K::ShiftLeft, -Vec3::Y),
-        ] {
-            if self.keys.contains(&key) {
-                motion += dir;
-            }
-        }
+        let motion = fly_direction(camera.yaw, &self.keys);
         let speed = if self.keys.contains(&K::ControlLeft) {
             30.0
         } else {
@@ -403,6 +388,58 @@ impl winit::application::ApplicationHandler for App {
                 state.window.request_redraw();
             }
             _ => {}
+        }
+    }
+}
+
+/// Which way the held keys fly, before normalising, for a camera turned `yaw` degrees:
+/// W and S along the view's level direction, A and D to its left and right, Space and
+/// Shift up and down.
+fn fly_direction(yaw: f32, keys: &std::collections::HashSet<winit::keyboard::KeyCode>) -> Vec3 {
+    use winit::keyboard::KeyCode as K;
+    let yaw = yaw.to_radians();
+    let forward = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
+    // Forward × up: facing south (+Z), the right hand points west (-X).
+    let right = forward.cross(Vec3::Y);
+    [
+        (K::KeyW, forward),
+        (K::KeyS, -forward),
+        (K::KeyD, right),
+        (K::KeyA, -right),
+        (K::Space, Vec3::Y),
+        (K::ShiftLeft, -Vec3::Y),
+    ]
+    .into_iter()
+    .filter(|(key, _)| keys.contains(key))
+    .map(|(_, dir)| dir)
+    .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::KeyCode as K;
+
+    /// D moves toward whatever is on the right of the screen, A toward the left. The
+    /// screen's right is worked out from the camera's own view matrix, not from
+    /// `fly_direction`'s maths, and checked at a turned yaw so a sign slip can't hide.
+    #[test]
+    fn d_strafes_toward_the_right_of_the_screen() {
+        for yaw in [0.0, 37.0, 90.0, 200.0] {
+            let camera = Camera {
+                eye: Vec3::ZERO,
+                yaw,
+                pitch: 0.0,
+                fov: 70.0,
+            };
+            let view_proj = camera.view_proj(1.0, 100.0);
+            let screen_x = |p: Vec3| view_proj.project_point3(p).x;
+            let ahead = camera.forward() * 10.0;
+            let held = |k| std::collections::HashSet::from([k]);
+            let d = fly_direction(yaw, &held(K::KeyD));
+            let a = fly_direction(yaw, &held(K::KeyA));
+            assert!(screen_x(ahead + d) > 0.0, "yaw {yaw}: D goes left");
+            assert!(screen_x(ahead + a) < 0.0, "yaw {yaw}: A goes right");
         }
     }
 }
