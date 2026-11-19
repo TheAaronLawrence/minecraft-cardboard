@@ -1,5 +1,6 @@
 //! One texture holding every block sprite.
 
+use crate::mipmap::Strategy;
 use anyhow::Result;
 use mc_assets::{MISSING_SPRITE, Resources};
 use std::collections::HashMap;
@@ -55,6 +56,7 @@ impl Atlas {
         extra: &[(String, image::RgbaImage)],
     ) -> Result<Self> {
         let mut images: Vec<(String, image::RgbaImage)> = extra.to_vec();
+        let mut meta: HashMap<String, (Strategy, f32)> = HashMap::new();
         let mut ids: Vec<String> = ids.into_iter().map(|id| normalize(&id)).collect();
         ids.push(MISSING_SPRITE.to_owned());
         ids.sort();
@@ -63,6 +65,7 @@ impl Atlas {
             let image = if id == MISSING_SPRITE {
                 None
             } else {
+                meta.insert(id.clone(), mipmap_meta(res, &id));
                 load_first_frame(res, &id)
             };
             images.push((id, image.unwrap_or_else(missing_texture)));
@@ -97,11 +100,9 @@ impl Atlas {
                 _ => Layer::Translucent,
             });
             // Each sprite gets its own mipmaps, so neighbours never bleed into it.
-            let mut mip = img.clone();
-            for (level, pixels) in levels.iter_mut().enumerate() {
-                if level > 0 {
-                    mip = downsample(&mip, layer != Layer::Opaque);
-                }
+            let (strategy, bias) = meta.get(&id).copied().unwrap_or((Strategy::Auto, 0.0));
+            let mips = crate::mipmap::generate(img.clone(), strategy, bias, MIP_LEVELS);
+            for (level, (pixels, mip)) in levels.iter_mut().zip(&mips).enumerate() {
                 let (lx, ly, level_width) = (x >> level, y >> level, WIDTH >> level);
                 for row in 0..mip.height() {
                     let src = &mip.as_raw()
@@ -175,33 +176,22 @@ fn missing_texture() -> image::RgbaImage {
     })
 }
 
-/// One mipmap step, as vanilla's `MipmapGenerator`: each pixel is the gamma-2.2 average of
-/// four. For sprites with see-through pixels, clear pixels add nothing and a result less
-/// than 96/255 opaque becomes fully clear, so leaves and glass keep crisp edges.
-fn downsample(img: &image::RgbaImage, transparent: bool) -> image::RgbaImage {
-    let pow22 = |c: u8| (c as f32 / 255.0).powf(2.2);
-    let back = |v: f32| ((v / 4.0).powf(1.0 / 2.2) * 255.0) as u8;
-    let (w, h) = ((img.width() / 2).max(1), (img.height() / 2).max(1));
-    image::RgbaImage::from_fn(w, h, |x, y| {
-        let px = |dx: u32, dy: u32| {
-            img.get_pixel(
-                (x * 2 + dx).min(img.width() - 1),
-                (y * 2 + dy).min(img.height() - 1),
-            )
-            .0
-        };
-        let four = [px(0, 0), px(1, 0), px(0, 1), px(1, 1)];
-        let mut sum = [0.0f32; 4];
-        for p in four {
-            if transparent && p[3] == 0 {
-                continue;
-            }
-            (0..4).for_each(|i| sum[i] += pow22(p[i]));
-        }
-        let mut out = sum.map(back);
-        if transparent && out[3] < 96 {
-            out[3] = 0;
-        }
-        image::Rgba(out)
-    })
+/// A texture's `mipmap_strategy` and `alpha_cutoff_bias`, from the `texture` section of
+/// its `.mcmeta` (`TextureMetadataSection`).
+fn mipmap_meta(res: &Resources, id: &str) -> (Strategy, f32) {
+    let path = res
+        .asset_path("textures", id, "png")
+        .with_extension("png.mcmeta");
+    let meta: Option<serde_json::Value> = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let texture = meta.as_ref().map(|m| &m["texture"]);
+    let strategy = texture
+        .and_then(|t| t["mipmap_strategy"].as_str())
+        .and_then(Strategy::parse)
+        .unwrap_or(Strategy::Auto);
+    let bias = texture
+        .and_then(|t| t["alpha_cutoff_bias"].as_f64())
+        .unwrap_or(0.0) as f32;
+    (strategy, bias)
 }

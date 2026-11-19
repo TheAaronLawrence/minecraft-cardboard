@@ -315,13 +315,9 @@ pub struct Element {
     pub from: [f32; 3],
     pub to: [f32; 3],
     pub rotation: Option<ElementRotation>,
-    #[serde(default = "yes")]
-    pub shade: bool,
+    /// Shade the faces as if they faced this way; plants use `up` so they stay bright.
+    pub shade_direction_override: Option<Direction>,
     pub faces: HashMap<Direction, Face>,
-}
-
-fn yes() -> bool {
-    true
 }
 
 /// Angles are in degrees, around `origin` in model units (0..16).

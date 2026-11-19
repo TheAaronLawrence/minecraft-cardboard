@@ -81,6 +81,9 @@ struct StateInfo {
     /// Plants vanilla nudges sideways by a per-position amount.
     offset: bool,
     air: bool,
+    /// Leaves draw the faces between them: `LeavesBlock.skipRendering` only hides them when
+    /// the Cutout Leaves option is off, and it is on by default.
+    leaves: bool,
     /// Its block entity's data can change how it looks (see `entity_model::uses_data`).
     data: bool,
 }
@@ -130,6 +133,7 @@ fn state_infos(registry: &Registry) -> Vec<StateInfo> {
                 fluid,
                 offset,
                 air: name.ends_with("air") && block.properties.is_empty(),
+                leaves: name.ends_with("_leaves"),
                 data: crate::entity_model::uses_data(name),
             });
         }
@@ -369,7 +373,7 @@ impl<'a> Mesher<'a> {
                     }
                     // Glass and ice hide the faces between two blocks of the same kind.
                     let same_kind = self.infos[other as usize].block == info.block;
-                    if same_kind && quad.layer != Layer::Opaque && quad.on_face {
+                    if same_kind && !info.leaves && quad.layer != Layer::Opaque && quad.on_face {
                         continue;
                     }
                 }
@@ -438,7 +442,7 @@ impl<'a> Mesher<'a> {
         tint: [f32; 3],
         ao: bool,
     ) {
-        let shade = if quad.shade { quad.dir.shade() } else { 1.0 };
+        let shade = quad.shade.unwrap_or(quad.dir).shade();
         let [dx, dy, dz] = quad.dir.offset();
         let [x, y, z] = block;
         // Light comes from the block the face looks into when it lies on the block's edge.

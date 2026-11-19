@@ -284,7 +284,7 @@ impl Builder {
                 dir,
                 cull: None,
                 tint: self.tint,
-                shade: true,
+                shade: None,
                 layer: self.sprite.layer,
                 on_face: bake::lies_on_face(&pos, dir),
             });
@@ -543,7 +543,7 @@ fn portal(atlas: &Atlas, end_portal: bool) -> Vec<Quad> {
                 dir,
                 cull: (!end_portal).then_some(dir),
                 tint: -1,
-                shade: false,
+                shade: Some(Dir::Up),
                 // `RenderPipelines`' `PORTAL_LAYERS` for each.
                 layer: Layer::EndPortal(if end_portal { 15 } else { 16 }),
                 on_face: bake::lies_on_face(&pos, dir),

@@ -1,14 +1,16 @@
-//! Biome colours for grass, leaves and water.
+//! Biome colours for grass, leaves, leaf litter and water.
 
 use anyhow::{Context, Result};
 use mc_assets::Resources;
 use std::collections::HashMap;
 
-/// Which colour a block's tinted faces take. Vanilla assigns these in code.
+/// Which colour a block's tinted faces take. Vanilla assigns these in code
+/// (`BlockColors.createDefault`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Tint {
     Grass,
     Foliage,
+    DryFoliage,
     Water,
     Fixed([f32; 3]),
 }
@@ -17,9 +19,11 @@ pub fn block_tint(name: &str) -> Option<Tint> {
     let name = name.strip_prefix("minecraft:").unwrap_or(name);
     Some(match name {
         "grass_block" | "short_grass" | "tall_grass" | "fern" | "large_fern" | "potted_fern"
-        | "sugar_cane" | "bush" => Tint::Grass,
+        | "sugar_cane" | "bush" | "pink_petals" | "wildflowers" => Tint::Grass,
         "oak_leaves" | "jungle_leaves" | "acacia_leaves" | "dark_oak_leaves"
         | "mangrove_leaves" | "vine" => Tint::Foliage,
+        "leaf_litter" => Tint::DryFoliage,
+        "attached_melon_stem" | "attached_pumpkin_stem" => Tint::Fixed(rgb(0xE0C71C)),
         "birch_leaves" => Tint::Fixed(rgb(0x80A755)),
         "spruce_leaves" => Tint::Fixed(rgb(0x619961)),
         "lily_pad" => Tint::Fixed(rgb(0x208030)),
@@ -45,6 +49,7 @@ fn parse_hex(v: &serde_json::Value) -> Option<u32> {
 struct BiomeColors {
     grass: [f32; 3],
     foliage: [f32; 3],
+    dry_foliage: [f32; 3],
     water: [f32; 3],
 }
 
@@ -64,6 +69,7 @@ impl Biomes {
             )
         };
         let (grass_map, foliage_map) = (colormap("grass")?, colormap("foliage")?);
+        let dry_foliage_map = colormap("dry_foliage")?;
         let lookup = |map: &image::RgbaImage, temperature: f32, downfall: f32| {
             // GrassColor.get / FoliageColor.get: humidity is scaled by temperature.
             let (t, d) = (temperature.clamp(0.0, 1.0), downfall.clamp(0.0, 1.0));
@@ -92,6 +98,9 @@ impl Biomes {
             let foliage = parse_hex(&effects["foliage_color"])
                 .map(rgb)
                 .unwrap_or_else(|| lookup(&foliage_map, temperature, downfall));
+            let dry_foliage = parse_hex(&effects["dry_foliage_color"])
+                .map(rgb)
+                .unwrap_or_else(|| lookup(&dry_foliage_map, temperature, downfall));
             let water = parse_hex(&effects["water_color"])
                 .map(rgb)
                 .unwrap_or(rgb(0x3F76E4));
@@ -109,6 +118,7 @@ impl Biomes {
                 BiomeColors {
                     grass,
                     foliage,
+                    dry_foliage,
                     water,
                 },
             );
@@ -116,6 +126,7 @@ impl Biomes {
         let fallback = BiomeColors {
             grass: lookup(&grass_map, 0.8, 0.4),
             foliage: lookup(&foliage_map, 0.8, 0.4),
+            dry_foliage: lookup(&dry_foliage_map, 0.8, 0.4),
             water: rgb(0x3F76E4),
         };
         Ok(Self { colors, fallback })
@@ -128,6 +139,7 @@ impl Biomes {
         match tint {
             Tint::Grass => colors.grass,
             Tint::Foliage => colors.foliage,
+            Tint::DryFoliage => colors.dry_foliage,
             Tint::Water => colors.water,
             Tint::Fixed(c) => c,
         }

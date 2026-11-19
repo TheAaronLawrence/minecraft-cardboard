@@ -5,6 +5,7 @@ struct Uniforms {
     inv_view_proj: mat4x4<f32>,
     eye: vec4<f32>,
     fog_color: vec4<f32>,
+    // w: the sky's fog end (`FogSkyEnd`), in blocks.
     sky_color: vec4<f32>,
     // fog start, fog end, sky brightness (1 at noon), brightness option (vanilla default 0.5)
     params: vec4<f32>,
@@ -94,7 +95,9 @@ fn fs_translucent(in: VertexOut) -> @location(0) vec4<f32> {
     return shade(in);
 }
 
-// Sky: one full-screen triangle, pale fog colour at the horizon fading to the sky colour above.
+// Sky: one full-screen triangle that draws vanilla's sky disc, a fan 16 blocks overhead with a
+// 512-block radius, fogged by the distance its vertices interpolate (16 at the centre, 512 at
+// the rim). Below the disc's edge only the fog colour shows, as vanilla's clear colour.
 struct SkyOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) ndc: vec2<f32>,
@@ -113,8 +116,15 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
 fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let far = u.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - u.eye.xyz);
-    let t = smoothstep(0.0, 0.35, dir.y);
-    return vec4<f32>(mix(u.fog_color.rgb, u.sky_color.rgb, t), 1.0);
+    var color = u.fog_color.rgb;
+    if dir.y > 0.0 {
+        let r = 16.0 * length(dir.xz) / dir.y;
+        if r < 512.0 {
+            let distance = mix(16.0, length(vec2<f32>(512.0, 16.0)), r / 512.0);
+            color = mix(u.sky_color.rgb, color, clamp(distance / u.sky_color.w, 0.0, 1.0));
+        }
+    }
+    return vec4<f32>(color, 1.0);
 }
 
 // End portals and gateways: vanilla's `rendertype_end_portal` shader. The sky texture and

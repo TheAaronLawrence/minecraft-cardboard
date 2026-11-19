@@ -89,7 +89,9 @@ pub struct Quad {
     pub cull: Option<Dir>,
     /// Which tint the block applies (grass, foliage, water), if any.
     pub tint: i32,
-    pub shade: bool,
+    /// The direction whose shading the quad takes instead of its own
+    /// (`shade_direction_override`).
+    pub shade: Option<Dir>,
     pub layer: Layer,
     /// Lies on the block's outer face in `dir`, so its light comes from the neighbor.
     pub on_face: bool,
@@ -341,7 +343,7 @@ fn bake_variant(model: &Model, variant: &Variant, atlas: &Atlas) -> BakedModel {
                 dir,
                 cull,
                 tint: face.tintindex,
-                shade: element.shade,
+                shade: element.shade_direction_override.map(Dir::from),
                 layer,
                 on_face,
             });

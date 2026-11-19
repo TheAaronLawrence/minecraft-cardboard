@@ -448,12 +448,19 @@ impl Renderer {
         // Vanilla's terrain fog: it ends at the render distance and starts a tenth before.
         let fog_end = view.distance;
         let fog_start = fog_end - (fog_end / 10.0).clamp(4.0, 64.0);
+        // `AtmosphericFogEnvironment.getBaseColor`: the nearer the render distance, the more
+        // the fog takes on the sky's colour, so short distances don't look washed out.
+        let chunks = view.distance / 16.0;
+        let toward_sky = 1.0 - (0.25 + 0.75 * chunks / 32.0).clamp(0.25, 1.0).powf(0.25);
+        let (fog, sky) = (color(FOG), color(SKY));
+        let fog_color = std::array::from_fn(|i| fog[i] + (sky[i] - fog[i]) * toward_sky);
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             eye: camera.eye.extend(1.0).into(),
-            fog_color: color(FOG),
-            sky_color: color(SKY),
+            fog_color,
+            // The sky fogs out at the render distance (`FogData.skyEnd`).
+            sky_color: [sky[0], sky[1], sky[2], view.distance],
             params: [fog_start, fog_end, 1.0, 0.5],
             // `GlobalSettingsUniform`'s GameTime.
             time: [(view.ticks % 24000.0) / 24000.0, 0.0, 0.0, 0.0],

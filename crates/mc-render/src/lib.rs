@@ -7,4 +7,5 @@ pub mod chest;
 pub mod entity_model;
 pub mod gpu;
 pub mod mesh;
+pub mod mipmap;
 pub mod tint;

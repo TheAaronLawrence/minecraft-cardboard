@@ -173,7 +173,7 @@ pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Bake
                 dir,
                 cull: None,
                 tint: -1,
-                shade: true,
+                shade: None,
                 layer: sprite.layer,
                 on_face: bake::lies_on_face(&pos, dir),
             });
