@@ -9,13 +9,15 @@
 //! On a server, the camera starts where the server puts the player, unless `--pos` and
 //! `--look` say otherwise.
 //! In the window: click to capture the mouse, WASD to move, Space and Shift to go up and
-//! down, Ctrl to fly faster, Esc to release the mouse. On a server, left click mines, right
+//! down, Ctrl to fly faster, Esc to pause. On a server, left click mines, right
 //! click places or uses, middle click picks the block, and 1 to 9 or the wheel choose the
 //! hotbar slot. Dying opens the death screen, whose buttons respawn or leave.
 //!
 //! Without `--world` or `--server`, the window opens on the title screen: Singleplayer opens
 //! the test world, and Multiplayer asks for a server's address (remembered in `options.txt`
-//! beside the exe). Leaving a world, or losing the connection, comes back to the menus.
+//! beside the exe). In a world, Esc (or the window losing focus) opens the pause screen,
+//! whose Disconnect, or Save and Quit to Title, comes back to the menus, as losing the
+//! connection does.
 
 use anyhow::{Context, Result, bail};
 use glam::Vec3;
@@ -313,6 +315,7 @@ fn run() -> Result<()> {
                 captured: false,
                 cursor: None,
                 focused_at: Instant::now(),
+                paused: false,
             };
             if app.start.server.is_some() || app.start.world_given {
                 app.play(app.start.server.clone());
@@ -442,6 +445,8 @@ struct App {
     loading: Option<std::sync::mpsc::Receiver<Result<Scene>>>,
     /// When the menu's text box was last focused or edited, which restarts its blink.
     focused_at: Instant,
+    /// The pause screen is open over the world.
+    paused: bool,
     view: View,
     state: Option<WindowState>,
     keys: std::collections::HashSet<winit::keyboard::KeyCode>,
@@ -459,6 +464,19 @@ struct App {
 }
 
 impl WindowState {
+    /// Captures the mouse for looking around; false if the window can't.
+    fn grab(&self) -> bool {
+        let grab = self
+            .window
+            .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+            .or_else(|_| {
+                self.window
+                    .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+            });
+        self.window.set_cursor_visible(grab.is_err());
+        grab.is_ok()
+    }
+
     /// Lets go of the mouse.
     fn release(&self) {
         let _ = self
@@ -559,7 +577,7 @@ impl App {
         );
         self.models = scene.models.clone();
         self.streamer = Some(spawn_streamer(scene, &self.args));
-        self.menu = None;
+        (self.menu, self.paused) = (None, false);
         (self.outlined, self.shown_hotbar) = (None, None);
         self.shown_cracks.clear();
         self.view.ticks = self.args.ticks;
@@ -582,7 +600,7 @@ impl App {
             );
         }
         self.models = self.menu_models.clone();
-        (self.captured, self.buttons) = (false, Default::default());
+        (self.captured, self.buttons, self.paused) = (false, Default::default(), false);
         self.keys.clear();
         self.menu = Some(menu::Menu {
             screen,
@@ -687,6 +705,48 @@ impl App {
         self.focused_at = Instant::now();
     }
 
+    /// `Minecraft.pauseGame`: opens the pause screen over the world in play, letting go of
+    /// the mouse. Not over another screen.
+    fn pause(&mut self) {
+        let screen_open = self.walker.as_ref().is_some_and(walk::Walker::screen_open);
+        if self.streamer.is_none() || self.menu.is_some() || self.paused || screen_open {
+            return;
+        }
+        if let Some(state) = &self.state {
+            state.release();
+        }
+        (self.paused, self.captured, self.buttons) = (true, false, Default::default());
+        self.keys.clear();
+    }
+
+    /// Back to Game: closes the pause screen and captures the mouse again.
+    fn resume(&mut self) {
+        self.paused = false;
+        if let Some(state) = &self.state {
+            self.captured = state.grab();
+        }
+    }
+
+    fn pause_click(&mut self) {
+        let Some(state) = &self.state else { return };
+        let (width, height, Some(mouse)) = state.gui(self.cursor) else {
+            return;
+        };
+        let pause = mc_render::hud::pause::Pause {
+            local: self.walker.is_none(),
+            mouse: None,
+        };
+        let action = mc_render::hud::pause::buttons(&pause, width, height)
+            .into_iter()
+            .find(|(_, button, active, _)| *active && button.contains(mouse))
+            .map(|(action, ..)| action);
+        match action {
+            Some(mc_render::hud::pause::Action::ReturnToGame) => self.resume(),
+            Some(mc_render::hud::pause::Action::Leave) => self.leave_world(menu::Screen::Title),
+            _ => {}
+        }
+    }
+
     fn fly(&mut self, dt: f32) {
         use winit::keyboard::KeyCode as K;
         let camera = &mut self.args.camera;
@@ -759,6 +819,22 @@ impl winit::application::ApplicationHandler for App {
                 state: ElementState::Pressed,
                 button: winit::event::MouseButton::Left,
                 ..
+            } if self.paused => self.pause_click(),
+            // Esc closes the pause screen (`Screen.shouldCloseOnEsc`), back to the game.
+            WindowEvent::KeyboardInput { event, .. } if self.paused => {
+                if event.state == ElementState::Pressed
+                    && event.physical_key
+                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
+                {
+                    self.resume();
+                }
+            }
+            // `Minecraft.setWindowActive`: with `pauseOnLostFocus`, losing focus pauses.
+            WindowEvent::Focused(false) => self.pause(),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
             } if self.walker.as_ref().is_some_and(walk::Walker::screen_open) => {
                 let (width, height, mouse) = state.gui(self.cursor);
                 if let (Some(walker), Some(mouse)) = (&mut self.walker, mouse)
@@ -772,18 +848,10 @@ impl winit::application::ApplicationHandler for App {
                 ..
             } if !self.captured
                 && self.menu.is_none()
+                && !self.paused
                 && !self.walker.as_ref().is_some_and(walk::Walker::screen_open) =>
             {
-                let grab = state
-                    .window
-                    .set_cursor_grab(winit::window::CursorGrabMode::Locked)
-                    .or_else(|_| {
-                        state
-                            .window
-                            .set_cursor_grab(winit::window::CursorGrabMode::Confined)
-                    });
-                self.captured = grab.is_ok();
-                state.window.set_cursor_visible(!self.captured);
+                self.captured = state.grab();
             }
             WindowEvent::MouseInput {
                 state: pressed,
@@ -824,12 +892,11 @@ impl winit::application::ApplicationHandler for App {
                     if code == winit::keyboard::KeyCode::Escape
                         && event.state == ElementState::Pressed
                     {
-                        state.release();
-                        self.captured = false;
-                        self.buttons = Default::default();
-                        if let Some(walker) = &mut self.walker {
-                            walker.escape();
+                        match &mut self.walker {
+                            Some(walker) if walker.screen_open() => walker.escape(),
+                            _ => self.pause(),
                         }
+                        return;
                     }
                     let digits = [
                         winit::keyboard::KeyCode::Digit1,
@@ -982,12 +1049,26 @@ impl winit::application::ApplicationHandler for App {
                     streamer.follow(self.args.camera.eye);
                 }
                 let Some(state) = &mut self.state else { return };
-                let screen = self.menu.clone().map(|mut m| {
-                    m.mouse = state.gui(self.cursor).2;
-                    // `TextCursorUtils.isCursorVisible`: on for 300 ms, off for 300.
-                    m.cursor_on = (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2);
-                    mc_render::hud::Screen::Menu(m)
-                });
+                // Dying closes the pause screen for the death screen.
+                if self.walker.as_ref().is_some_and(walk::Walker::screen_open) {
+                    self.paused = false;
+                }
+                let mouse = state.gui(self.cursor).2;
+                let screen = match &self.menu {
+                    Some(m) => Some(mc_render::hud::Screen::Menu(menu::Menu {
+                        mouse,
+                        // `TextCursorUtils.isCursorVisible`: on for 300 ms, off for 300.
+                        cursor_on: (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2),
+                        ..m.clone()
+                    })),
+                    None if self.paused => Some(mc_render::hud::Screen::Pause(
+                        mc_render::hud::pause::Pause {
+                            local: self.walker.is_none(),
+                            mouse,
+                        },
+                    )),
+                    None => None,
+                };
                 state.renderer.set_screen(screen);
                 let frame = match state.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)

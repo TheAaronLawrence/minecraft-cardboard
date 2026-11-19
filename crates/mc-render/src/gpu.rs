@@ -739,14 +739,14 @@ impl Renderer {
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
         let scale = gui_scale(width, height);
         let (gui_width, gui_height) = (width.div_ceil(scale), height.div_ceil(scale));
-        let gui_mesh = match (&self.screen, &self.hotbar, view.hud) {
+        let mut gui_mesh = match (&self.screen, &self.hotbar, view.hud) {
             (Some(crate::hud::Screen::Menu(menu)), ..) => {
                 crate::hud::menu::menu(&self.hud_art, menu, gui_width, gui_height)
             }
             (Some(crate::hud::Screen::Launcher(launcher)), ..) => {
                 crate::hud::launcher::launcher(&self.hud_art, launcher, gui_width, gui_height)
             }
-            (None, Some(hotbar), true) => crate::hud::hotbar(
+            (None | Some(crate::hud::Screen::Pause(_)), Some(hotbar), true) => crate::hud::hotbar(
                 &self.hud_art,
                 hotbar,
                 width.div_ceil(scale),
@@ -754,6 +754,9 @@ impl Renderer {
             ),
             _ => Default::default(),
         };
+        if let Some(crate::hud::Screen::Pause(pause)) = &self.screen {
+            gui_mesh.pause(&self.hud_art, pause, gui_width as i32, gui_height as i32);
+        }
         let gui_buffer = self.quads_buffer("gui", &gui_mesh.vertices);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -819,7 +822,8 @@ impl Renderer {
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
             }
-            if view.hud {
+            // Vanilla blurs the crosshair away under a screen; without the blur, it's hidden.
+            if view.hud && self.screen.is_none() {
                 pass.set_pipeline(&self.crosshair);
                 pass.draw(0..3, 0..1);
             }

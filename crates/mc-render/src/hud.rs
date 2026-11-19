@@ -8,6 +8,7 @@
 
 pub mod launcher;
 pub mod menu;
+pub mod pause;
 
 use crate::atlas::Atlas;
 use crate::bake::{BlockModels, Dir};
@@ -56,6 +57,7 @@ fn named_sprites() -> Vec<String> {
         .chain(FOOD)
         .chain(BUTTON)
         .chain(menu::TEXT_FIELD)
+        .chain(pause::ICONS)
         .map(str::to_owned)
         .collect();
     for i in 0..16 {
@@ -88,6 +90,7 @@ pub(crate) fn sprites() -> Vec<String> {
         .chain((0..10).map(crack_sprite))
         .chain(named_sprites().iter().map(|n| gui_sprite(n)))
         .chain(menu::TEXTURES.map(str::to_owned))
+        .chain(pause::TEXTURES.map(str::to_owned))
         .collect()
 }
 
@@ -153,7 +156,12 @@ impl HudArt {
                     let rect = atlas.sprite(&gui_sprite(&n)).rect;
                     (n, rect)
                 })
-                .chain(menu::TEXTURES.map(|id| (id.to_owned(), atlas.sprite(id).rect)))
+                .chain(
+                    menu::TEXTURES
+                        .into_iter()
+                        .chain(pause::TEXTURES)
+                        .map(|id| (id.to_owned(), atlas.sprite(id).rect)),
+                )
                 .collect(),
             white: {
                 let [u0, v0, u1, v1] = atlas.sprite(crate::atlas::WHITE_SPRITE).rect;
@@ -181,6 +189,7 @@ fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
                 "connect.",
                 "disconnect.",
                 "gui.",
+                "options.",
             ]
             .iter()
             .any(|p| k.starts_with(p))
@@ -243,6 +252,8 @@ pub struct Hotbar {
 #[derive(Clone, PartialEq, Debug)]
 pub enum Screen {
     Menu(menu::Menu),
+    /// Drawn over the HUD rather than instead of it.
+    Pause(pause::Pause),
     Launcher(launcher::Launcher),
 }
 
@@ -753,29 +764,33 @@ impl GuiMesh {
         };
         let [x, y, w, h] = b.rect;
         let [u0, v0, u1, v1] = art.named[sprite];
-        // The sprites are 200 × 20 with a 3-pixel border, and buttons are no wider or
-        // taller: the left part up to the right border, then the right border.
+        // `GuiGraphicsExtractor.blitNineSlicedSprite` for the 200 × 20 sprites with a 3-pixel
+        // border at the buttons' height of 20: the left border, the middle 194 tiled across
+        // (wider buttons, such as the pause screen's 204, repeat its start), then the right
+        // border.
         let u = |px: i32| u0 + (u1 - u0) * px as f32 / 200.0;
         let z = SCREEN + 1.0;
         let white = [1.0; 4];
-        self.blit(
-            x as f32,
-            y as f32,
-            z,
-            (w - 3) as f32,
-            h as f32,
-            [u0, v0, u(w - 3), v1],
-            white,
-        );
-        self.blit(
-            (x + w - 3) as f32,
-            y as f32,
-            z,
-            3.0,
-            h as f32,
-            [u(197), v0, u1, v1],
-            white,
-        );
+        let mut column = |left: i32, from: i32, width: i32| {
+            let rect = [u(from), v0, u(from + width), v1];
+            self.blit(
+                left as f32,
+                y as f32,
+                z,
+                width as f32,
+                h as f32,
+                rect,
+                white,
+            );
+        };
+        column(x, 0, 3);
+        let mut left = x + 3;
+        while left < x + w - 3 {
+            let width = (x + w - 3 - left).min(194);
+            column(left, 3, width);
+            left += width;
+        }
+        column(x + w - 3, 197, 3);
         // `ActiveTextCollector.defaultScrollingHelper` for a label that fits.
         let label = art.lang.get(b.label).map_or(b.label, String::as_str);
         let text_width = Self::text_width(art, label) as i32;

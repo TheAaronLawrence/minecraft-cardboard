@@ -41,7 +41,8 @@ cargo run --release -p mc-client -- --pos 20.5,78,-30.5 --look 210,15
 ```
 
 Opens the test world (or any save with `--world DIR`) in a window: click to capture the
-mouse, WASD to move, Space and Shift for up and down, Ctrl to go faster, Esc to let go.
+mouse, WASD to move, Space and Shift for up and down, Ctrl to go faster, Esc to pause
+(the pause screen lets go of the mouse; Save and Quit to Title goes back to the menu).
 Add `--screenshot out.png` to render one frame to a file instead; it works without a GPU
 through Mesa's lavapipe Vulkan driver.
 
