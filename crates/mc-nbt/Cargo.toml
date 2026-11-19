@@ -1,0 +1,11 @@
+[package]
+name = "mc-nbt"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+indexmap = "2"
+
+[dev-dependencies]
+flate2 = "1"

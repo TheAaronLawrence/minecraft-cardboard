@@ -116,6 +116,73 @@ impl BlockState {
             BlockState::Multipart(cases) => cases.iter().flat_map(|c| c.apply.as_slice()).collect(),
         }
     }
+
+    /// The models a block state draws. `property` gives the state's value for a property
+    /// name. A `variants` file should match exactly one entry; a `multipart` file draws
+    /// every case whose condition holds.
+    pub fn select<'a, 'p>(
+        &'a self,
+        property: &dyn Fn(&str) -> Option<&'p str>,
+    ) -> Vec<&'a Variants> {
+        match self {
+            BlockState::Variants(map) => map
+                .iter()
+                .filter(|(key, _)| {
+                    key.split(',').filter(|pair| !pair.is_empty()).all(|pair| {
+                        pair.split_once('=')
+                            .is_some_and(|(k, v)| property(k) == Some(v))
+                    })
+                })
+                .map(|(_, variants)| variants)
+                .collect(),
+            BlockState::Multipart(cases) => cases
+                .iter()
+                .filter(|case| {
+                    case.when
+                        .as_ref()
+                        .is_none_or(|when| condition_holds(when, property))
+                })
+                .map(|case| &case.apply)
+                .collect(),
+        }
+    }
+}
+
+/// A multipart `when`: `{"OR": [...]}`, `{"AND": [...]}`, or property values that must
+/// all match, where `"a|b"` allows either value and a leading `!` negates the list.
+fn condition_holds<'p>(
+    when: &serde_json::Value,
+    property: &dyn Fn(&str) -> Option<&'p str>,
+) -> bool {
+    let Some(map) = when.as_object() else {
+        return false;
+    };
+    let all = |list: &serde_json::Value| {
+        list.as_array()
+            .is_some_and(|l| l.iter().all(|c| condition_holds(c, property)))
+    };
+    let any = |list: &serde_json::Value| {
+        list.as_array()
+            .is_some_and(|l| l.iter().any(|c| condition_holds(c, property)))
+    };
+    if let Some(list) = map.get("OR") {
+        return any(list);
+    }
+    if let Some(list) = map.get("AND") {
+        return all(list);
+    }
+    map.iter().all(|(name, expected)| {
+        let Some(expected) = expected.as_str() else {
+            return false;
+        };
+        let (negate, values) = expected
+            .strip_prefix('!')
+            .map_or((false, expected), |rest| (true, rest));
+        let Some(actual) = property(name) else {
+            return false;
+        };
+        values.split('|').any(|v| v == actual) != negate
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,4 +322,26 @@ pub struct Face {
 
 fn no_tint() -> i32 {
     -1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negated_conditions_exclude_every_listed_value() {
+        // Resource packs may write `!`; vanilla's own files don't, so test it here.
+        let state: BlockState = serde_json::from_str(
+            r#"{"multipart": [
+            {"when": {"facing": "!north|south"}, "apply": {"model": "minecraft:block/side"}}
+        ]}"#,
+        )
+        .unwrap();
+        let picks = |facing: &'static str| {
+            state
+                .select(&move |p| (p == "facing").then_some(facing))
+                .len()
+        };
+        assert_eq!([picks("north"), picks("south"), picks("east")], [0, 0, 1]);
+    }
 }

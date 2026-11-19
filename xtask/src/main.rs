@@ -17,12 +17,17 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("fetch-assets") => fetch_assets(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
-        _ => bail!("usage: cargo xtask fetch-assets [version]"),
+        Some("gen-reports") => gen_reports(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
+        _ => bail!("usage: cargo xtask fetch-assets [version] | gen-reports [version]"),
     }
 }
 
-fn fetch_assets(version: &str) -> Result<()> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources");
+fn resources_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../resources")
+}
+
+/// The launcher's description of a version: its downloads, asset index and Java version.
+fn version_info(version: &str) -> Result<Value> {
     let manifest: Value = serde_json::from_slice(&get(MANIFEST_URL)?)?;
     let entry = manifest["versions"]
         .as_array()
@@ -30,8 +35,67 @@ fn fetch_assets(version: &str) -> Result<()> {
         .iter()
         .find(|v| v["id"] == version)
         .with_context(|| format!("version {version} not in the manifest"))?;
-    let version_json = get_verified(str_at(entry, "url")?, str_at(entry, "sha1")?)?;
-    let version_info: Value = serde_json::from_slice(&version_json)?;
+    Ok(serde_json::from_slice(&get_verified(
+        str_at(entry, "url")?,
+        str_at(entry, "sha1")?,
+    )?)?)
+}
+
+/// Runs vanilla's data generator on the server jar and copies the reports we use into
+/// `resources/reports/`: every block's properties and state ids, and every registry's
+/// protocol ids. Vanilla defines these in code, so they aren't in the data packs. Needs
+/// `java` (the version's Java, 25 for 26.3) on PATH, or set JAVA to its path.
+fn gen_reports(version: &str) -> Result<()> {
+    const REPORTS: [&str; 2] = ["blocks.json", "registries.json"];
+    let server = &version_info(version)?["downloads"]["server"];
+    let work = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/gen-reports");
+    if work.exists() {
+        std::fs::remove_dir_all(&work)?;
+    }
+    let jar = work.join("server.jar");
+    write(
+        &jar,
+        &get_verified(str_at(server, "url")?, str_at(server, "sha1")?)?,
+    )?;
+
+    let java = std::env::var("JAVA").unwrap_or_else(|_| "java".into());
+    let status = std::process::Command::new(&java)
+        .current_dir(&work)
+        .args([
+            "-DbundlerMainClass=net.minecraft.data.Main",
+            "-jar",
+            "server.jar",
+            "--reports",
+            "--output",
+            "out",
+        ])
+        .status()
+        .with_context(|| format!("running {java}; install Java or set JAVA"))?;
+    ensure!(status.success(), "the data generator failed: {status}");
+
+    let reports = resources_dir().join("reports");
+    for name in REPORTS {
+        write(
+            &reports.join(name),
+            &std::fs::read(work.join("out/reports").join(name))?,
+        )?;
+    }
+    let source =
+        serde_json::json!({ "version": version, "server_jar_sha1": str_at(server, "sha1")? });
+    write(
+        &reports.join("source.json"),
+        serde_json::to_string_pretty(&source)?.as_bytes(),
+    )?;
+    println!(
+        "resources/reports/: {} from the {version} data generator",
+        REPORTS.join(", ")
+    );
+    Ok(())
+}
+
+fn fetch_assets(version: &str) -> Result<()> {
+    let root = resources_dir();
+    let version_info = version_info(version)?;
 
     // Start from an empty tree so files removed upstream don't linger.
     for dir in ["assets", "data"] {
