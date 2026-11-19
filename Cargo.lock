@@ -3161,6 +3161,7 @@ name = "xtask"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "image",
  "serde_json",
  "sha1_smol",
  "ureq",

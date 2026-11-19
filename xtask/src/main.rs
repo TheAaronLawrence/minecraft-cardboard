@@ -1,7 +1,10 @@
 //! Project tasks. `cargo xtask fetch-assets [version]` copies Mojang's assets for a
 //! vanilla Java Edition version into `resources/`, which is committed to the repo.
 //! `cargo xtask package-windows [tag]` builds a Windows release (see `package.rs`).
+//! `cargo xtask compare [views]` renders views in vanilla and in our client and measures the
+//! difference (see `compare.rs`).
 
+mod compare;
 mod package;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -23,9 +26,10 @@ fn main() -> Result<()> {
         Some("gen-reports") => gen_reports(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
         Some("gen-world") => gen_world(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
         Some("package-windows") => package::package_windows(args.get(1).map(String::as_str)),
+        Some("compare") => compare::compare(args.get(1).map(String::as_str)),
         _ => bail!(
             "usage: cargo xtask fetch-assets|gen-reports|gen-world [version], \
-             or cargo xtask package-windows [tag]"
+             cargo xtask package-windows [tag], or cargo xtask compare [views]"
         ),
     }
 }

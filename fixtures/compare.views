@@ -1,0 +1,10 @@
+# Views `cargo xtask compare` renders in vanilla and in our client: name x y z yaw pitch,
+# where x y z is the eye position and yaw/pitch are vanilla's (pitch 15 looks down 15°).
+probe 20.5 79.6 -30.5 210 15
+down 20.5 79.6 -30.5 210 60
+east 20.5 79.6 -30.5 270 10
+west 20.5 79.6 -30.5 120 10
+row_a -2.5 251.6 -3.5 0 15
+row_b -26.5 251.6 -3.5 0 15
+row_c -56.5 251.6 -3.5 0 15
+row_d -79.5 251.6 -3.5 0 15
