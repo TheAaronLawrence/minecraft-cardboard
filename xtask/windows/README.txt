@@ -15,7 +15,7 @@ so it needs your GitHub login: install the GitHub CLI (https://cli.github.com) a
 In the window: click to capture the mouse, WASD to move, Space and Shift to go up and down,
 Ctrl to fly faster, Esc to pause. On a server: Space jumps, Shift sneaks, Ctrl sprints, left
 click mines, right click places, middle click picks a block, 1 to 9 or the wheel choose the
-hotbar slot, T opens the chat and / opens it to type a command.
+hotbar slot, E opens the inventory, T opens the chat and / opens it to type a command.
 
 You can also start the game without the launcher. From PowerShell, in this folder:
   .\minecraft-cardboard.exe --pos -40,252,6 --look 180,10

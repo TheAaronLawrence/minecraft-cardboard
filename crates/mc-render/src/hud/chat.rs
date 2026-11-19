@@ -268,6 +268,7 @@ mod tests {
             named: Default::default(),
             white: [0.0; 2],
             lang: Default::default(),
+            item_names: Default::default(),
         };
         let plain = |t: &str| Span {
             text: t.into(),

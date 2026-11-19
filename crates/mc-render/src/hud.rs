@@ -3,10 +3,11 @@
 //! above it, as `Hud.extractPlayerHealth` and `ExperienceBar` do, in GUI pixels (screen
 //! pixels divided by the GUI scale). Also the cracks over a block being mined, as vanilla's crumbling overlay draws
 //! them. Everything samples the block atlas, which holds the HUD's sprites and the font.
-//! Over it all, the death screen, as vanilla's `DeathScreen` and its `TitleConfirmScreen`
+//! Over it all, the inventory (`hud/inventory.rs`) and the death screen, as vanilla's `DeathScreen` and its `TitleConfirmScreen`
 //! lay them out.
 
 pub mod chat;
+pub mod inventory;
 pub mod launcher;
 pub mod menu;
 pub mod pause;
@@ -59,6 +60,7 @@ fn named_sprites() -> Vec<String> {
         .chain(BUTTON)
         .chain(menu::TEXT_FIELD)
         .chain(pause::ICONS)
+        .chain(inventory::SPRITES)
         .map(str::to_owned)
         .collect();
     for i in 0..16 {
@@ -92,6 +94,7 @@ pub(crate) fn sprites() -> Vec<String> {
         .chain(named_sprites().iter().map(|n| gui_sprite(n)))
         .chain(menu::TEXTURES.map(str::to_owned))
         .chain(pause::TEXTURES.map(str::to_owned))
+        .chain(inventory::TEXTURES.map(str::to_owned))
         .collect()
 }
 
@@ -112,6 +115,8 @@ pub struct HudArt {
     white: [f32; 2],
     /// The death screen's English text, by translation key.
     lang: HashMap<String, String>,
+    /// Each item's name key and rarity, by item, for tooltips.
+    item_names: HashMap<String, (String, String)>,
 }
 
 impl HudArt {
@@ -174,6 +179,7 @@ impl HudArt {
                     menu::TEXTURES
                         .into_iter()
                         .chain(pause::TEXTURES)
+                        .chain(inventory::TEXTURES)
                         .map(|id| (id.to_owned(), atlas.sprite(id).rect)),
                 )
                 .collect(),
@@ -182,8 +188,22 @@ impl HudArt {
                 [(u0 + u1) / 2.0, (v0 + v1) / 2.0]
             },
             lang: gui_lang(res)?,
+            item_names: item_names()?,
         })
     }
+}
+
+/// Each item's name key and rarity, from the `items.json` report (`[key, max stack, rarity,
+/// slot]`).
+fn item_names() -> Result<HashMap<String, (String, String)>> {
+    let path = mc_registry::default_reports_dir().join("items.json");
+    let items: HashMap<String, (String, i32, String, Option<String>)> = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("{}", path.display()))?,
+    )?;
+    Ok(items
+        .into_iter()
+        .map(|(item, (key, _, rarity, _))| (item, (key, rarity)))
+        .collect())
 }
 
 /// The English translations of the keys the death screen and the menus use.
@@ -204,6 +224,9 @@ fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
                 "disconnect.",
                 "gui.",
                 "options.",
+                "container.",
+                "item.",
+                "block.",
             ]
             .iter()
             .any(|p| k.starts_with(p))
@@ -269,6 +292,8 @@ pub enum Screen {
     Menu(menu::Menu),
     /// Drawn over the HUD rather than instead of it.
     Pause(pause::Pause),
+    /// Drawn over the HUD too.
+    Inventory(inventory::Inventory),
     Launcher(launcher::Launcher),
 }
 
@@ -406,12 +431,8 @@ impl GuiMesh {
         );
     }
 
-    /// `Font.drawString` with its shadow: one GUI pixel down and right, a quarter as bright.
-    fn text(&mut self, art: &HudArt, text: &str, x: f32, y: f32, rgb: [f32; 3]) {
-        self.shadowed(art, text, x, y, TEXT, 1.0, rgb);
-    }
-
-    /// Text with its shadow at depth `z`, `scale` times its size.
+    /// `Font.drawString` with its shadow (one GUI pixel down and right, a quarter as bright),
+    /// at depth `z`, `scale` times its size.
     #[allow(clippy::too_many_arguments)]
     fn shadowed(
         &mut self,
@@ -462,12 +483,12 @@ impl GuiMesh {
             .sum()
     }
 
-    /// An item's icon in the 16 × 16 slot whose top left is `x`, `y`.
-    fn item(&mut self, icon: &ItemIcon, x: f32, y: f32) {
+    /// An item's icon in the 16 × 16 slot whose top left is `x`, `y`, around depth `z`.
+    fn item(&mut self, icon: &ItemIcon, x: f32, y: f32, z: f32) {
         match icon {
             ItemIcon::Flat(layers) => {
                 for (i, &(rect, [r, g, b])) in layers.iter().enumerate() {
-                    self.blit(x, y, i as f32 * 0.01, 16.0, 16.0, rect, [r, g, b, 1.0]);
+                    self.blit(x, y, z + i as f32 * 0.01, 16.0, 16.0, rect, [r, g, b, 1.0]);
                 }
             }
             ItemIcon::Model {
@@ -489,7 +510,7 @@ impl GuiMesh {
                     t + r * (Vec3::from(gui.scale) * (p - Vec3::splat(0.5)))
                 };
                 let place =
-                    |v: Vec3| Vec3::new(x + 8.0 + v.x * 16.0, y + 8.0 - v.y * 16.0, v.z * 16.0);
+                    |v: Vec3| Vec3::new(x + 8.0 + v.x * 16.0, y + 8.0 - v.y * 16.0, z + v.z * 16.0);
                 let lights = item_lights(*front_lit);
                 let mut quads: Vec<PlacedQuad> = model
                     .quads
@@ -529,6 +550,35 @@ impl GuiMesh {
                     self.quad(corners, uv, color);
                 }
             }
+        }
+    }
+}
+
+impl GuiMesh {
+    /// `GuiGraphics.renderItem` and `renderItemDecorations`: an item kept inside its 16 × 16
+    /// slot at `x`, `y` around depth `z`, then its count, right-aligned, at `text_z`.
+    #[allow(clippy::too_many_arguments)]
+    fn slot_item(
+        &mut self,
+        art: &HudArt,
+        name: &str,
+        count: i32,
+        x: f32,
+        y: f32,
+        z: f32,
+        text_z: f32,
+    ) {
+        if let Some(icon) = art.items.get(name) {
+            let start = (self.vertices.len() / 4) as u32;
+            self.item(icon, x, y, z);
+            let end = (self.vertices.len() / 4) as u32;
+            self.clips.push((start..end, [x, y, 16.0, 16.0]));
+        }
+        if count != 1 {
+            let text = count.to_string();
+            let w = GuiMesh::text_width(art, &text);
+            let (tx, ty) = (x + 19.0 - 2.0 - w, y + 6.0 + 3.0);
+            self.shadowed(art, &text, tx, ty, text_z, 1.0, [1.0; 3]);
         }
     }
 }
@@ -590,18 +640,7 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
             center - 90.0 + slot as f32 * 20.0 + 2.0,
             bottom - 16.0 - 3.0,
         );
-        if let Some(icon) = art.items.get(name) {
-            let start = (mesh.vertices.len() / 4) as u32;
-            mesh.item(icon, x, y);
-            let end = (mesh.vertices.len() / 4) as u32;
-            mesh.clips.push((start..end, [x, y, 16.0, 16.0]));
-        }
-        // `GuiGraphics.renderItemDecorations`: the count, right-aligned in the slot.
-        if *count != 1 {
-            let text = count.to_string();
-            let w = GuiMesh::text_width(art, &text);
-            mesh.text(art, &text, x + 19.0 - 2.0 - w, y + 6.0 + 3.0, [1.0; 3]);
-        }
+        mesh.slot_item(art, name, *count, x, y, 0.0, TEXT);
     }
     if let Some(vitals) = &hotbar.vitals {
         mesh.vitals(art, vitals, width as i32, height as i32);

@@ -66,8 +66,16 @@ pub enum Event {
     },
     /// The server selected this hotbar slot (0 to 8), such as after picking a block.
     HeldSlot(u8),
-    /// Hotbar slots (0 to 8) now hold these items: name and count, or nothing.
-    Hotbar(Vec<(u8, Option<(String, i32)>)>),
+    /// Slots of the player's inventory menu (`InventoryMenu`: 0 the crafting result, 1 to 4
+    /// the grid, 5 to 8 armour, 9 to 35 the inventory, 36 to 44 the hotbar, 45 the
+    /// offhand) now hold these items: name and count, or nothing. With the state id the
+    /// server numbers the menu's changes by, when the packet has one.
+    Inventory {
+        state_id: Option<i32>,
+        slots: Vec<(u8, Option<(String, i32)>)>,
+    },
+    /// The item held on the mouse cursor in an open inventory.
+    Carried(Option<(String, i32)>),
     /// Another player's mining of a block: their entity id, the block, and the crack stage
     /// (0 to 9), or `None` once they stop.
     Destruction {
@@ -587,43 +595,65 @@ fn play(
             "container_set_content" => {
                 // The player's inventory menu is container 0: crafting result and grid (0 to
                 // 4), armour (5 to 8), the inventory (9 to 35), then the hotbar (36 to 44).
+                // Only the player's inventory menu, container 0, is open in this game.
                 let container = r.varint()?;
-                r.varint()?; // state id
-                let mut slots = Vec::new();
-                if container == 0 {
-                    for slot in 0..r.count()? {
-                        // A stack whose data this can't read ends the list early.
-                        let Some(stack) = item_stack(&mut r, registry).ok() else {
-                            break;
-                        };
-                        if (36..45).contains(&slot) {
-                            slots.push(((slot - 36) as u8, stack));
-                        }
-                    }
+                let state_id = r.varint()?;
+                if container != 0 {
+                    continue;
                 }
-                tx.send(Event::Hotbar(slots)).is_ok()
+                let mut slots = Vec::new();
+                let mut whole = true;
+                for slot in 0..r.count()? {
+                    // A stack whose data this can't read ends the list early.
+                    let Some(stack) = item_stack(&mut r, registry).ok() else {
+                        whole = false;
+                        break;
+                    };
+                    slots.push((slot as u8, stack));
+                }
+                let sent = tx
+                    .send(Event::Inventory {
+                        state_id: Some(state_id),
+                        slots,
+                    })
+                    .is_ok();
+                match whole.then(|| item_stack(&mut r, registry)) {
+                    Some(Ok(carried)) => sent && tx.send(Event::Carried(carried)).is_ok(),
+                    _ => sent,
+                }
             }
             "container_set_slot" => {
                 let container = r.varint()?;
-                r.varint()?; // state id
+                let state_id = r.varint()?;
                 let slot = r.i16()?;
-                let changed = (container == 0 && (36..45).contains(&slot))
-                    .then(|| {
-                        Ok::<_, anyhow::Error>(((slot - 36) as u8, item_stack(&mut r, registry)?))
-                    })
-                    .transpose()?;
-                tx.send(Event::Hotbar(changed.into_iter().collect()))
-                    .is_ok()
+                if container != 0 || !(0..46).contains(&slot) {
+                    continue;
+                }
+                tx.send(Event::Inventory {
+                    state_id: Some(state_id),
+                    slots: vec![(slot as u8, item_stack(&mut r, registry)?)],
+                })
+                .is_ok()
             }
+            "set_cursor_item" => tx
+                .send(Event::Carried(item_stack(&mut r, registry)?))
+                .is_ok(),
             "set_player_inventory" => {
-                // An `Inventory` index, where the hotbar is 0 to 8.
+                // An `Inventory` index: the hotbar 0 to 8, the rest 9 to 35, armour from
+                // the feet up 36 to 39 and the offhand 40, as the menu's slots hold them.
                 let slot = r.varint()?;
-                let changed = (0..9)
-                    .contains(&slot)
-                    .then(|| Ok::<_, anyhow::Error>((slot as u8, item_stack(&mut r, registry)?)))
-                    .transpose()?;
-                tx.send(Event::Hotbar(changed.into_iter().collect()))
-                    .is_ok()
+                let menu_slot = match slot {
+                    0..9 => slot + 36,
+                    9..36 => slot,
+                    36..40 => 44 - slot,
+                    40 => 45,
+                    _ => continue,
+                };
+                tx.send(Event::Inventory {
+                    state_id: None,
+                    slots: vec![(menu_slot as u8, item_stack(&mut r, registry)?)],
+                })
+                .is_ok()
             }
             "block_destruction" => {
                 let id = r.varint()?;

@@ -56,7 +56,8 @@ fn version_info(version: &str) -> Result<Value> {
 /// Runs vanilla's data generator on the server jar and copies the reports we use into
 /// `resources/reports/`: every block's properties and state ids, every registry's protocol
 /// ids, and every packet's id in each protocol state. Vanilla defines these in code, so
-/// they aren't in the data packs. `source.json` records the protocol version. It also
+/// they aren't in the data packs. `items.json` condenses the items' default components to
+/// what the inventory needs (see `item_report`). `source.json` records the protocol version. It also
 /// runs `xtask/java/DumpPhysics.java` on the unpacked server for `physics.json`: every state's
 /// collision shape and the blocks' friction, speed and jump factors. Needs a JDK's `java`
 /// (the version's Java, 25 for 26.3) on PATH, or set JAVA to its path.
@@ -84,6 +85,10 @@ fn gen_reports(version: &str) -> Result<()> {
             &std::fs::read(work.join("out/reports").join(name))?,
         )?;
     }
+    write(
+        &reports.join("items.json"),
+        item_report(&work.join("out/reports/minecraft/components/item"))?.as_bytes(),
+    )?;
     // The data generator unpacked the server and its libraries; run the dumper on them.
     let mut classpath = Vec::new();
     collect_jars(&work.join("versions"), &mut classpath)?;
@@ -118,10 +123,34 @@ fn gen_reports(version: &str) -> Result<()> {
         serde_json::to_string_pretty(&source)?.as_bytes(),
     )?;
     println!(
-        "resources/reports/: {} from the {version} data generator, and physics.json",
+        "resources/reports/: {} and items.json from the {version} data generator, and physics.json",
         REPORTS.join(", ")
     );
     Ok(())
+}
+
+/// Each item's `[name key, max stack size, rarity, equipment slot or null]`, from the
+/// components report's file per item, sorted by name.
+fn item_report(dir: &Path) -> Result<String> {
+    let mut items = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_stem().context("item file")?.to_string_lossy();
+        let json: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let c = &json["components"];
+        let entry = serde_json::json!([
+            c["minecraft:item_name"]["translate"],
+            c["minecraft:max_stack_size"],
+            c["minecraft:rarity"],
+            c["minecraft:equippable"]["slot"],
+        ]);
+        items.insert(format!("minecraft:{name}"), entry.to_string());
+    }
+    let lines: Vec<String> = items
+        .iter()
+        .map(|(k, v)| format!("  \"{k}\": {v}"))
+        .collect();
+    Ok(format!("{{\n{}\n}}\n", lines.join(",\n")))
 }
 
 fn collect_jars(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {

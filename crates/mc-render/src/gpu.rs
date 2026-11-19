@@ -746,7 +746,11 @@ impl Renderer {
             (Some(crate::hud::Screen::Launcher(launcher)), ..) => {
                 crate::hud::launcher::launcher(&self.hud_art, launcher, gui_width, gui_height)
             }
-            (None | Some(crate::hud::Screen::Pause(_)), Some(hotbar), true) => crate::hud::hotbar(
+            (
+                None | Some(crate::hud::Screen::Pause(_) | crate::hud::Screen::Inventory(_)),
+                Some(hotbar),
+                true,
+            ) => crate::hud::hotbar(
                 &self.hud_art,
                 hotbar,
                 width.div_ceil(scale),
@@ -754,8 +758,13 @@ impl Renderer {
             ),
             _ => Default::default(),
         };
-        if let Some(crate::hud::Screen::Pause(pause)) = &self.screen {
-            gui_mesh.pause(&self.hud_art, pause, gui_width as i32, gui_height as i32);
+        let (gw, gh) = (gui_width as i32, gui_height as i32);
+        match &self.screen {
+            Some(crate::hud::Screen::Pause(pause)) => gui_mesh.pause(&self.hud_art, pause, gw, gh),
+            Some(crate::hud::Screen::Inventory(inv)) => {
+                gui_mesh.inventory(&self.hud_art, inv, gw, gh)
+            }
+            _ => {}
         }
         let gui_buffer = self.quads_buffer("gui", &gui_mesh.vertices);
 

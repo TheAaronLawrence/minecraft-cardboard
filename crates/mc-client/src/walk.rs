@@ -110,8 +110,8 @@ pub struct Walker {
     miss_time: u32,
     /// Numbers each action the server acknowledges.
     sequence: i32,
-    /// What the hotbar holds.
-    hotbar: [Option<(String, i32)>; 9],
+    /// The inventory, whose last row is the hotbar.
+    inventory: crate::inventory::Inventory,
     /// Other players mining blocks, by entity id: the block and crack stage.
     others_mining: HashMap<i32, (IVec3, u8)>,
     /// Presses not yet handled, by `Click`.
@@ -247,7 +247,7 @@ impl Walker {
             right_click_delay: 0,
             miss_time: 0,
             sequence: 0,
-            hotbar: Default::default(),
+            inventory: crate::inventory::Inventory::new(registry),
             others_mining: HashMap::new(),
             clicks: [0; 3],
             airs,
@@ -347,11 +347,10 @@ impl Walker {
             mc_protocol::Event::HeldSlot(slot) => {
                 (self.selected, self.sent_selected) = (slot, slot)
             }
-            mc_protocol::Event::Hotbar(slots) => {
-                for (slot, item) in slots {
-                    self.hotbar[slot as usize] = item;
-                }
+            mc_protocol::Event::Inventory { state_id, slots } => {
+                self.inventory.set(state_id, slots)
             }
+            mc_protocol::Event::Carried(stack) => self.inventory.carried = stack,
             mc_protocol::Event::Destruction { id, pos, stage } => match stage {
                 Some(stage) => {
                     self.others_mining.insert(id, (IVec3::from(pos), stage));
@@ -443,6 +442,76 @@ impl Walker {
         }
     }
 
+    pub fn inventory_open(&self) -> bool {
+        self.inventory.is_open()
+    }
+
+    /// E: `InventoryScreen` (a creative player gets it too, as the creative inventory
+    /// isn't built yet).
+    pub fn open_inventory(&mut self) {
+        if !self.dead() {
+            self.inventory.open();
+        }
+    }
+
+    /// E or Esc, or dying (`AbstractContainerScreen.tick`).
+    pub fn close_inventory(&mut self) {
+        if let Err(e) = self.inventory.close(&self.outbox) {
+            eprintln!("closing the inventory: {e:#}");
+        }
+    }
+
+    /// A mouse button (0 left, 1 right, 2 middle) pressed or released at `mouse` in a GUI
+    /// `width` × `height`.
+    pub fn inventory_mouse(
+        &mut self,
+        button: u8,
+        down: bool,
+        shift: bool,
+        mouse: [f32; 2],
+        width: i32,
+        height: i32,
+    ) {
+        use mc_render::hud::inventory::{outside, slot_at};
+        let (hovered, outside) = (slot_at(width, height, mouse), outside(width, height, mouse));
+        let creative = self.game_mode == 1;
+        let result = if down {
+            self.inventory
+                .mouse_down(&self.outbox, button, shift, hovered, outside, creative)
+        } else {
+            self.inventory
+                .mouse_up(&self.outbox, button, shift, hovered, outside, creative)
+        };
+        if let Err(e) = result {
+            eprintln!("inventory click: {e:#}");
+        }
+    }
+
+    pub fn inventory_drag(&mut self, mouse: [f32; 2], width: i32, height: i32) {
+        self.inventory
+            .mouse_moved(mc_render::hud::inventory::slot_at(width, height, mouse));
+    }
+
+    pub fn inventory_key(
+        &mut self,
+        key: crate::inventory::InventoryKey,
+        mouse: Option<[f32; 2]>,
+        width: i32,
+        height: i32,
+    ) {
+        let hovered = mouse.and_then(|m| mc_render::hud::inventory::slot_at(width, height, m));
+        if let Err(e) = self
+            .inventory
+            .key(&self.outbox, key, hovered, self.game_mode == 1)
+        {
+            eprintln!("inventory key: {e:#}");
+        }
+    }
+
+    pub fn inventory_view(&self, mouse: Option<[f32; 2]>) -> mc_render::hud::inventory::Inventory {
+        self.inventory.view(mouse)
+    }
+
     /// `ChatScreen.handleChatInput`: a `/` command, or else a chat message.
     pub fn send_chat(&self, message: &str) -> anyhow::Result<()> {
         match message.strip_prefix('/') {
@@ -504,7 +573,7 @@ impl Walker {
             xp_level: self.xp_level,
         });
         mc_render::hud::Hotbar {
-            slots: self.hotbar.clone(),
+            slots: std::array::from_fn(|i| self.inventory.slots[36 + i].clone()),
             selected: self.selected,
             vitals,
             death: self.death_screen(),
@@ -581,6 +650,9 @@ impl Walker {
                 death.ticks += 1;
             }
             self.previous = self.player.pos;
+            if self.dead() && self.inventory.is_open() {
+                self.close_inventory();
+            }
             if self.dead() {
                 // `Minecraft.tick`: a dead player with no screen gets the death screen
                 // (`Gui.setScreen(null)`), or respawns at once when it isn't shown.

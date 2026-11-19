@@ -56,6 +56,8 @@ and double-tap Space to fly where the server allows it. Only offline-mode server
 (`online-mode=false`) work so far. Swimming isn't simulated yet. In survival the HUD shows
 hearts, food and experience, and dying opens the death screen. The chat shows the
 server's and other players' messages; T opens it to type one, and / to type a command.
+E opens the inventory: click, right-click, shift-click, drag, double-click and 1 to 9 move
+items as in vanilla, and the server keeps what you do.
 
 ```sh
 cargo build --release -p mc-client && cargo run --release -p mc-launcher

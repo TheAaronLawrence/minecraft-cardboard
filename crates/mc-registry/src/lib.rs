@@ -24,6 +24,21 @@ pub struct Registry {
     block_entity_types: Vec<String>,
     /// Indexed by data component type id.
     component_types: Vec<String>,
+    /// What the inventory needs to know of each item, by name.
+    item_info: HashMap<String, ItemInfo>,
+}
+
+/// An item's default components that matter to the inventory, from `items.json`.
+#[derive(Debug, Clone)]
+pub struct ItemInfo {
+    /// Its name's translation key, such as `block.minecraft.stone`.
+    pub name: String,
+    /// How many stack in one slot (`max_stack_size`).
+    pub max_stack: i32,
+    /// `Rarity`: `common`, `uncommon`, `rare` or `epic`, which colours its name.
+    pub rarity: String,
+    /// The `EquipmentSlot` it's worn in (`equippable`), such as `head` or `offhand`.
+    pub slot: Option<String>,
 }
 
 #[derive(Debug)]
@@ -171,7 +186,23 @@ impl Registry {
         let component_types =
             names_by_id(&protocol_ids(&registries, "minecraft:data_component_type")?);
 
+        let item_info: HashMap<String, (String, i32, String, Option<String>)> =
+            read_json(&reports_dir.join("items.json"))?;
+        let item_info = item_info
+            .into_iter()
+            .map(|(item, (name, max_stack, rarity, slot))| {
+                let info = ItemInfo {
+                    name,
+                    max_stack,
+                    rarity,
+                    slot,
+                };
+                (item, info)
+            })
+            .collect();
+
         Ok(Self {
+            item_info,
             block_ids,
             blocks,
             state_blocks,
@@ -216,6 +247,11 @@ impl Registry {
 
     pub fn item_name(&self, id: u32) -> Option<&str> {
         self.items.get(id as usize).map(String::as_str)
+    }
+
+    /// An item's name, stack size, rarity and equipment slot, by its name.
+    pub fn item_info(&self, name: &str) -> Option<&ItemInfo> {
+        self.item_info.get(name)
     }
 
     /// A block entity type's name, such as `minecraft:chest`, from its protocol id.

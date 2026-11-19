@@ -11,7 +11,8 @@
 //! In the window: click to capture the mouse, WASD to move, Space and Shift to go up and
 //! down, Ctrl to fly faster, Esc to pause. On a server, left click mines, right
 //! click places or uses, middle click picks the block, and 1 to 9 or the wheel choose the
-//! hotbar slot. T opens the chat and / opens it to type a command; Enter sends. Dying
+//! hotbar slot. E opens the inventory, where clicks, shift-clicks, drags and 1 to 9 move
+//! items. T opens the chat and / opens it to type a command; Enter sends. Dying
 //! opens the death screen, whose buttons respawn or leave.
 //!
 //! Without `--world` or `--server`, the window opens on the title screen: Singleplayer opens
@@ -26,6 +27,7 @@ use mc_render::bake::BlockModels;
 use mc_render::hud::menu;
 
 mod chat;
+mod inventory;
 mod skins;
 mod stream;
 mod walk;
@@ -319,6 +321,7 @@ fn run() -> Result<()> {
                 focused_at: Instant::now(),
                 paused: false,
                 chat: Default::default(),
+                modifiers: Default::default(),
             };
             if app.start.server.is_some() || app.start.world_given {
                 app.play(app.start.server.clone());
@@ -452,6 +455,8 @@ struct App {
     paused: bool,
     /// The chat on a server, and its screen when open.
     chat: chat::Chat,
+    /// Shift, Ctrl and the like, held now.
+    modifiers: winit::keyboard::ModifiersState,
     view: View,
     state: Option<WindowState>,
     keys: std::collections::HashSet<winit::keyboard::KeyCode>,
@@ -721,6 +726,7 @@ impl App {
             || self.paused
             || screen_open
             || self.chat.is_open()
+            || self.inventory_open()
         {
             return;
         }
@@ -757,6 +763,54 @@ impl App {
             Some(mc_render::hud::pause::Action::Leave) => self.leave_world(menu::Screen::Title),
             _ => {}
         }
+    }
+
+    fn inventory_open(&self) -> bool {
+        self.walker
+            .as_ref()
+            .is_some_and(walk::Walker::inventory_open)
+    }
+
+    /// A key in the open inventory: E or Esc closes it and captures the mouse again; 1 to 9
+    /// and F swap the hovered slot with that hotbar slot or the offhand, and Q throws from
+    /// it (`AbstractContainerScreen.keyPressed`).
+    fn inventory_key(&mut self, event: &winit::event::KeyEvent) {
+        use crate::inventory::InventoryKey;
+        use winit::keyboard::{KeyCode as K, PhysicalKey};
+        let (Some(state), Some(walker)) = (&self.state, &mut self.walker) else {
+            return;
+        };
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        let digits = [
+            K::Digit1,
+            K::Digit2,
+            K::Digit3,
+            K::Digit4,
+            K::Digit5,
+            K::Digit6,
+            K::Digit7,
+            K::Digit8,
+            K::Digit9,
+        ];
+        let key = match code {
+            K::Escape | K::KeyE => {
+                walker.close_inventory();
+                self.captured = state.grab();
+                return;
+            }
+            K::KeyF => InventoryKey::Offhand,
+            K::KeyQ => InventoryKey::Drop {
+                all: self.modifiers.control_key(),
+            },
+            _ => match digits.iter().position(|&d| d == code) {
+                Some(n) => InventoryKey::Hotbar(n as u8),
+                None => return,
+            },
+        };
+        let (width, height, mouse) = state.gui(self.cursor);
+        walker.inventory_key(key, mouse, width, height);
     }
 
     /// A key in the open chat: Enter sends what was typed and closes it, as Esc does,
@@ -839,6 +893,46 @@ impl winit::application::ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = Some([position.x as f32, position.y as f32]);
+                let (width, height, mouse) = state.gui(self.cursor);
+                if let (Some(walker), Some(mouse)) = (&mut self.walker, mouse)
+                    && walker.inventory_open()
+                {
+                    walker.inventory_drag(mouse, width, height);
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::MouseInput {
+                state: pressed,
+                button,
+                ..
+            } if self
+                .walker
+                .as_ref()
+                .is_some_and(walk::Walker::inventory_open) =>
+            {
+                use winit::event::MouseButton;
+                let button = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Right => 1,
+                    MouseButton::Middle => 2,
+                    _ => return,
+                };
+                let (width, height, mouse) = state.gui(self.cursor);
+                let shift = self.modifiers.shift_key();
+                if let (Some(walker), Some(mouse)) = (&mut self.walker, mouse) {
+                    let down = pressed == ElementState::Pressed;
+                    walker.inventory_mouse(button, down, shift, mouse, width, height);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if self
+                    .walker
+                    .as_ref()
+                    .is_some_and(walk::Walker::inventory_open) =>
+            {
+                if event.state == ElementState::Pressed {
+                    self.inventory_key(&event);
+                }
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -946,6 +1040,20 @@ impl winit::application::ApplicationHandler for App {
                         match &mut self.walker {
                             Some(walker) if walker.screen_open() => walker.escape(),
                             _ => self.pause(),
+                        }
+                        return;
+                    }
+                    // `Gui.handleKeybinds`: E opens the inventory.
+                    if code == winit::keyboard::KeyCode::KeyE
+                        && event.state == ElementState::Pressed
+                        && let Some(walker) = &mut self.walker
+                        && !walker.screen_open()
+                    {
+                        walker.open_inventory();
+                        if walker.inventory_open() {
+                            state.release();
+                            (self.captured, self.buttons) = (false, Default::default());
+                            self.keys.clear();
                         }
                         return;
                     }
@@ -1139,7 +1247,11 @@ impl winit::application::ApplicationHandler for App {
                             mouse,
                         },
                     )),
-                    None => None,
+                    None => self
+                        .walker
+                        .as_ref()
+                        .filter(|w| w.inventory_open())
+                        .map(|w| mc_render::hud::Screen::Inventory(w.inventory_view(mouse))),
                 };
                 state.renderer.set_screen(screen);
                 let frame = match state.surface.get_current_texture() {
