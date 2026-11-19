@@ -33,6 +33,16 @@ impl Resources {
             .join(format!("{path}.{extension}"))
     }
 
+    /// `kind` is the folder under `data/<namespace>/`, such as `worldgen/biome`.
+    pub fn data_path(&self, kind: &str, id: &str, extension: &str) -> PathBuf {
+        let (namespace, path) = split_id(id);
+        self.root
+            .join("data")
+            .join(namespace)
+            .join(kind)
+            .join(format!("{path}.{extension}"))
+    }
+
     /// Names of every block with a blockstate file, such as `oak_log`.
     pub fn block_names(&self) -> Result<Vec<String>> {
         let dir = self.root.join("assets/minecraft/blockstates");
@@ -288,7 +298,7 @@ impl TextureRef {
 pub struct Element {
     pub from: [f32; 3],
     pub to: [f32; 3],
-    pub rotation: Option<serde_json::Value>,
+    pub rotation: Option<ElementRotation>,
     #[serde(default = "yes")]
     pub shade: bool,
     pub faces: HashMap<Direction, Face>,
@@ -296,6 +306,39 @@ pub struct Element {
 
 fn yes() -> bool {
     true
+}
+
+/// Angles are in degrees, around `origin` in model units (0..16).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(untagged)]
+pub enum ElementRotation {
+    /// The classic form. `rescale` stretches the element so a 22.5° or 45° face still spans
+    /// the block, as crosses (grass, flowers) do.
+    Axis {
+        origin: [f32; 3],
+        axis: Axis,
+        angle: f32,
+        #[serde(default)]
+        rescale: bool,
+    },
+    /// Newer models: rotations about x, then y, then z.
+    Euler {
+        origin: [f32; 3],
+        #[serde(default)]
+        x: f32,
+        #[serde(default)]
+        y: f32,
+        #[serde(default)]
+        z: f32,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Axis {
+    X,
+    Y,
+    Z,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]

@@ -18,7 +18,8 @@ fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("fetch-assets") => fetch_assets(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
         Some("gen-reports") => gen_reports(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
-        _ => bail!("usage: cargo xtask fetch-assets [version] | gen-reports [version]"),
+        Some("gen-world") => gen_world(args.get(1).map_or(DEFAULT_VERSION, String::as_str)),
+        _ => bail!("usage: cargo xtask fetch-assets|gen-reports|gen-world [version]"),
     }
 }
 
@@ -47,19 +48,8 @@ fn version_info(version: &str) -> Result<Value> {
 /// `java` (the version's Java, 25 for 26.3) on PATH, or set JAVA to its path.
 fn gen_reports(version: &str) -> Result<()> {
     const REPORTS: [&str; 2] = ["blocks.json", "registries.json"];
-    let server = &version_info(version)?["downloads"]["server"];
-    let work = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/gen-reports");
-    if work.exists() {
-        std::fs::remove_dir_all(&work)?;
-    }
-    let jar = work.join("server.jar");
-    write(
-        &jar,
-        &get_verified(str_at(server, "url")?, str_at(server, "sha1")?)?,
-    )?;
-
-    let java = std::env::var("JAVA").unwrap_or_else(|_| "java".into());
-    let status = std::process::Command::new(&java)
+    let (work, server_sha1) = server_workdir(version, "gen-reports")?;
+    let status = java()
         .current_dir(&work)
         .args([
             "-DbundlerMainClass=net.minecraft.data.Main",
@@ -70,7 +60,7 @@ fn gen_reports(version: &str) -> Result<()> {
             "out",
         ])
         .status()
-        .with_context(|| format!("running {java}; install Java or set JAVA"))?;
+        .context("running java; install Java or set JAVA")?;
     ensure!(status.success(), "the data generator failed: {status}");
 
     let reports = resources_dir().join("reports");
@@ -80,8 +70,7 @@ fn gen_reports(version: &str) -> Result<()> {
             &std::fs::read(work.join("out/reports").join(name))?,
         )?;
     }
-    let source =
-        serde_json::json!({ "version": version, "server_jar_sha1": str_at(server, "sha1")? });
+    let source = serde_json::json!({ "version": version, "server_jar_sha1": server_sha1 });
     write(
         &reports.join("source.json"),
         serde_json::to_string_pretty(&source)?.as_bytes(),
@@ -90,6 +79,143 @@ fn gen_reports(version: &str) -> Result<()> {
         "resources/reports/: {} from the {version} data generator",
         REPORTS.join(", ")
     );
+    Ok(())
+}
+
+/// A fresh `target/<name>/` holding the version's server jar, and the jar's SHA-1.
+fn server_workdir(version: &str, name: &str) -> Result<(PathBuf, String)> {
+    let server = &version_info(version)?["downloads"]["server"];
+    let work = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../target")
+        .join(name);
+    if work.exists() {
+        std::fs::remove_dir_all(&work)?;
+    }
+    let sha1 = str_at(server, "sha1")?;
+    write(
+        &work.join("server.jar"),
+        &get_verified(str_at(server, "url")?, sha1)?,
+    )?;
+    Ok((work, sha1.to_owned()))
+}
+
+/// `java` from PATH, or the JAVA environment variable. 26.3 needs Java 25.
+fn java() -> std::process::Command {
+    std::process::Command::new(std::env::var("JAVA").unwrap_or_else(|_| "java".into()))
+}
+
+/// Has the vanilla server generate `fixtures/worlds/test-world`: a fixed seed, 12×12 chunks
+/// around the origin (four region files), and the blocks listed in
+/// `fixtures/worlds/test-world.blocks` placed in the sky, so tests can check our reader
+/// against what vanilla itself saved. Running the server accepts Mojang's EULA.
+fn gen_world(version: &str) -> Result<()> {
+    use std::io::{BufRead, Write};
+    const SEED: &str = "20261119";
+    const RADIUS: i32 = 96; // blocks either side of the origin: 12×12 chunks
+
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/worlds");
+    let placements = std::fs::read_to_string(fixtures.join("test-world.blocks"))?;
+    let (work, _) = server_workdir(version, "gen-world")?;
+    write(&work.join("eula.txt"), b"eula=true\n")?;
+    let properties = format!(
+        "level-seed={SEED}\nonline-mode=false\nspawn-protection=0\nmax-tick-time=-1\n\
+         sync-chunk-writes=true\nserver-port=25599\nenable-rcon=false\npause-when-empty-seconds=-1\n"
+    );
+    write(&work.join("server.properties"), properties.as_bytes())?;
+
+    let mut child = java()
+        .current_dir(&work)
+        .args(["-Xmx1G", "-jar", "server.jar", "--nogui"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("running java; install Java or set JAVA")?;
+    let mut stdin = child.stdin.take().expect("piped");
+    let (lines_tx, lines) = std::sync::mpsc::channel::<String>();
+    let stdout = child.stdout.take().expect("piped");
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            println!("server: {line}");
+            if lines_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    // The first line containing any of `needles`, or an error after ten minutes.
+    let wait_for_any = |needles: &[&str]| -> Result<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = lines
+                .recv_timeout(left)
+                .with_context(|| format!("server never printed {needles:?}"))?;
+            if needles.iter().any(|n| line.contains(n)) {
+                return Ok(line);
+            }
+        }
+    };
+    let wait_for = |needle: &str| wait_for_any(&[needle]).map(drop);
+    let mut send = |command: &str| -> Result<()> { Ok(writeln!(stdin, "{command}")?) };
+
+    wait_for("Done (")?;
+    // Forceloading only queues the chunks. Ask whether each one is loaded (fully generated
+    // and ticking) until all are.
+    send(&format!(
+        "forceload add -{RADIUS} -{RADIUS} {} {}",
+        RADIUS - 1,
+        RADIUS - 1
+    ))?;
+    wait_for("Marked")?;
+    let centers: Vec<(i32, i32)> = (-RADIUS / 16..RADIUS / 16)
+        .flat_map(|cx| (-RADIUS / 16..RADIUS / 16).map(move |cz| (cx * 16 + 8, cz * 16 + 8)))
+        .collect();
+    loop {
+        let mut loaded = 0;
+        for (x, z) in &centers {
+            send(&format!("execute if loaded {x} 0 {z}"))?;
+            loaded +=
+                usize::from(wait_for_any(&["Test passed", "Test failed"])?.contains("passed"));
+        }
+        println!("{loaded}/{} chunks loaded", centers.len());
+        if loaded == centers.len() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(10));
+    }
+    for line in placements
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        send(&format!("setblock {line}"))?;
+        wait_for("Changed the block")?;
+    }
+    send("save-all flush")?;
+    wait_for("Saved the game")?;
+    send("stop")?;
+    ensure!(child.wait()?.success(), "the server exited with an error");
+
+    let out = fixtures.join("test-world");
+    if out.exists() {
+        std::fs::remove_dir_all(&out)?;
+    }
+    // Only what the reader needs: level.dat and the overworld's block data, in vanilla's layout.
+    write(
+        &out.join("level.dat"),
+        &std::fs::read(work.join("world/level.dat"))?,
+    )?;
+    let regions = Path::new("dimensions/minecraft/overworld/region");
+    for entry in std::fs::read_dir(work.join("world").join(regions))? {
+        let path = entry?.path();
+        write(
+            &out.join(regions).join(path.file_name().expect("file")),
+            &std::fs::read(&path)?,
+        )?;
+    }
+    println!("fixtures/worlds/test-world: written");
     Ok(())
 }
 

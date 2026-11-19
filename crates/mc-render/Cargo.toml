@@ -1,0 +1,17 @@
+[package]
+name = "mc-render"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.34"
+image = { version = "0.25", default-features = false, features = ["png"] }
+mc-assets = { path = "../mc-assets" }
+mc-registry = { path = "../mc-registry" }
+mc-world = { path = "../mc-world" }
+pollster = "1"
+serde_json.workspace = true
+wgpu = "30"

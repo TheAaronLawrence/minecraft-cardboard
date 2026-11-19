@@ -1,0 +1,22 @@
+# Blocks `cargo xtask gen-world` places with /setblock: x y z state.
+# Spaced apart in the sky so no block updates another, and limited to blocks that keep the
+# exact state placed (no falling, flowing, scheduled ticks, redstone power changes, or
+# block entities that rewrite their state, like brewing stands).
+# They straddle x = 0 so both the -1 and 0 region files are covered.
+-24 250 1 minecraft:stone
+-21 250 1 minecraft:oak_stairs[facing=west,half=top,shape=outer_left,waterlogged=true]
+-18 250 1 minecraft:oak_log[axis=x]
+-15 250 1 minecraft:chest[facing=east,type=left,waterlogged=false]
+-12 250 1 minecraft:glass_pane[east=true,north=false,south=true,west=false,waterlogged=false]
+-9 250 1 minecraft:cobblestone_wall[east=none,north=low,south=tall,up=false,waterlogged=false,west=none]
+-6 250 1 minecraft:oak_slab[type=top,waterlogged=false]
+-3 250 1 minecraft:grass_block[snowy=true]
+0 250 1 minecraft:lantern[hanging=true,waterlogged=false]
+3 250 1 minecraft:furnace[facing=south,lit=true]
+6 250 1 minecraft:end_rod[facing=down]
+9 250 1 minecraft:cake[bites=3]
+12 250 1 minecraft:oak_sign[rotation=7,waterlogged=false]
+15 250 1 minecraft:smooth_stone_slab[type=double,waterlogged=false]
+18 250 1 minecraft:amethyst_cluster[facing=north,waterlogged=false]
+24 250 -2 minecraft:diamond_block
+24 250 -5 minecraft:cherry_trapdoor[facing=south,half=top,open=true,powered=false,waterlogged=false]
