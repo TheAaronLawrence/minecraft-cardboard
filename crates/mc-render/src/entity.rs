@@ -161,7 +161,8 @@ pub struct EquipmentLayers {
 }
 
 /// Every equipment asset in `assets/*/equipment`, by id, and the sprites their humanoid
-/// layers need.
+/// layers need. Without the folder (unpacked by a launcher older than preview 12), there
+/// are none, and armour isn't drawn.
 pub(crate) fn equipment_assets(
     res: &mc_assets::Resources,
 ) -> anyhow::Result<(HashMap<String, EquipmentLayers>, Vec<String>)> {
@@ -169,7 +170,17 @@ pub(crate) fn equipment_assets(
     let mut sprites = Vec::new();
     let dir = res.asset_path("equipment", "minecraft:x", "json");
     let dir = dir.parent().expect("a file in a folder");
-    for entry in std::fs::read_dir(dir)? {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("no {}, so armour isn't drawn", dir.display());
+            return Ok((assets, sprites));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("reading {}", dir.display())));
+        }
+    };
+    for entry in entries {
         let path = entry?.path();
         let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
             continue;

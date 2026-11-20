@@ -14,6 +14,7 @@ const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manif
 /// What the game reads from the jar, as paths or folders (ending in `/`) in it.
 const WANTED: &[&str] = &[
     "assets/minecraft/blockstates/",
+    "assets/minecraft/equipment/",
     "assets/minecraft/font/include/default.json",
     "assets/minecraft/items/",
     "assets/minecraft/lang/en_us.json",
@@ -22,8 +23,14 @@ const WANTED: &[&str] = &[
     "data/",
 ];
 
-/// Written once the jar's files are unpacked: the jar's SHA-1.
+/// Written once the jar's files are unpacked: what [`marker`] says.
 const MARKER: &str = "mojang.txt";
+
+/// The jar's SHA-1 and the `WANTED` list it was unpacked with, so a launcher that wants
+/// more of the jar unpacks it again.
+fn marker(sha1: &str) -> String {
+    format!("{sha1} {}", WANTED.join(" "))
+}
 
 /// The client jar the release in `dir` was built against, from its `resources/source.json`:
 /// the version and the jar's SHA-1.
@@ -43,7 +50,7 @@ fn source(dir: &Path) -> Result<(String, String)> {
 
 /// Mojang's files for the release in `dir` are unpacked.
 pub fn installed(dir: &Path) -> bool {
-    source(dir).is_ok_and(|(_, sha1)| read_text(&dir.join(MARKER)) == sha1)
+    source(dir).is_ok_and(|(_, sha1)| read_text(&dir.join(MARKER)) == marker(&sha1))
 }
 
 fn get_json(url: &str) -> Result<Value> {
@@ -112,7 +119,7 @@ pub fn install(dir: &Path, step: &mut dyn FnMut(Step)) -> Result<()> {
         }
     }
     unpack(&jar, &resources).context(WRITE_FAILED)?;
-    std::fs::write(dir.join(MARKER), &sha1).context(WRITE_FAILED)?;
+    std::fs::write(dir.join(MARKER), marker(&sha1)).context(WRITE_FAILED)?;
     Ok(())
 }
 
