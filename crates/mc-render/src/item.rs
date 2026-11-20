@@ -15,15 +15,44 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub enum ItemIcon {
     /// Sprite layers drawn one over another, each as its atlas rect and tint.
-    Flat(Vec<([f32; 4], [f32; 3])>),
+    Flat {
+        layers: Vec<([f32; 4], [f32; 3])>,
+        /// How it sits in a mob's right and left hand.
+        hands: [Transform; 2],
+    },
     /// A model drawn in 3D, with a colour per tint index.
     Model {
         model: Arc<BakedModel>,
         tints: Vec<[f32; 3]>,
         gui: Transform,
+        /// How it sits on the ground when dropped.
+        ground: Transform,
         /// Lit from the front (`gui_light: front`) rather than the side.
         front_lit: bool,
+        hands: [Transform; 2],
     },
+}
+
+impl ItemIcon {
+    /// `ItemTransforms`' third person transform for a right (`false`) or left hand.
+    pub fn hand(&self, left: bool) -> Transform {
+        let (ItemIcon::Flat { hands, .. } | ItemIcon::Model { hands, .. }) = self;
+        hands[left as usize]
+    }
+}
+
+/// `ItemTransform.NO_TRANSFORM`.
+const IDENTITY: Transform = Transform {
+    rotation: [0.0; 3],
+    translation: [0.0; 3],
+    scale: [1.0; 3],
+};
+
+/// A model's hand transforms: its left hand's is its right hand's when it has none
+/// (`ItemTransforms.Deserializer`).
+fn hands(model: &Model) -> [Transform; 2] {
+    let right = model.hands[0].unwrap_or(IDENTITY);
+    [right, model.hands[1].unwrap_or(right)]
 }
 
 /// An item's definition, resolved to one model, before the atlas exists.
@@ -137,11 +166,7 @@ pub(crate) fn bake(
 ) -> Result<HashMap<String, ItemIcon>> {
     let mut icons = HashMap::new();
     let mut baked: HashMap<String, Arc<BakedModel>> = HashMap::new();
-    let identity = Transform {
-        rotation: [0.0; 3],
-        translation: [0.0; 3],
-        scale: [1.0; 3],
-    };
+    let identity = IDENTITY;
     for item in items.items {
         let model = &items.models[&item.model];
         let icon = if item.special {
@@ -171,7 +196,9 @@ pub(crate) fn bake(
                 model: block_model.clone(),
                 tints: item.tints,
                 gui: model.gui.unwrap_or(identity),
+                ground: model.ground.unwrap_or(identity),
                 front_lit: model.gui_light_front.unwrap_or(false),
+                hands: hands(model),
             }
         } else if model.generated {
             let layers = (0..)
@@ -184,7 +211,10 @@ pub(crate) fn bake(
                     )
                 })
                 .collect();
-            ItemIcon::Flat(layers)
+            ItemIcon::Flat {
+                layers,
+                hands: hands(model),
+            }
         } else if model.elements.is_some() {
             let model_baked = baked
                 .entry(item.model.clone())
@@ -196,7 +226,9 @@ pub(crate) fn bake(
                 model: model_baked,
                 tints: item.tints,
                 gui: model.gui.unwrap_or(identity),
+                ground: model.ground.unwrap_or(identity),
                 front_lit: model.gui_light_front.unwrap_or(false),
+                hands: hands(model),
             }
         } else {
             continue;

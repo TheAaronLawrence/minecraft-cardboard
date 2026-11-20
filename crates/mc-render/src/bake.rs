@@ -119,6 +119,8 @@ pub struct BlockModels {
     pub hud: crate::hud::HudArt,
     /// The end portal shader's own textures, which it tiles, so they aren't in the atlas.
     pub portal_textures: PortalTextures,
+    /// Armour's layers, by equipment asset (`entity::equipment_assets`).
+    pub equipment: HashMap<String, crate::entity::EquipmentLayers>,
 }
 
 /// `TheEndPortalRenderer`'s two textures: the sky behind, and the stars on every layer.
@@ -189,7 +191,11 @@ impl BlockModels {
         sprites.extend(items.sprites.iter().cloned());
         sprites.extend(crate::hud::sprites());
         sprites.extend(crate::entity_model::sprites(res));
-        let atlas = Atlas::build(res, sprites, extra_sprites)?;
+        let (equipment, equipment_sprites) = crate::entity::equipment_assets(res)?;
+        sprites.extend(equipment_sprites);
+        let mut extra = extra_sprites.to_vec();
+        extra.extend(crate::entity::skin_slots());
+        let atlas = Atlas::build(res, sprites, &extra)?;
 
         let mut baked: HashMap<(String, i32, i32, bool), Arc<BakedModel>> = HashMap::new();
         let mut states = Vec::with_capacity(registry.state_count() as usize);
@@ -239,6 +245,7 @@ impl BlockModels {
             atlas,
             hud,
             portal_textures: PortalTextures::load(res)?,
+            equipment,
         })
     }
 }
@@ -259,6 +266,7 @@ impl BlockModels {
                 sky: blank(),
                 stars: blank(),
             },
+            equipment: HashMap::new(),
         })
     }
 }

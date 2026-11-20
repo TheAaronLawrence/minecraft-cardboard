@@ -64,7 +64,7 @@ fn vs(in: VertexIn) -> VertexOut {
     out.uv = in.uv;
     // Light bytes hold level × 16; the vertex format normalises them to 0..1.
     let light = lightmap(in.light.x * 255.0 / 16.0, in.light.y * 255.0 / 16.0);
-    out.color = vec4<f32>(in.color.rgb * light, 1.0);
+    out.color = vec4<f32>(in.color.rgb * light, in.color.a);
     // Vanilla fogs by cylindrical distance: horizontal, and vertical separately.
     let d = in.pos - u.eye.xyz;
     out.distance = max(length(d.xz), abs(d.y));

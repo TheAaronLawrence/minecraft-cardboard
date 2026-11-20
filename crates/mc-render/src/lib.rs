@@ -4,6 +4,7 @@
 pub mod atlas;
 pub mod bake;
 pub mod chest;
+pub mod entity;
 pub mod entity_model;
 pub mod gpu;
 pub mod hud;

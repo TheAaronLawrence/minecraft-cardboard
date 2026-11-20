@@ -20,6 +20,7 @@ mc-physics = { path = "../mc-physics" }
 mc-protocol = { path = "../mc-protocol" }
 mc-world = { path = "../mc-world" }
 pollster = "1"
+ring = "0.17"
 serde_json.workspace = true
 ureq = { version = "3", features = ["json"] }
 wgpu = "30"

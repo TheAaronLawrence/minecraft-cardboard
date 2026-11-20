@@ -32,7 +32,7 @@ const COLORS: [&str; 16] = [
 ];
 
 /// `DyeColor`'s texture diffuse colours, in `COLORS` order, which banners are tinted with.
-const DYE_RGB: [u32; 16] = [
+pub(crate) const DYE_RGB: [u32; 16] = [
     0xF9FFFE, 0xF9801D, 0xC74EBD, 0x3AB3DA, 0xFED83D, 0x80C71F, 0xF38BAA, 0x474F52, 0x9D9D97,
     0x169C9C, 0x8932B8, 0x3C44AA, 0x835432, 0x5E7C16, 0xB02E26, 0x1D1D21,
 ];
@@ -113,6 +113,7 @@ pub fn sprites(res: &Resources) -> Vec<String> {
     out.extend(SKULLS.iter().map(|(_, s)| s.to_string()));
     out.extend([POT_BASE, POT_SIDE, CONDUIT, PORTAL].map(str::to_owned));
     out.extend(DEFAULT_SKINS.map(str::to_owned));
+    out.extend(crate::entity::SPRITES.map(str::to_owned));
     out.extend(
         ["", "_exposed", "_weathered", "_oxidized"]
             .map(|age| format!("minecraft:entity/copper_golem/copper_golem{age}")),
@@ -136,18 +137,18 @@ fn dye_rgb(color: &str) -> Option<[f32; 3]> {
 }
 
 /// One `addBox`, in model pixels, with its texture offset.
-struct Cube {
-    from: [f32; 3],
-    size: [f32; 3],
-    tex: [f32; 2],
+pub(crate) struct Cube {
+    pub(crate) from: [f32; 3],
+    pub(crate) size: [f32; 3],
+    pub(crate) tex: [f32; 2],
     /// `CubeDeformation`: grows the box on every side without moving its texture.
-    grow: f32,
-    mirror: bool,
+    pub(crate) grow: f32,
+    pub(crate) mirror: bool,
     /// Only this face (an index into `FACES`), as `addBox` with a set of visible faces.
-    only: Option<usize>,
+    pub(crate) only: Option<usize>,
 }
 
-const fn cube(from: [f32; 3], size: [f32; 3], tex: [f32; 2]) -> Cube {
+pub(crate) const fn cube(from: [f32; 3], size: [f32; 3], tex: [f32; 2]) -> Cube {
     Cube {
         from,
         size,
@@ -172,14 +173,14 @@ const NORTH: usize = 3;
 
 /// One part of a model: its parent (an earlier index), `PartPose` offset in pixels and
 /// rotation in radians, and its cubes.
-struct Node {
-    parent: Option<usize>,
-    pose: [f32; 6],
-    cubes: &'static [Cube],
+pub(crate) struct Node {
+    pub(crate) parent: Option<usize>,
+    pub(crate) pose: [f32; 6],
+    pub(crate) cubes: &'static [Cube],
 }
 
 /// `ModelPart.translateAndRotate`: move by the offset in pixels, then turn Z, Y, X.
-fn pose(offset: [f32; 3], rot: [f32; 3]) -> Mat4 {
+pub(crate) fn pose(offset: [f32; 3], rot: [f32; 3]) -> Mat4 {
     Mat4::from_translation(Vec3::from(offset) / 16.0)
         * Mat4::from_quat(
             Quat::from_rotation_z(rot[2])
@@ -189,16 +190,16 @@ fn pose(offset: [f32; 3], rot: [f32; 3]) -> Mat4 {
 }
 
 /// Collects one texture's cubes as block-space quads.
-struct Builder {
-    quads: Vec<Quad>,
-    sprite: Sprite,
-    tex_size: [f32; 2],
-    tint: i32,
+pub(crate) struct Builder {
+    pub(crate) quads: Vec<Quad>,
+    pub(crate) sprite: Sprite,
+    pub(crate) tex_size: [f32; 2],
+    pub(crate) tint: i32,
 }
 
 impl Builder {
     /// Every part's cubes, each placed by its parents' poses under `root`.
-    fn nodes(&mut self, root: Mat4, nodes: &[Node]) {
+    pub(crate) fn nodes(&mut self, root: Mat4, nodes: &[Node]) {
         let mut placed: Vec<Mat4> = Vec::with_capacity(nodes.len());
         for n in nodes {
             let [x, y, z, rx, ry, rz] = n.pose;

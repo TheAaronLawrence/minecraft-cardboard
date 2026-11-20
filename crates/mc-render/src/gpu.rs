@@ -103,10 +103,15 @@ type ChunkBuffers = [Option<(wgpu::Buffer, u32)>; 4];
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// The block and entity atlas, and its full size, for writing sprites into it later.
+    atlas: wgpu::Texture,
+    atlas_size: [u32; 2],
     sky: wgpu::RenderPipeline,
     opaque: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
+    entity: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
+    see_through: wgpu::RenderPipeline,
     portal: wgpu::RenderPipeline,
     outline: wgpu::RenderPipeline,
     crosshair: wgpu::RenderPipeline,
@@ -118,6 +123,13 @@ pub struct Renderer {
     screen: Option<crate::hud::Screen>,
     /// The cracks over blocks being mined, and their index count.
     crack_vertices: Option<(wgpu::Buffer, u32)>,
+    /// Players, mobs and dropped items, and their index count.
+    entity_vertices: Option<(wgpu::Buffer, u32)>,
+    /// Entities' glowing layers, and their index count.
+    eye_vertices: Option<(wgpu::Buffer, u32)>,
+    /// Name tags' see-through parts, and their opaque text, with index counts.
+    see_through_vertices: Option<(wgpu::Buffer, u32)>,
+    tag_vertices: Option<(wgpu::Buffer, u32)>,
     /// The outline around the block the player looks at, and its index count.
     outline_vertices: Option<(wgpu::Buffer, u32)>,
     bind_group: wgpu::BindGroup,
@@ -170,7 +182,7 @@ impl Renderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
@@ -331,70 +343,77 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Unorm8x4, 3 => Unorm8x4],
         });
-        let pipeline =
-            |fragment: &str, blend: Option<wgpu::BlendState>, depth_write: bool, sky: bool| {
-                let portal = fragment == "fs_portal";
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(fragment),
-                    layout: Some(if portal {
-                        &portal_pipeline_layout
+        let pipeline = |fragment: &str,
+                        blend: Option<wgpu::BlendState>,
+                        depth_write: bool,
+                        sky: bool,
+                        cull: bool| {
+            let portal = fragment == "fs_portal";
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(fragment),
+                layout: Some(if portal {
+                    &portal_pipeline_layout
+                } else {
+                    &pipeline_layout
+                }),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(match (sky, portal) {
+                        (true, _) => "vs_sky",
+                        (_, true) => "vs_portal",
+                        _ => "vs",
+                    }),
+                    buffers: if sky {
+                        &[]
                     } else {
-                        &pipeline_layout
-                    }),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some(match (sky, portal) {
-                            (true, _) => "vs_sky",
-                            (_, true) => "vs_portal",
-                            _ => "vs",
-                        }),
-                        buffers: if sky {
-                            &[]
-                        } else {
-                            std::slice::from_ref(&vertex_layout)
-                        },
-                        compilation_options: Default::default(),
+                        std::slice::from_ref(&vertex_layout)
                     },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some(fragment),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: cull.then_some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(if sky {
+                        wgpu::CompareFunction::Always
+                    } else {
+                        wgpu::CompareFunction::LessEqual
                     }),
-                    primitive: wgpu::PrimitiveState {
-                        cull_mode: if sky { None } else { Some(wgpu::Face::Back) },
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: DEPTH_FORMAT,
-                        depth_write_enabled: Some(depth_write),
-                        depth_compare: Some(if sky {
-                            wgpu::CompareFunction::Always
-                        } else {
-                            wgpu::CompareFunction::LessEqual
-                        }),
-                        stencil: Default::default(),
-                        bias: Default::default(),
-                    }),
-                    multisample: Default::default(),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let sky = pipeline("fs_sky", None, false, true);
-        let opaque = pipeline("fs_opaque", None, true, false);
-        let cutout = pipeline("fs_cutout", None, true, false);
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let sky = pipeline("fs_sky", None, false, true, false);
+        let opaque = pipeline("fs_opaque", None, true, false, true);
+        let cutout = pipeline("fs_cutout", None, true, false, true);
+        // `RenderPipelines.ENTITY_CUTOUT`: entities show their boxes' back faces too, which
+        // some textures paint where the front is clear, such as a chicken's legs.
+        let entity = pipeline("fs_cutout", None, true, false, false);
         let translucent = pipeline(
             "fs_translucent",
             Some(wgpu::BlendState::ALPHA_BLENDING),
             false,
             false,
+            true,
         );
-        let portal = pipeline("fs_portal", None, true, false);
+        let portal = pipeline("fs_portal", None, true, false, true);
         let line_layout = Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -462,6 +481,14 @@ impl Renderer {
             wgpu::CompareFunction::Always,
         );
         let vertex_layouts = std::slice::from_ref(&vertex_layout);
+        // `RenderPipelines.TEXT_SEE_THROUGH`: blended over whatever is in front.
+        let see_through = overlay(
+            "vs",
+            "fs_translucent",
+            vertex_layouts,
+            wgpu::BlendState::ALPHA_BLENDING,
+            wgpu::CompareFunction::Always,
+        );
         // The HUD has a depth buffer of its own, so items' faces hide each other.
         let gui = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("gui"),
@@ -543,12 +570,16 @@ impl Renderer {
             cache: None,
         });
         Self {
+            atlas_size: [atlas.width, atlas.height],
+            atlas: texture,
             device,
             queue,
             sky,
             opaque,
             cutout,
+            entity,
             translucent,
+            see_through,
             portal,
             outline,
             crosshair,
@@ -558,6 +589,10 @@ impl Renderer {
             hotbar: None,
             screen: None,
             crack_vertices: None,
+            entity_vertices: None,
+            eye_vertices: None,
+            see_through_vertices: None,
+            tag_vertices: None,
             outline_vertices: None,
             bind_group,
             portal_bind_group,
@@ -631,6 +666,49 @@ impl Renderer {
     /// Draws these crack quads (from `hud::cracks`) over blocks being mined.
     pub fn set_cracks(&mut self, vertices: &[Vertex]) {
         self.crack_vertices = self.quads_buffer("cracks", vertices);
+    }
+
+    /// Draws these entity quads (from `entity::vertices`) after the cutout blocks.
+    pub fn set_entities(&mut self, meshes: &crate::entity::Meshes) {
+        self.entity_vertices = self.quads_buffer("entities", &meshes.cutout);
+        self.eye_vertices = self.quads_buffer("entity eyes", &meshes.eyes);
+        self.see_through_vertices = self.quads_buffer("name tags behind", &meshes.see_through);
+        self.tag_vertices = self.quads_buffer("name tags", &meshes.tags);
+    }
+
+    /// Replaces a sprite's pixels in the atlas, mipmaps and all, such as a skin slot's
+    /// (`entity::skin_slot`) with a downloaded skin. `img` must be the sprite's size.
+    pub fn write_sprite(&self, sprite: crate::atlas::Sprite, img: &image::RgbaImage) {
+        let [w, h] = self.atlas_size;
+        let x = (sprite.rect[0] * w as f32).round() as u32;
+        let y = (sprite.rect[1] * h as f32).round() as u32;
+        let levels = self.atlas.mip_level_count() - 1;
+        let mips = crate::mipmap::generate(img.clone(), crate::mipmap::Strategy::Auto, 0.0, levels);
+        for (level, mip) in mips.iter().enumerate() {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.atlas,
+                    mip_level: level as u32,
+                    origin: wgpu::Origin3d {
+                        x: x >> level,
+                        y: y >> level,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                mip.as_raw(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(mip.width() * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: mip.width(),
+                    height: mip.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     /// A vertex buffer of whole quads and its index count, growing the index buffer to fit.
@@ -817,6 +895,39 @@ impl Renderer {
                         if let Some((buffer, count)) = &self.chunks[key][slot] {
                             pass.set_vertex_buffer(0, buffer.slice(..));
                             pass.draw_indexed(0..*count, 0, 0..1);
+                        }
+                    }
+                    // Entities are cutout too, and go before anything translucent covers
+                    // them.
+                    if slot == 1
+                        && let Some((buffer, count)) = &self.entity_vertices
+                    {
+                        pass.set_pipeline(&self.entity);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                    // `RenderPipelines.EYES`: blended over the bodies, fully bright, without
+                    // writing depth.
+                    if slot == 1
+                        && let Some((buffer, count)) = &self.eye_vertices
+                    {
+                        pass.set_pipeline(&self.translucent);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                    // Name tags: their text where nothing hides it (`RenderPipelines.TEXT`),
+                    // then their see-through parts over everything so far, the text too, as
+                    // vanilla's see-through phase comes after the solid one.
+                    if slot == 1 {
+                        for (pipeline, vertices) in [
+                            (&self.entity, &self.tag_vertices),
+                            (&self.see_through, &self.see_through_vertices),
+                        ] {
+                            if let Some((buffer, count)) = vertices {
+                                pass.set_pipeline(pipeline);
+                                pass.set_vertex_buffer(0, buffer.slice(..));
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
                         }
                     }
                 }

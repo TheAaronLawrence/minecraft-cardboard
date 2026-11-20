@@ -90,6 +90,8 @@ impl Resources {
             ambient_occlusion: None,
             generated: false,
             gui: None,
+            ground: None,
+            hands: [None; 2],
             gui_light_front: None,
         };
         let mut next = Some(id.to_owned());
@@ -113,8 +115,12 @@ impl Resources {
                 model.elements = raw.elements;
             }
             model.ambient_occlusion = model.ambient_occlusion.or(raw.ambientocclusion);
-            if model.gui.is_none() {
-                model.gui = raw.display.and_then(|mut d| d.remove("gui"));
+            if let Some(mut display) = raw.display {
+                model.gui = model.gui.or_else(|| display.remove("gui"));
+                model.ground = model.ground.or_else(|| display.remove("ground"));
+                for (hand, key) in model.hands.iter_mut().zip(HAND_KEYS) {
+                    *hand = hand.or_else(|| display.remove(key));
+                }
             }
             if model.gui_light_front.is_none() {
                 model.gui_light_front = raw.gui_light.map(|l| l == "front");
@@ -261,6 +267,8 @@ fn one() -> u32 {
     1
 }
 
+const HAND_KEYS: [&str; 2] = ["thirdperson_righthand", "thirdperson_lefthand"];
+
 #[derive(Deserialize)]
 struct RawModel {
     parent: Option<String>,
@@ -284,6 +292,11 @@ pub struct Model {
     pub generated: bool,
     /// How an item drawn with this model sits in an inventory slot (`display.gui`).
     pub gui: Option<Transform>,
+    /// How a dropped item with this model sits on the ground (`display.ground`).
+    pub ground: Option<Transform>,
+    /// How it sits in a mob's right and left hand (`display.thirdperson_righthand` and
+    /// `thirdperson_lefthand`).
+    pub hands: [Option<Transform>; 2],
     /// `gui_light`: lit from the front, as flat items are, rather than from the side as
     /// blocks are. `None` when no model in the chain says, which means side.
     pub gui_light_front: Option<bool>,

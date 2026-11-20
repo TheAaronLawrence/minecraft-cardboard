@@ -130,7 +130,8 @@ fn gen_reports(version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Each item's `[name key, max stack size, rarity, equipment slot or null]`, from the
+/// Each item's `[name key, max stack size, rarity, equipment slot or null, equipment
+/// asset or null]`, from the
 /// components report's file per item, sorted by name.
 fn item_report(dir: &Path) -> Result<String> {
     let mut items = std::collections::BTreeMap::new();
@@ -144,6 +145,7 @@ fn item_report(dir: &Path) -> Result<String> {
             c["minecraft:max_stack_size"],
             c["minecraft:rarity"],
             c["minecraft:equippable"]["slot"],
+            c["minecraft:equippable"]["asset_id"],
         ]);
         items.insert(format!("minecraft:{name}"), entry.to_string());
     }

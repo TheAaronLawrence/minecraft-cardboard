@@ -57,6 +57,62 @@ impl mc_physics::World for Collision {
     }
 }
 
+/// A section's sky and block light, each 4 bits a block, or `None` when the server hasn't
+/// sent that layer.
+pub type SectionLight = [Option<Box<[u8; 2048]>>; 2];
+
+/// The server's light, by chunk, then section y: a copy of what the streaming thread keeps
+/// for meshing, which entities are lit by.
+#[derive(Default)]
+struct Light {
+    chunks: HashMap<(i32, i32), HashMap<i32, SectionLight>>,
+}
+
+impl Light {
+    /// Sets these sections' light; a layer left out keeps what it had, unless `whole`
+    /// replaces the chunk's light.
+    fn set(&mut self, key: (i32, i32), sections: Vec<(i32, SectionLight)>, whole: bool) {
+        let chunk = self.chunks.entry(key).or_default();
+        if whole {
+            chunk.clear();
+        }
+        for (y, layers) in sections {
+            let section = chunk.entry(y).or_default();
+            for (old, new) in section.iter_mut().zip(layers) {
+                if new.is_some() {
+                    *old = new;
+                }
+            }
+        }
+    }
+
+    /// Sky and block light at a block, read as `WorldView.light` reads it: a section
+    /// without sky light takes it from the nearest section above that has some, and above
+    /// them all it's 15. Outside the loaded chunks it's full sky light.
+    fn at(&self, [x, y, z]: [i32; 3]) -> [u8; 2] {
+        let Some(sections) = self.chunks.get(&(x.div_euclid(16), z.div_euclid(16))) else {
+            return [15, 0];
+        };
+        let (lx, lz) = (x.rem_euclid(16) as usize, z.rem_euclid(16) as usize);
+        let section_y = y.div_euclid(16);
+        let read = |section: i32, layer: usize, ly: usize| {
+            let light = sections.get(&section)?[layer].as_deref()?;
+            Some(mc_world::nibble(light, lx, ly, lz))
+        };
+        let ly = y.rem_euclid(16) as usize;
+        let sky = read(section_y, 0, ly).unwrap_or_else(|| {
+            let mut above: Vec<i32> = sections
+                .keys()
+                .copied()
+                .filter(|&s| s > section_y)
+                .collect();
+            above.sort_unstable();
+            above.into_iter().find_map(|s| read(s, 0, 0)).unwrap_or(15)
+        });
+        [sky, read(section_y, 1, ly).unwrap_or(0)]
+    }
+}
+
 /// The mouse buttons held: attack (left) and use (right).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Buttons {
@@ -85,6 +141,7 @@ pub struct Walker {
     placed: bool,
     since_tick: f32,
     collision: Collision,
+    light: Light,
     blocks: BlockPhysics,
     outbox: mc_protocol::Outbox,
     entity_id: i32,
@@ -114,6 +171,12 @@ pub struct Walker {
     inventory: crate::inventory::Inventory,
     /// Other players mining blocks, by entity id: the block and crack stage.
     others_mining: HashMap<i32, (IVec3, u8)>,
+    /// Other players, mobs and dropped items.
+    entities: crate::entities::Entities,
+    /// Downloads players' skins as they join the tab list.
+    skins: crate::skins::Loader,
+    /// Which player's skin each of the atlas's skin slots holds.
+    skin_slots: [Option<u128>; mc_render::entity::SKIN_SLOTS],
     /// Presses not yet handled, by `Click`.
     clicks: [u32; 3],
     /// Air, cave air and void air.
@@ -228,6 +291,7 @@ impl Walker {
                 chunks: HashMap::new(),
                 air,
             },
+            light: Light::default(),
             blocks: BlockPhysics::vanilla(registry)?,
             outbox,
             entity_id: 0,
@@ -249,6 +313,9 @@ impl Walker {
             sequence: 0,
             inventory: crate::inventory::Inventory::new(registry),
             others_mining: HashMap::new(),
+            entities: crate::entities::Entities::new(registry),
+            skins: crate::skins::Loader::new(),
+            skin_slots: [None; mc_render::entity::SKIN_SLOTS],
             clicks: [0; 3],
             airs,
             game_mode: 0,
@@ -277,9 +344,19 @@ impl Walker {
 
     pub fn chunk(&mut self, key: (i32, i32), blocks: Option<Vec<(i32, Blocks)>>) {
         match blocks {
-            Some(b) => self.collision.chunks.insert(key, b),
-            None => self.collision.chunks.remove(&key),
-        };
+            Some(b) => {
+                self.collision.chunks.insert(key, b);
+            }
+            None => {
+                self.collision.chunks.remove(&key);
+                self.light.chunks.remove(&key);
+            }
+        }
+    }
+
+    /// The server's light for these sections of a chunk; `whole` replaces all it had.
+    pub fn light(&mut self, key: (i32, i32), sections: Vec<(i32, SectionLight)>, whole: bool) {
+        self.light.set(key, sections, whole);
     }
 
     /// The server changed these blocks.
@@ -290,7 +367,29 @@ impl Walker {
     }
 
     pub fn server_event(&mut self, event: mc_protocol::Event) {
+        let Some(event) = self.entities.event(event) else {
+            return;
+        };
         match event {
+            mc_protocol::Event::AddPlayers(profiles) => {
+                for profile in profiles {
+                    self.entities.set_name(profile.uuid, Some(profile.name));
+                    if let Some(textures) = profile.textures {
+                        self.skins.request(profile.uuid, textures);
+                    }
+                }
+            }
+            mc_protocol::Event::RemovePlayers(ids) => {
+                for uuid in ids {
+                    for slot in &mut self.skin_slots {
+                        if *slot == Some(uuid) {
+                            *slot = None;
+                        }
+                    }
+                    self.entities.set_skin(uuid, None);
+                    self.entities.set_name(uuid, None);
+                }
+            }
             mc_protocol::Event::Login {
                 entity_id,
                 hardcore,
@@ -361,6 +460,34 @@ impl Walker {
             },
             _ => {}
         }
+    }
+
+    /// The entities to draw this frame, between the last tick and the next.
+    pub fn entities(&self) -> Vec<mc_render::entity::Lit> {
+        self.entities.render(self.since_tick / TICK, |p| {
+            self.light.at(p.floor().as_ivec3().to_array())
+        })
+    }
+
+    /// Skins that have arrived since the last call, each with the atlas sprite it now has,
+    /// for the renderer to write there. A skin that finds every slot taken isn't drawn.
+    pub fn new_skins(&mut self) -> Vec<(String, image::RgbaImage)> {
+        let mut out = Vec::new();
+        let arrived: Vec<_> = self.skins.arrived().collect();
+        for (uuid, img, slim) in arrived {
+            let slot = match self.skin_slots.iter().position(|s| *s == Some(uuid)) {
+                Some(i) => i,
+                None => match self.skin_slots.iter().position(Option::is_none) {
+                    Some(i) => i,
+                    None => continue,
+                },
+            };
+            self.skin_slots[slot] = Some(uuid);
+            let sprite = mc_render::entity::skin_slot(slot);
+            self.entities.set_skin(uuid, Some((sprite.clone(), slim)));
+            out.push((sprite, img));
+        }
+        out
     }
 
     pub fn click(&mut self, click: Click) {
@@ -650,6 +777,7 @@ impl Walker {
                 death.ticks += 1;
             }
             self.previous = self.player.pos;
+            self.entities.tick(&self.collision, &self.blocks);
             if self.dead() && self.inventory.is_open() {
                 self.close_inventory();
             }
@@ -751,21 +879,22 @@ impl Walker {
         self.outbox.send("player_action", &body)
     }
 
-    /// `Minecraft.startAttack`: a click on a block starts mining it; on nothing, a punch.
+    /// `Minecraft.startAttack`: a click on a block starts mining it; on nothing (or air), a
+    /// miss. Either way the arm swings, which the server shows others when it gets a
+    /// `punch`.
     fn start_attack(&mut self, hit: Option<BlockHit>) -> anyhow::Result<()> {
         if self.miss_time > 0 {
             return Ok(());
         }
         match hit {
-            Some(h) if !self.is_air(h.pos) => self.start_destroy(h.pos, h.face),
-            Some(_) => Ok(()),
-            None => {
+            Some(h) if !self.is_air(h.pos) => self.start_destroy(h.pos, h.face)?,
+            _ => {
                 if !self.instabuild {
                     self.miss_time = 10;
                 }
-                self.outbox.send("punch", &[])
             }
         }
+        self.outbox.send("punch", &[])
     }
 
     /// `Minecraft.continueAttack`.
@@ -777,9 +906,11 @@ impl Walker {
             return Ok(());
         }
         match hit {
+            // Each tick of mining swings the arm again.
             Some(h) if held => {
                 if !self.is_air(h.pos) {
                     self.continue_destroy(h.pos, h.face)?;
+                    self.outbox.send("punch", &[])?;
                 }
                 Ok(())
             }
@@ -944,5 +1075,47 @@ pub fn input(keys: &std::collections::HashSet<winit::keyboard::KeyCode>) -> Inpu
         jump: keys.contains(&K::Space),
         sneak: keys.contains(&K::ShiftLeft),
         sprint: keys.contains(&K::ControlLeft),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Light is read at the block's own nibble, in chunks at negative coordinates too; a
+    /// section without sky light takes the bottom of the nearest one above that has it, and
+    /// above every section it's full.
+    #[test]
+    fn entity_light_reads_like_world_view() {
+        let mut light = Light::default();
+        // In chunk (-1, 0), section 0: sky 9 and block 4 at x 3, y 5, z 7 (world -13, 5, 7).
+        let mut sky = Box::new([0u8; 2048]);
+        let mut block = Box::new([0u8; 2048]);
+        let index = (5 * 16 + 7) * 16 + 3;
+        sky[index / 2] |= 9 << (index % 2 * 4);
+        block[index / 2] |= 4 << (index % 2 * 4);
+        // Section 2's bottom layer has sky light 12 at x 3, z 7.
+        let mut upper = Box::new([0u8; 2048]);
+        let index = 7 * 16 + 3;
+        upper[index / 2] |= 12 << (index % 2 * 4);
+        light.set(
+            (-1, 0),
+            vec![
+                (0, [Some(sky), Some(block)]),
+                (1, [None, None]),
+                (2, [Some(upper), None]),
+            ],
+            true,
+        );
+        assert_eq!(light.at([-13, 5, 7]), [9, 4]);
+        assert_eq!(light.at([-12, 5, 7]), [0, 0]);
+        assert_eq!(light.at([-13, 20, 7]), [12, 0]);
+        assert_eq!(light.at([-13, 60, 7]), [15, 0]);
+        // An update of one layer keeps the other.
+        let mut lit = Box::new([0u8; 2048]);
+        lit[(5 * 16 + 7) * 16 / 2 + 1] = 0x70;
+        light.set((-1, 0), vec![(0, [None, Some(lit)])], false);
+        assert_eq!(light.at([-13, 5, 7]), [9, 7]);
+        assert_eq!(light.at([3, 5, 7]), [15, 0], "an unloaded chunk");
     }
 }

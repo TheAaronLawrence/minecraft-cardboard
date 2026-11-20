@@ -24,6 +24,7 @@ pub struct Registry {
     block_entity_types: Vec<String>,
     /// Indexed by data component type id.
     component_types: Vec<String>,
+    entity_types: Vec<String>,
     /// What the inventory needs to know of each item, by name.
     item_info: HashMap<String, ItemInfo>,
 }
@@ -39,6 +40,9 @@ pub struct ItemInfo {
     pub rarity: String,
     /// The `EquipmentSlot` it's worn in (`equippable`), such as `head` or `offhand`.
     pub slot: Option<String>,
+    /// The equipment asset drawn where it's worn (`equippable`'s `asset_id`), such as
+    /// `minecraft:diamond`.
+    pub equipment: Option<String>,
 }
 
 #[derive(Debug)]
@@ -185,17 +189,19 @@ impl Registry {
             names_by_id(&protocol_ids(&registries, "minecraft:block_entity_type")?);
         let component_types =
             names_by_id(&protocol_ids(&registries, "minecraft:data_component_type")?);
+        let entity_types = names_by_id(&protocol_ids(&registries, "minecraft:entity_type")?);
 
-        let item_info: HashMap<String, (String, i32, String, Option<String>)> =
-            read_json(&reports_dir.join("items.json"))?;
+        type Report = (String, i32, String, Option<String>, Option<String>);
+        let item_info: HashMap<String, Report> = read_json(&reports_dir.join("items.json"))?;
         let item_info = item_info
             .into_iter()
-            .map(|(item, (name, max_stack, rarity, slot))| {
+            .map(|(item, (name, max_stack, rarity, slot, equipment))| {
                 let info = ItemInfo {
                     name,
                     max_stack,
                     rarity,
                     slot,
+                    equipment,
                 };
                 (item, info)
             })
@@ -210,6 +216,7 @@ impl Registry {
             item_ids,
             block_entity_types,
             component_types,
+            entity_types,
         })
     }
 
@@ -262,6 +269,11 @@ impl Registry {
     /// A data component type's name, such as `minecraft:damage`, from its protocol id.
     pub fn component_type(&self, id: u32) -> Option<&str> {
         self.component_types.get(id as usize).map(String::as_str)
+    }
+
+    /// An entity type's name, such as `minecraft:zombie`, from its protocol id.
+    pub fn entity_type(&self, id: u32) -> Option<&str> {
+        self.entity_types.get(id as usize).map(String::as_str)
     }
 
     pub fn item_count(&self) -> u32 {

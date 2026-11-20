@@ -16,6 +16,24 @@ mod pick;
 
 use anyhow::{Context, Result};
 pub use collide::Aabb;
+
+/// `Entity.move`'s collision for an entity that doesn't step up blocks, such as a dropped
+/// item: how much of `motion` a `width` × `height` box with its feet at `feet` can move
+/// before blocks stop it.
+pub fn collide_box(
+    world: &impl World,
+    blocks: &BlockPhysics,
+    feet: DVec3,
+    [width, height]: [f64; 2],
+    motion: DVec3,
+) -> DVec3 {
+    collide::Collider { world, blocks }.collide(
+        &Aabb::at_feet(feet, width, height),
+        motion,
+        0.0,
+        false,
+    )
+}
 use glam::DVec3;
 use mc_registry::Registry;
 pub use pick::{BlockHit, pick, view_vector};
@@ -184,6 +202,11 @@ impl BlockPhysics {
         self.state_shapes
             .get(state as usize)
             .map_or(&[], |&i| &self.shapes[i as usize])
+    }
+
+    /// `Block.getFriction`: how slippery the block is, 0.6 for most.
+    pub fn friction(&self, state: u32) -> f32 {
+        self.friction.get(state as usize).copied().unwrap_or(0.6)
     }
 
     /// The boxes the game outlines and aims at (`BlockState.getShape`), in block units.

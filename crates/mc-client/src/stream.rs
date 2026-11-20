@@ -28,6 +28,14 @@ pub enum Update {
     Collision((i32, i32), Option<Vec<(i32, mc_world::Blocks)>>),
     /// The server changed these blocks: position and new state.
     Blocks(Vec<([i32; 3], u32)>),
+    /// A server chunk's light, for lighting entities: sky and block light by section y.
+    /// `whole` replaces the chunk's light; otherwise only the sections and layers given
+    /// change.
+    Light {
+        chunk: (i32, i32),
+        sections: Vec<(i32, crate::walk::SectionLight)>,
+        whole: bool,
+    },
     /// Another server event for the game: the login, or the player's abilities.
     Server(mc_protocol::Event),
 }
@@ -271,9 +279,22 @@ fn receive(
                 .iter()
                 .map(|s| (s.y, s.blocks.clone()))
                 .collect();
+            let light = chunk
+                .sections
+                .iter()
+                .map(|s| (s.y, [s.sky_light.clone(), s.block_light.clone()]))
+                .collect();
             // A chunk sent again replaces the old one and is meshed afresh.
             meshed.remove(&(chunk.x, chunk.z));
             let key = (chunk.x, chunk.z);
+            let light = Update::Light {
+                chunk: key,
+                sections: light,
+                whole: true,
+            };
+            if tx.send(light).is_err() {
+                return false;
+            }
             view.insert(chunk);
             return tx.send(Update::Collision(key, Some(blocks))).is_ok();
         }
@@ -292,12 +313,24 @@ fn receive(
             Update::Blocks(changes)
         }
         Event::Light { x, z, sky, block } => {
+            let mut sections = Vec::new();
             for (light, is_sky) in [(sky, true), (block, false)] {
                 for (section_y, array) in light {
+                    let mut layers = [None, None];
+                    layers[usize::from(!is_sky)] = Some(array.clone());
+                    sections.push((section_y, layers));
                     view.set_light((x, z), section_y, is_sky, array);
                 }
             }
             touch(x, z, -1..=1, -1..=1);
+            let light = Update::Light {
+                chunk: (x, z),
+                sections,
+                whole: false,
+            };
+            if tx.send(light).is_err() {
+                return false;
+            }
             return true;
         }
         Event::Forget(x, z) => {

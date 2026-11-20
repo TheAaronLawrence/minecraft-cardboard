@@ -331,7 +331,8 @@ impl Section {
     }
 }
 
-fn nibble(light: &[u8; 2048], x: usize, y: usize, z: usize) -> u8 {
+/// A light level (0 to 15) from a section's 4-bit array, at block coordinates 0..16 in it.
+pub fn nibble(light: &[u8; 2048], x: usize, y: usize, z: usize) -> u8 {
     let index = (y * 16 + z) * 16 + x;
     (light[index / 2] >> ((index % 2) * 4)) & 0xF
 }

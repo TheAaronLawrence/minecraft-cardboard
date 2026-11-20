@@ -204,15 +204,16 @@ impl HudArt {
 }
 
 /// Each item's name key and rarity, from the `items.json` report (`[key, max stack, rarity,
-/// slot]`).
+/// slot, equipment asset]`).
 pub(crate) fn item_names() -> Result<HashMap<String, (String, String)>> {
     let path = mc_registry::default_reports_dir().join("items.json");
-    let items: HashMap<String, (String, i32, String, Option<String>)> = serde_json::from_slice(
+    type Report = (String, i32, String, Option<String>, Option<String>);
+    let items: HashMap<String, Report> = serde_json::from_slice(
         &std::fs::read(&path).with_context(|| format!("{}", path.display()))?,
     )?;
     Ok(items
         .into_iter()
-        .map(|(item, (key, _, rarity, _))| (item, (key, rarity)))
+        .map(|(item, (key, _, rarity, ..))| (item, (key, rarity)))
         .collect())
 }
 
@@ -496,7 +497,7 @@ impl GuiMesh {
     /// An item's icon in the 16 × 16 slot whose top left is `x`, `y`, around depth `z`.
     fn item(&mut self, icon: &ItemIcon, x: f32, y: f32, z: f32) {
         match icon {
-            ItemIcon::Flat(layers) => {
+            ItemIcon::Flat { layers, .. } => {
                 for (i, &(rect, [r, g, b])) in layers.iter().enumerate() {
                     self.blit(x, y, z + i as f32 * 0.01, 16.0, 16.0, rect, [r, g, b, 1.0]);
                 }
@@ -506,6 +507,7 @@ impl GuiMesh {
                 tints,
                 gui,
                 front_lit,
+                ..
             } => {
                 // `ItemTransform.apply`, then the model centred on the slot, 16 GUI pixels
                 // to a block, with y pointing down the screen.
@@ -884,6 +886,98 @@ impl GuiMesh {
                 light: [0; 4],
             });
         }
+    }
+}
+
+/// `SubmitNodeCollection.submitNameTag`: the entity's name half a block over its
+/// `NAME_TAG` attachment, facing the camera, a text pixel being 0.025 blocks, centred on a
+/// translucent black background (`getBackgroundOpacity(0.25)`) one pixel wider than the
+/// text on every side but the right. Shown within 64 blocks (`extractNameTags`), or 32
+/// when discrete (`LivingEntityRenderer.shouldShowName`).
+///
+/// A tag that isn't discrete is drawn twice: the text opaque where nothing hides it, lit
+/// by the light at the entity or a light of 2, whichever is brighter
+/// (`lightCoordsWithEmission`), then the background with half-transparent text over
+/// everything, so unhidden text ends up three quarters bright plus half. A
+/// discrete one is drawn once, background and half-transparent text, where nothing hides
+/// it.
+pub(crate) fn name_tag(
+    art: &HudArt,
+    tag: &crate::entity::NameTag,
+    feet: Vec3,
+    [sky, block]: [u8; 2],
+    camera: &crate::gpu::Camera,
+    out: &mut crate::entity::Meshes,
+) {
+    let range = if tag.discrete { 32.0 } else { 64.0 };
+    if feet.distance_squared(camera.eye) >= range * range {
+        return;
+    }
+    // The camera's orientation: text runs to its right and down its up, whatever its pitch.
+    let yaw = camera.yaw.to_radians();
+    let right = Vec3::new(-yaw.cos(), 0.0, -yaw.sin());
+    let up = right.cross(camera.forward());
+    let anchor = feet + Vec3::Y * (tag.height + 0.5);
+    let place = |x: f32, y: f32| (anchor + (right * x - up * y) * 0.025).to_array();
+    let quad = |out: &mut Vec<Vertex>, [x0, y0, x1, y1]: [f32; 4], uv: [f32; 4], color, light| {
+        let [u0, v0, u1, v1] = uv;
+        for (x, y, u, v) in [
+            (x0, y0, u0, v0),
+            (x0, y1, u0, v1),
+            (x1, y1, u1, v1),
+            (x1, y0, u1, v0),
+        ] {
+            out.push(Vertex {
+                pos: place(x, y),
+                uv: [u, v],
+                color,
+                light,
+            });
+        }
+    };
+    let text = |out: &mut Vec<Vertex>, color: [u8; 4], light: [u8; 4]| {
+        let mut pen = -GuiMesh::text_width(art, &tag.text) / 2.0;
+        for c in tag.text.chars() {
+            let Some(&(cell, advance)) = art.glyphs.get(&c) else {
+                continue;
+            };
+            if c != ' ' {
+                quad(
+                    out,
+                    [pen, 0.0, pen + 8.0, 8.0],
+                    art.glyph_rect(cell),
+                    color,
+                    light,
+                );
+            }
+            pen += advance as f32;
+        }
+    };
+    let width = GuiMesh::text_width(art, &tag.text);
+    let x = -width / 2.0;
+    let [u, v] = art.white;
+    let background = |out: &mut Vec<Vertex>| {
+        quad(
+            out,
+            [x - 1.0, -1.0, x + width, 9.0],
+            [u, v, u, v],
+            [0, 0, 0, 64],
+            [0; 4],
+        );
+    };
+    let lit = [sky.min(15) * 16, block.min(15) * 16, 0, 0];
+    // `(backgroundAlpha + 0.75) * 0.5`, white.
+    let faint = [255, 255, 255, 128];
+    if tag.discrete {
+        background(&mut out.eyes);
+        text(&mut out.eyes, faint, lit);
+    } else {
+        // The see-through shader doesn't use the lightmap: full light leaves colours as they
+        // are, near enough.
+        background(&mut out.see_through);
+        text(&mut out.see_through, faint, [240, 240, 0, 0]);
+        let glowing = [sky.clamp(2, 15) * 16, block.clamp(2, 15) * 16, 0, 0];
+        text(&mut out.tags, [255; 4], glowing);
     }
 }
 

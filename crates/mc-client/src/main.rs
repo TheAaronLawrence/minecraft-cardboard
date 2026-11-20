@@ -27,6 +27,7 @@ use mc_render::bake::BlockModels;
 use mc_render::hud::menu;
 
 mod chat;
+mod entities;
 mod inventory;
 mod skins;
 mod stream;
@@ -1146,6 +1147,15 @@ impl winit::application::ApplicationHandler for App {
                                 walker.chunk(key, blocks);
                             }
                         }
+                        stream::Update::Light {
+                            chunk,
+                            sections,
+                            whole,
+                        } => {
+                            if let Some(walker) = &mut self.walker {
+                                walker.light(chunk, sections, whole);
+                            }
+                        }
                         stream::Update::Blocks(changes) => {
                             if let Some(walker) = &mut self.walker {
                                 walker.blocks(&changes);
@@ -1209,6 +1219,15 @@ impl winit::application::ApplicationHandler for App {
                                 renderer.set_hotbar(hotbar.clone());
                                 self.shown_hotbar = hotbar;
                             }
+                            for (sprite, skin) in walker.new_skins() {
+                                renderer.write_sprite(self.models.atlas.sprite(&sprite), &skin);
+                            }
+                            let entities = walker.entities();
+                            renderer.set_entities(&mc_render::entity::vertices(
+                                &self.models,
+                                self.view.hud.then_some(&*camera),
+                                &entities,
+                            ));
                             let cracks = walker.cracks();
                             if cracks != self.shown_cracks {
                                 let vertices: Vec<_> = cracks

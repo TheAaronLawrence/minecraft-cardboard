@@ -130,6 +130,21 @@ impl Atlas {
         })
     }
 
+    /// A sprite's size in pixels, and its pixel's alpha at `x`, `y` from the top left.
+    pub fn sprite_size(&self, sprite: Sprite) -> [u32; 2] {
+        let [u0, v0, u1, v1] = sprite.rect;
+        [
+            ((u1 - u0) * self.width as f32).round() as u32,
+            ((v1 - v0) * self.height as f32).round() as u32,
+        ]
+    }
+
+    pub fn alpha(&self, sprite: Sprite, x: u32, y: u32) -> u8 {
+        let x0 = (sprite.rect[0] * self.width as f32).round() as u32;
+        let y0 = (sprite.rect[1] * self.height as f32).round() as u32;
+        self.levels[0][(((y0 + y) * self.width + x0 + x) * 4 + 3) as usize]
+    }
+
     pub fn contains(&self, id: &str) -> bool {
         self.sprites.contains_key(&normalize(id))
     }
