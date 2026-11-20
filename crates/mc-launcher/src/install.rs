@@ -11,6 +11,10 @@ use std::path::Path;
 const FULL: &str = "-windows-x64.zip";
 const EXE_ONLY: &str = "-windows-x64-exe-only.zip";
 
+/// What the launcher shows when it can't put the game's files in place, such as with the
+/// disk full; the log has which file.
+pub(crate) const WRITE_FAILED: &str = "Couldn't install the game's files";
+
 /// The game's executable in `dir`.
 pub fn game_exe(dir: &Path) -> std::path::PathBuf {
     dir.join(format!(
@@ -64,7 +68,7 @@ fn install_release(dir: &Path, release: &Release, step: &mut dyn FnMut(Step)) ->
     let full = assets != read_text(&dir.join("assets.txt"));
     let zip = download(release, if full { FULL } else { EXE_ONLY }, step)?;
     step(Step::Installing);
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir).context(WRITE_FAILED)?;
     // Without these, an install cut short is redone, in full, next time.
     for file in ["version.txt", "assets.txt"] {
         let _ = std::fs::remove_file(dir.join(file));
@@ -76,13 +80,14 @@ fn install_release(dir: &Path, release: &Release, step: &mut dyn FnMut(Step)) ->
             let path = dir.join(folder);
             if path.exists() {
                 std::fs::remove_dir_all(&path)
-                    .with_context(|| format!("removing {}", path.display()))?;
+                    .with_context(|| format!("removing {}", path.display()))
+                    .context(WRITE_FAILED)?;
             }
         }
     }
-    unzip(&zip, dir)?;
-    std::fs::write(dir.join("assets.txt"), &assets)?;
-    std::fs::write(dir.join("version.txt"), &release.tag)?;
+    unzip(&zip, dir).context(WRITE_FAILED)?;
+    std::fs::write(dir.join("assets.txt"), &assets).context(WRITE_FAILED)?;
+    std::fs::write(dir.join("version.txt"), &release.tag).context(WRITE_FAILED)?;
     Ok(())
 }
 

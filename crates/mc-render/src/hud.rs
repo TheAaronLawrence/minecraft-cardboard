@@ -134,7 +134,7 @@ impl HudArt {
     }
 
     /// `StringSplitter.splitLines`: `text` broken at spaces into lines at most `max` GUI
-    /// pixels wide, a word wider than that on a line of its own.
+    /// pixels wide, and inside a word too wide for a line of its own, as vanilla breaks one.
     pub(crate) fn wrap(&self, text: &str, max: i32) -> Vec<String> {
         let width = |s: &str| GuiMesh::text_width(self, s) as i32;
         let mut lines = Vec::new();
@@ -146,10 +146,19 @@ impl HudArt {
                 } else {
                     format!("{line} {word}")
                 };
-                if width(&candidate) > max && !line.is_empty() {
-                    lines.push(std::mem::replace(&mut line, word.to_owned()));
-                } else {
+                if width(&candidate) <= max {
                     line = candidate;
+                    continue;
+                }
+                if !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                }
+                for c in word.chars() {
+                    line.push(c);
+                    if width(&line) > max && line.chars().count() > 1 {
+                        line.pop();
+                        lines.push(std::mem::replace(&mut line, c.to_string()));
+                    }
                 }
             }
             lines.push(line);
@@ -936,4 +945,32 @@ fn decal_uv(p: Vec3, dir: Dir) -> [f32; 2] {
     };
     let v = face * (Quat::from_rotation_x(-FRAC_PI_2) * (Quat::from_rotation_y(PI) * p));
     [-v.x, -v.y]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GuiMesh;
+
+    /// A word wider than a line, such as a URL, breaks inside itself so every line fits,
+    /// and the words around it still break at spaces.
+    #[test]
+    fn wrap_breaks_words_wider_than_a_line() {
+        let res = mc_assets::Resources::new(mc_assets::default_root());
+        let art = crate::bake::BlockModels::gui(&res).unwrap().hud;
+        let url = "https://api.github.com/repos/TheAaronLawrence/minecraft-cardboard/releases";
+        let text = format!("GitHub answered 404 to {url} today");
+        let max = 120;
+        let lines = art.wrap(&text, max);
+        assert!(lines.len() > 2, "{lines:?}");
+        for line in &lines {
+            assert!(GuiMesh::text_width(&art, line) as i32 <= max, "{line:?}");
+        }
+        assert_eq!(lines.first().unwrap(), "GitHub answered 404 to");
+        assert_eq!(lines.concat().replace(' ', ""), text.replace(' ', ""));
+        // Words that fit still go whole onto the next line.
+        assert_eq!(
+            art.wrap("aaa bbb", GuiMesh::text_width(&art, "aaa ") as i32 + 2),
+            ["aaa", "bbb"]
+        );
+    }
 }

@@ -3,7 +3,7 @@
 //! textures, models and data the game reads into `resources/`. Mojang's code stays in the
 //! jar, which isn't kept.
 
-use crate::install::{Step, read_text};
+use crate::install::{Step, WRITE_FAILED, read_text};
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::io::Read;
@@ -49,7 +49,8 @@ pub fn installed(dir: &Path) -> bool {
 fn get_json(url: &str) -> Result<Value> {
     let mut response = ureq::get(url)
         .call()
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("GET {url}"))
+        .context("Couldn't reach Mojang; check your internet connection")?;
     Ok(response
         .body_mut()
         .with_config()
@@ -83,7 +84,8 @@ pub fn install(dir: &Path, step: &mut dyn FnMut(Step)) -> Result<()> {
     let url = str_at(&client, "url")?;
     let mut response = ureq::get(url)
         .call()
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("GET {url}"))
+        .context("Couldn't reach Mojang; check your internet connection")?;
     let jar = crate::github::read_body(&mut response, &what, |done| {
         step(Step::Downloading {
             what: &what,
@@ -105,11 +107,12 @@ pub fn install(dir: &Path, step: &mut dyn FnMut(Step)) -> Result<()> {
         let path = resources.join(folder);
         if path.exists() {
             std::fs::remove_dir_all(&path)
-                .with_context(|| format!("removing {}", path.display()))?;
+                .with_context(|| format!("removing {}", path.display()))
+                .context(WRITE_FAILED)?;
         }
     }
-    unpack(&jar, &resources)?;
-    std::fs::write(dir.join(MARKER), &sha1)?;
+    unpack(&jar, &resources).context(WRITE_FAILED)?;
+    std::fs::write(dir.join(MARKER), &sha1).context(WRITE_FAILED)?;
     Ok(())
 }
 

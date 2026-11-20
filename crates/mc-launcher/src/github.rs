@@ -1,7 +1,7 @@
 //! What the launcher asks GitHub: the newest release of the game, and its files. The
 //! repository is public, so it asks without signing in.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::io::Read;
 
@@ -38,12 +38,14 @@ fn get(url: &str, accept: &str) -> Result<ureq::http::Response<ureq::Body>> {
         .http_status_as_error(false)
         .build()
         .call()
-        .with_context(|| format!("GET {url}"))?;
+        .with_context(|| format!("GET {url}"))
+        .context("Couldn't reach GitHub; check your internet connection")?;
     match response.status().as_u16() {
         200 => Ok(response),
         // GitHub allows 60 API calls an hour from one address without signing in.
         403 | 429 => bail!("GitHub is limiting requests from this network; try again later"),
-        status => bail!("GitHub answered {status} to {url}"),
+        status => Err(anyhow!("GET {url}: HTTP {status}")
+            .context(format!("GitHub couldn't send the game (HTTP {status})"))),
     }
 }
 
@@ -99,7 +101,8 @@ pub fn read_body(
     loop {
         let n = reader
             .read(&mut buf)
-            .with_context(|| format!("downloading {name}"))?;
+            .with_context(|| format!("downloading {name}"))
+            .context("The download stopped; check your internet connection")?;
         if n == 0 {
             break;
         }

@@ -70,10 +70,11 @@ the game, as here, it starts the `minecraft-cardboard` beside it. On its own, as
 download it from a release, it installs the newest release into
 `.minecraft-cardboard/game` in the app data folder (`CARDBOARD_HOME` overrides it), with
 Mojang's files from the 26.3 client jar, and updates it each time it opens. It remembers
-the name in `launcher.json` there, and comes back when the game closes. Started without
-`--world` or `--server`, the game opens on its title screen: Singleplayer opens the test
-world, and Multiplayer asks for a server's address, remembered as vanilla does in
-`options.txt`. Leaving a server, or losing the connection, comes back to the menus.
+the name in `launcher.json` there, writes why an install failed to `launcher.log` there,
+and comes back when the game closes. Started without `--world` or `--server`, the game
+opens on its title screen: Singleplayer opens the test world, and Multiplayer asks for a
+server's address, remembered as vanilla does in `options.txt`. Leaving a server, or losing
+the connection, comes back to the menus.
 
 ## Crates
 

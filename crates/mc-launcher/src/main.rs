@@ -265,11 +265,18 @@ impl App {
     /// Installs or updates the game, on a thread of its own.
     fn start_worker(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let dir = self.game_dir.clone();
+        let (dir, log) = (self.game_dir.clone(), self.home.join("launcher.log"));
         std::thread::spawn(move || {
             let message = match work(&tx, &dir) {
                 Ok(tag) => Message::Ready(tag),
-                Err(e) => Message::Failed(format!("{e:#}")),
+                Err(e) => {
+                    // The window shows what went wrong; the log has every detail, such as
+                    // the URL or file.
+                    if let Err(log_error) = std::fs::write(&log, format!("{e:#}\n")) {
+                        eprintln!("writing {}: {log_error}", log.display());
+                    }
+                    Message::Failed(e.to_string())
+                }
             };
             let _ = tx.send(message);
         });
@@ -335,7 +342,10 @@ impl App {
                     state.window.set_visible(false);
                 }
             }
-            Err(e) => self.screen.error = Some(format!("Couldn't start {}: {e}", exe.display())),
+            Err(e) => {
+                eprintln!("starting {}: {e}", exe.display());
+                self.screen.error = Some(format!("Couldn't start the game: {e}"));
+            }
         }
     }
 
