@@ -115,6 +115,12 @@ pub struct Living {
     pub equipment: Equipment,
     /// The swing its arm is in, if any.
     pub swing: Option<Swing>,
+    /// Its bounding box's width and height while it's on fire, for the flames around it.
+    pub burning: Option<[f32; 2]>,
+    /// Flashing red, as it does while hurt or dying (`hasRedOverlay`).
+    pub hurt: bool,
+    /// Ticks since it died, to the frame (`deathTime`), or 0 while it lives.
+    pub death_time: f32,
 }
 
 /// What a humanoid wears and holds (`HumanoidRenderState`'s equipment and hand items).
@@ -214,6 +220,8 @@ pub struct Dropped {
     pub age: f32,
     /// `ItemEntity.bobOffs`: a random phase for the bob and spin, in radians.
     pub bob_offset: f32,
+    /// Its bounding box's width and height while it's on fire, for the flames around it.
+    pub burning: Option<[f32; 2]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -242,14 +250,16 @@ pub struct Meshes {
     pub tags: Vec<Vertex>,
 }
 
-/// Quads for these entities, and their name tags as seen from `camera`, or none without
-/// one (the HUD is hidden).
+/// Quads for these entities as seen from `camera`, with their name tags unless the HUD is
+/// hidden.
 pub fn vertices(
     models: &crate::bake::BlockModels,
-    camera: Option<&crate::gpu::Camera>,
+    camera: &crate::gpu::Camera,
+    name_tags: bool,
     entities: &[Lit],
 ) -> Meshes {
     let (atlas, art) = (&models.atlas, &models.hud);
+    let fire = ["minecraft:block/fire_0", "minecraft:block/fire_1"].map(|s| atlas.sprite(s).rect);
     let mut out = Meshes::default();
     for (entity, light) in entities {
         match entity {
@@ -274,13 +284,19 @@ pub fn vertices(
                 };
                 living(atlas, l, *light, &mut out);
                 equipment(models, l, *light, &mut out.cutout);
-                if let (Some(tag), Some(camera)) = (&l.name_tag, camera) {
+                if let Some(tag) = l.name_tag.as_ref().filter(|_| name_tags) {
                     crate::hud::name_tag(art, tag, l.pos, *light, camera, &mut out);
+                }
+                if let Some(size) = l.burning {
+                    flames(fire, l.pos, size, camera.yaw, *light, &mut out.cutout);
                 }
             }
             Entity::Item(d) => {
                 if let Some(icon) = art.items.get(&d.item) {
                     dropped(atlas, icon, d, *light, &mut out.cutout);
+                }
+                if let Some(size) = d.burning {
+                    flames(fire, d.pos, size, camera.yaw, *light, &mut out.cutout);
                 }
             }
         }
@@ -288,19 +304,79 @@ pub fn vertices(
     out
 }
 
+/// `FlameFeatureRenderer`: fire around a burning entity whose bounding box is `width` by
+/// `height`, as cards of `fire_0` and `fire_1` (their atlas rects) stacked up it, each a little narrower and
+/// nearer the camera than the last, turned to face a camera looking along `yaw`. Lit at
+/// full block light (its light already is, for a burning entity), and shaded as faces
+/// pointing up are, which is not at all.
+fn flames(
+    fire: [[f32; 4]; 2],
+    pos: Vec3,
+    [width, height]: [f32; 2],
+    yaw: f32,
+    [sky, block]: [u8; 2],
+    out: &mut Vec<Vertex>,
+) {
+    let s = width * 1.4;
+    let mut h = height / s;
+    // `Mth.rotationAroundAxis(Y_AXIS, camera.orientation)`: the camera's turn about y.
+    let m = Mat4::from_translation(pos)
+        * Mat4::from_scale(Vec3::splat(s))
+        * Mat4::from_rotation_y(PI - yaw.to_radians())
+        * Mat4::from_translation(Vec3::new(0.0, 0.0, 0.3 - h.trunc() * 0.02));
+    let (mut r, mut y, mut z) = (0.5, 0.0, 0.0);
+    let mut i = 0;
+    while h > 0.0 {
+        let [mut u0, v0, mut u1, v1] = fire[i % 2];
+        if i / 2 % 2 == 0 {
+            std::mem::swap(&mut u0, &mut u1);
+        }
+        let corners = [
+            ([-r, y, z], [u1, v1]),
+            ([r, y, z], [u0, v1]),
+            ([r, y + 1.4, z], [u0, v0]),
+            ([-r, y + 1.4, z], [u1, v0]),
+        ];
+        for (p, uv) in corners {
+            out.push(Vertex {
+                pos: m.transform_point3(Vec3::from(p)).to_array(),
+                uv,
+                color: [255; 4],
+                light: [sky.min(15) * 16, block.min(15) * 16, 0, 0],
+            });
+        }
+        h -= 0.45;
+        y += 0.45;
+        r *= 0.9;
+        z -= 0.03;
+        i += 1;
+    }
+}
+
 /// `LivingEntityRenderer.submit`'s transform, without the move to the entity's position:
-/// turned to face `bodyRot`, flipped into model space (y down, 16 units to a block), and
-/// lowered so the model's feet, 24 pixels down, stand at the origin.
+/// turned to face `bodyRot`, fallen over as far as its death has got (`setupRotations`),
+/// flipped into model space (y down, 16 units to a block), and lowered so the model's
+/// feet, 24 pixels down, stand at the origin.
 fn living_root(l: &Living, model_scale: f32) -> Mat4 {
     let scale = if l.baby { 0.5 } else { 1.0 };
+    // Over onto its side in the first 12.5 ticks; a spider rolls onto its back
+    // (`SpiderRenderer.getFlipDegrees`).
+    let fall = if l.death_time > 0.0 {
+        let flip = if l.kind == Kind::Spider { 180.0 } else { 90.0 };
+        ((l.death_time - 1.0) / 20.0 * 1.6).sqrt().min(1.0) * flip
+    } else {
+        0.0
+    };
     Mat4::from_scale(Vec3::splat(scale))
         * Mat4::from_rotation_y((180.0 - l.body_yaw).to_radians())
+        * Mat4::from_rotation_z(fall.to_radians())
         * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
         * Mat4::from_scale(Vec3::splat(model_scale))
         * Mat4::from_translation(Vec3::new(0.0, -1.501, 0.0))
 }
 
 fn living(atlas: &Atlas, l: &Living, light: [u8; 2], out: &mut Meshes) {
+    let start = out.cutout.len();
     let (nodes, tex_size, model_scale) = match l.kind {
         // `AvatarRenderer.scale`: players are drawn at 15/16 size.
         Kind::Player { slim, .. } => (player(l, slim), [64.0, 64.0], 0.9375),
@@ -361,6 +437,13 @@ fn living(atlas: &Atlas, l: &Living, light: [u8; 2], out: &mut Meshes) {
             }
         }
         _ => {}
+    }
+    // `getOverlayCoords`: the body and the layers drawn as it is (the sheep's coats) flash;
+    // glowing eyes don't.
+    if l.hurt {
+        for v in &mut out.cutout[start..] {
+            v.light[3] |= crate::mesh::RED;
+        }
     }
 }
 
@@ -730,16 +813,7 @@ fn equipment(models: &crate::bake::BlockModels, l: &Living, light: [u8; 2], out:
             * Mat4::from_rotation_x(-PI / 2.0)
             * Mat4::from_rotation_y(PI)
             * Mat4::from_translation(Vec3::new(sign, 2.0, -10.0) / 16.0);
-        // `ItemTransform.apply`, mirrored for the left hand.
-        let t = icon.hand(left);
-        let [rx, ry, rz] = t.rotation.map(f32::to_radians);
-        let [tx, ty, tz] = t.translation;
-        let (tx, ry, rz) = if left { (-tx, -ry, -rz) } else { (tx, ry, rz) };
-        let m = hand
-            * Mat4::from_translation(Vec3::new(tx, ty, tz) / 16.0)
-            * Mat4::from_quat(Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz))
-            * Mat4::from_scale(Vec3::from(t.scale))
-            * Mat4::from_translation(Vec3::splat(-0.5));
+        let m = hand * item_transform(icon.hand(left), left);
         for (corners, uv, tint) in item_quads(&models.atlas, icon) {
             emit_quad(
                 corners.map(|c| m.transform_point3(c)),
@@ -753,73 +827,248 @@ fn equipment(models: &crate::bake::BlockModels, l: &Living, light: [u8; 2], out:
     }
 }
 
+/// `ItemTransform.apply`, mirrored for the left hand, then the model centred, as
+/// `ItemStackRenderState.submit` places an item.
+fn item_transform(t: mc_assets::Transform, left: bool) -> Mat4 {
+    let [rx, ry, rz] = t.rotation.map(f32::to_radians);
+    let [tx, ty, tz] = t.translation;
+    let (tx, ry, rz) = if left { (-tx, -ry, -rz) } else { (tx, ry, rz) };
+    Mat4::from_translation(Vec3::new(tx, ty, tz) / 16.0)
+        * Mat4::from_quat(Quat::from_euler(glam::EulerRot::XYZ, rx, ry, rz))
+        * Mat4::from_scale(Vec3::from(t.scale))
+        * Mat4::from_translation(Vec3::splat(-0.5))
+}
+
+/// What the player sees of their own hands (`FirstPersonHandsAndItemsRenderState`),
+/// already interpolated to the frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FirstPerson {
+    /// The player's skin sprite, and whether it has slim arms.
+    pub skin: String,
+    pub slim: bool,
+    /// Whether their main hand is their left.
+    pub left_handed: bool,
+    /// The items shown in the main and off hand, by name; they lag the real ones while
+    /// the hand dips to swap them.
+    pub items: [Option<String>; 2],
+    /// How far each hand is lowered, 0 (up) to 1 (out of sight): `1 - handHeight`.
+    pub lowered: [f32; 2],
+    /// The swing in progress, if any: which hand (0 main, 1 off), its `SwingAnimationType`
+    /// (whack 1), and how far through it is, 0 to 1.
+    pub swing: Option<(usize, u8, f32)>,
+    /// How far the view has turned past where the hands have caught up to, in degrees
+    /// (`viewXRot - xBob` and `viewYRot - yBob`); the hands lag a tenth of it.
+    pub sway: [f32; 2],
+}
+
+/// `GameRenderer.renderItemInHand` and `FirstPersonHandsAndItemsRenderer.submitHandsWithItems`:
+/// the player's arm and the items they hold, as world-space quads around `camera.eye`,
+/// lit with `light`, for [`crate::gpu::Renderer::set_hand`] to draw over the world.
+pub fn first_person(
+    models: &crate::bake::BlockModels,
+    camera: &crate::gpu::Camera,
+    hands: &FirstPerson,
+    light: [u8; 2],
+) -> Vec<Vertex> {
+    let mut out = Vec::new();
+    // The pose stack starts as the inverse view rotation (`Camera.rotation`), so the
+    // quads end up in world space and the world's entity lights shade them.
+    let view = Mat4::from_quat(
+        Quat::from_rotation_y(PI - camera.yaw.to_radians())
+            * Quat::from_rotation_x(-camera.pitch.to_radians()),
+    );
+    let root = view
+        * Mat4::from_rotation_x((hands.sway[0] * 0.1).to_radians())
+        * Mat4::from_rotation_y((hands.sway[1] * 0.1).to_radians());
+    let deg = |d: f32| d.to_radians();
+    for (hand, item) in hands.items.iter().enumerate() {
+        // `submitArmWithItem`: which arm holds this hand, and its swing.
+        let left = (hand == 1) != hands.left_handed;
+        let invert = if left { -1.0 } else { 1.0 };
+        let swing = hands.swing.filter(|&(h, ..)| h == hand);
+        // `attackHand` is the main hand when nothing swings.
+        let attack = match hands.swing {
+            Some((h, _, progress)) if h == hand => progress,
+            _ => 0.0,
+        };
+        let lowered = hands.lowered[hand];
+        let Some(item) = item else {
+            // `renderPlayerArm`: only an empty main hand shows the arm.
+            if hand != 0 {
+                continue;
+            }
+            let sqrt = attack.sqrt();
+            let m =
+                root * Mat4::from_translation(Vec3::new(
+                    invert * (-0.3 * (sqrt * PI).sin() + 0.64),
+                    0.4 * (sqrt * PI * 2.0).sin() - 0.6 + lowered * -0.6,
+                    -0.4 * (attack * PI).sin() - 0.72,
+                )) * Mat4::from_rotation_y(deg(invert * 45.0))
+                    * Mat4::from_rotation_y(deg(invert * (sqrt * PI).sin() * 70.0))
+                    * Mat4::from_rotation_z(deg(invert * (attack * attack * PI).sin() * -20.0))
+                    * Mat4::from_translation(Vec3::new(-invert, 3.6, 3.5))
+                    * Mat4::from_rotation_z(deg(invert * 120.0))
+                    * Mat4::from_rotation_x(deg(200.0))
+                    * Mat4::from_rotation_y(deg(invert * -135.0))
+                    * Mat4::from_translation(Vec3::new(invert * 5.6, 0.0, 0.0));
+            // `AvatarRenderer.renderHand`: the arm at its resting offset, tilted a little
+            // out, with its sleeve.
+            let limbs = if hands.slim { PLAYER_SLIM } else { PLAYER_WIDE };
+            let arm = part(
+                None,
+                [invert * -5.0, 2.0, 0.0],
+                [0.0, 0.0, invert * 0.1],
+                limbs.cubes[left as usize],
+            );
+            let mut b = Builder {
+                quads: Vec::new(),
+                sprite: models.atlas.sprite(&hands.skin),
+                tex_size: [64.0, 64.0],
+                tint: -1,
+            };
+            b.nodes(m, &[arm]);
+            emit(&b.quads, camera.eye, [1.0; 3], light, &mut out);
+            continue;
+        };
+        let Some(icon) = models.hud.items.get(item) else {
+            continue;
+        };
+        // `applyItemArmTransform`, then `swingArm` for a whack in this hand.
+        let mut m =
+            root * Mat4::from_translation(Vec3::new(invert * 0.56, -0.52 + lowered * -0.6, -0.72));
+        if swing.is_some_and(|(_, kind, _)| kind == 1) {
+            let sqrt = attack.sqrt();
+            let xz = (sqrt * PI).sin();
+            m = m
+                * Mat4::from_translation(Vec3::new(
+                    invert * -0.4 * xz,
+                    0.2 * (sqrt * PI * 2.0).sin(),
+                    -0.2 * (attack * PI).sin(),
+                ))
+                // `applyItemArmAttackTransform`.
+                * Mat4::from_rotation_y(deg(invert * (45.0 + (attack * attack * PI).sin() * -20.0)))
+                * Mat4::from_rotation_z(deg(invert * xz * -20.0))
+                * Mat4::from_rotation_x(deg(xz * -80.0))
+                * Mat4::from_rotation_y(deg(invert * -45.0));
+        }
+        let m = m * item_transform(icon.first_person_hand(left), left);
+        for (corners, uv, tint) in item_quads(&models.atlas, icon) {
+            emit_quad(
+                corners.map(|c| m.transform_point3(c)),
+                uv,
+                camera.eye,
+                tint,
+                light,
+                &mut out,
+            );
+        }
+    }
+    out
+}
+
+/// `ScreenEffectRenderer.submitFire`: what a burning player sees, two cards of `fire_1`
+/// half a block ahead, mirrored, low in the view and turned 10° in from each side, drawn
+/// translucent and unlit over everything, the hand too. They're placed where `camera`
+/// sees them as the hand's 70° view would, for [`crate::gpu::Renderer::set_fire_overlay`].
+pub fn fire_overlay(atlas: &Atlas, camera: &crate::gpu::Camera) -> Vec<Vertex> {
+    let [u0, v0, u1, v1] = atlas.sprite("minecraft:block/fire_1").rect;
+    // The hand pass's view is `camera.view()` (the screen effects don't bob), so undo it.
+    let to_world = camera.view().inverse();
+    let mut out = Vec::new();
+    for side in [1.0, -1.0] {
+        let m = to_world
+            * Mat4::from_translation(Vec3::new(side * 0.24, -0.3, 0.0))
+            * Mat4::from_rotation_y(side * -PI / 18.0);
+        // `buildSpriteQuad`: the sprite's right edge at the left.
+        let corners = [
+            ([-0.5, -0.5], [u1, v1]),
+            ([0.5, -0.5], [u0, v1]),
+            ([0.5, 0.5], [u0, v0]),
+            ([-0.5, 0.5], [u1, v0]),
+        ];
+        for ([x, y], uv) in corners {
+            out.push(Vertex {
+                pos: m.transform_point3(Vec3::new(x, y, -0.5)).to_array(),
+                uv,
+                // `-436207617`: white at 0xE5 alpha.
+                color: [255, 255, 255, 0xE5],
+                light: [0, 0, 0, crate::mesh::UNLIT],
+            });
+        }
+    }
+    out
+}
+
+/// How far a player's outer layer (jacket, sleeves, trousers) sits out, in pixels.
+const PLAYER_LAYER: f32 = 0.25;
+/// `PlayerModel.createMesh`'s limbs: wide or slim arms, each with its sleeve.
+const PLAYER_WIDE: Limbs = Limbs {
+    cubes: [
+        &[
+            cube([-3.0, -2.0, -2.0], [4.0, 12.0, 4.0], [40.0, 16.0]),
+            grown(
+                cube([-3.0, -2.0, -2.0], [4.0, 12.0, 4.0], [40.0, 32.0]),
+                PLAYER_LAYER,
+            ),
+        ],
+        &[
+            cube([-1.0, -2.0, -2.0], [4.0, 12.0, 4.0], [32.0, 48.0]),
+            grown(
+                cube([-1.0, -2.0, -2.0], [4.0, 12.0, 4.0], [48.0, 48.0]),
+                PLAYER_LAYER,
+            ),
+        ],
+        PLAYER_LEGS[0],
+        PLAYER_LEGS[1],
+    ],
+    leg_x: 1.9,
+};
+const PLAYER_SLIM: Limbs = Limbs {
+    cubes: [
+        &[
+            cube([-2.0, -2.0, -2.0], [3.0, 12.0, 4.0], [40.0, 16.0]),
+            grown(
+                cube([-2.0, -2.0, -2.0], [3.0, 12.0, 4.0], [40.0, 32.0]),
+                PLAYER_LAYER,
+            ),
+        ],
+        &[
+            cube([-1.0, -2.0, -2.0], [3.0, 12.0, 4.0], [32.0, 48.0]),
+            grown(
+                cube([-1.0, -2.0, -2.0], [3.0, 12.0, 4.0], [48.0, 48.0]),
+                PLAYER_LAYER,
+            ),
+        ],
+        PLAYER_LEGS[0],
+        PLAYER_LEGS[1],
+    ],
+    leg_x: 1.9,
+};
+const PLAYER_LEGS: [&[Cube]; 2] = [
+    &[
+        cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0]),
+        grown(
+            cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 32.0]),
+            PLAYER_LAYER,
+        ),
+    ],
+    &[
+        cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [16.0, 48.0]),
+        grown(
+            cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 48.0]),
+            PLAYER_LAYER,
+        ),
+    ],
+];
+
 /// `PlayerModel.createMesh`: a humanoid with its own left limbs' texture, wide or slim
 /// arms, and the outer layer (jacket, sleeves, trousers) a quarter pixel out.
 fn player(l: &Living, slim: bool) -> Vec<Node> {
-    const LAYER: f32 = 0.25;
-    const WIDE: Limbs = Limbs {
-        cubes: [
-            &[
-                cube([-3.0, -2.0, -2.0], [4.0, 12.0, 4.0], [40.0, 16.0]),
-                grown(
-                    cube([-3.0, -2.0, -2.0], [4.0, 12.0, 4.0], [40.0, 32.0]),
-                    LAYER,
-                ),
-            ],
-            &[
-                cube([-1.0, -2.0, -2.0], [4.0, 12.0, 4.0], [32.0, 48.0]),
-                grown(
-                    cube([-1.0, -2.0, -2.0], [4.0, 12.0, 4.0], [48.0, 48.0]),
-                    LAYER,
-                ),
-            ],
-            LEGS[0],
-            LEGS[1],
-        ],
-        leg_x: 1.9,
-    };
-    const SLIM: Limbs = Limbs {
-        cubes: [
-            &[
-                cube([-2.0, -2.0, -2.0], [3.0, 12.0, 4.0], [40.0, 16.0]),
-                grown(
-                    cube([-2.0, -2.0, -2.0], [3.0, 12.0, 4.0], [40.0, 32.0]),
-                    LAYER,
-                ),
-            ],
-            &[
-                cube([-1.0, -2.0, -2.0], [3.0, 12.0, 4.0], [32.0, 48.0]),
-                grown(
-                    cube([-1.0, -2.0, -2.0], [3.0, 12.0, 4.0], [48.0, 48.0]),
-                    LAYER,
-                ),
-            ],
-            LEGS[0],
-            LEGS[1],
-        ],
-        leg_x: 1.9,
-    };
-    const LEGS: [&[Cube]; 2] = [
-        &[
-            cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0]),
-            grown(
-                cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 32.0]),
-                LAYER,
-            ),
-        ],
-        &[
-            cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [16.0, 48.0]),
-            grown(
-                cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 48.0]),
-                LAYER,
-            ),
-        ],
-    ];
     const JACKET: &[Cube] = &[grown(
         cube([-4.0, 0.0, -2.0], [8.0, 12.0, 4.0], [16.0, 32.0]),
-        LAYER,
+        PLAYER_LAYER,
     )];
-    let mut nodes = humanoid(l, if slim { SLIM } else { WIDE }, None);
+    let mut nodes = humanoid(l, if slim { PLAYER_SLIM } else { PLAYER_WIDE }, None);
     nodes.push(part(Some(2), [0.0; 3], [0.0; 3], JACKET));
     nodes
 }
@@ -1235,6 +1484,9 @@ mod tests {
             name_tag: None,
             equipment: Equipment::default(),
             swing: None,
+            burning: None,
+            hurt: false,
+            death_time: 0.0,
         }
     }
 
@@ -1314,6 +1566,73 @@ mod tests {
             close(head_min.z, 0.5) && close(head_max.z, 15.0 / 16.0),
             "{head_min} {head_max}"
         );
+    }
+
+    /// A zombie's flames (0.6 by 1.95) are six cards, 0.84 blocks to a side, a 0.45-block
+    /// step (scaled) apart, each 0.9 the width of the one below; seen from a camera looking
+    /// south, they face it, front out, and the first stands 0.3 (less 0.02 per whole card
+    /// height) towards it.
+    #[test]
+    fn flames_stack_up_facing_the_camera() {
+        let fire = [[0.0, 0.0, 0.5, 1.0], [0.5, 0.0, 1.0, 1.0]];
+        let mut out = Vec::new();
+        flames(fire, Vec3::ZERO, [0.6, 1.95], 0.0, [15, 15], &mut out);
+        let quads: Vec<&[Vertex]> = out.chunks(4).collect();
+        assert_eq!(quads.len(), 6);
+        let s = 0.6 * 1.4;
+        for (i, q) in quads.iter().enumerate() {
+            let p = q.iter().map(|v| Vec3::from(v.pos)).collect::<Vec<_>>();
+            // The camera looks along +z, so a card facing it faces -z.
+            let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize();
+            assert!((normal - Vec3::NEG_Z).length() < 1e-5, "{i}: {normal}");
+            let width = (p[1] - p[0]).length();
+            assert!(
+                (width - s * 0.9f32.powi(i as i32)).abs() < 1e-5,
+                "{i}: {width}"
+            );
+            assert!(
+                (p[0].y - s * 0.45 * i as f32).abs() < 1e-5,
+                "{i}: {}",
+                p[0].y
+            );
+            assert!((p[2].y - p[0].y - s * 1.4).abs() < 1e-5);
+            let z = -(0.3 - 2.0 * 0.02 - 0.03 * i as f32) * s;
+            assert!((p[0].z - z).abs() < 1e-5, "{i}: {} vs {z}", p[0].z);
+            // `fire_0` then `fire_1` mirrored, then the pair unmirrored, and so on.
+            let u = [q[0].uv[0], q[1].uv[0]];
+            let expected = [[0.0, 0.5], [0.5, 1.0], [0.5, 0.0], [1.0, 0.5]][i % 4];
+            assert_eq!(u, expected, "{i}");
+        }
+        assert!(quads.iter().all(|q| q.iter().all(|v| v.color == [255; 4])));
+    }
+
+    /// A dying mob tips over sideways, √((t − 1) / 20 × 1.6) of the way at t ticks, so it's
+    /// 56.9° over at 6 and flat from 13.5; a spider rolls on to its back instead.
+    #[test]
+    fn dying_mobs_fall_over() {
+        let up = |kind, death_time| {
+            let l = Living {
+                death_time,
+                ..standing(kind)
+            };
+            // Model space is y down: its up is -y.
+            let up = living_root(&l, 1.0)
+                .transform_vector3(Vec3::NEG_Y)
+                .normalize();
+            (up.angle_between(Vec3::Y).to_degrees(), up)
+        };
+        let pig = Kind::Pig;
+        assert!(up(pig, 0.0).0 < 1e-3);
+        let expected = (5.0f32 / 20.0 * 1.6).sqrt() * 90.0;
+        assert!(
+            (up(pig, 6.0).0 - expected).abs() < 1e-3,
+            "{:?}",
+            up(pig, 6.0)
+        );
+        let (angle, flat) = up(pig, 13.5);
+        assert!((angle - 90.0).abs() < 1e-3 && flat.x > 0.99, "{flat}");
+        assert!((up(pig, 20.0).0 - 90.0).abs() < 1e-3);
+        assert!((up(Kind::Spider, 20.0).0 - 180.0).abs() < 1e-3);
     }
 
     /// Wool colours as `ColorLerper` makes them: white is E6E6E6, others are their dye's

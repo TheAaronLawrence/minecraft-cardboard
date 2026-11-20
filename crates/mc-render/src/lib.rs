@@ -11,4 +11,5 @@ pub mod hud;
 pub mod item;
 pub mod mesh;
 pub mod mipmap;
+pub mod particle;
 pub mod tint;

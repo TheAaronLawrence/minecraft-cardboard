@@ -242,13 +242,29 @@ struct Tracked {
     /// What it holds and wears, by `EquipmentSlot` id.
     equipment: HashMap<u8, mc_protocol::Equipped>,
     swing: SwingState,
+    /// `LivingEntity.hurtTime`: ticks left of the red flash after a hit, from 10.
+    hurt_time: i32,
+    /// `LivingEntity.deathTime`: ticks since its health ran out.
+    death_time: u32,
+}
+
+/// `PlayerInfo.getSkin`: a player's downloaded skin once it's arrived, else the default
+/// skin for the UUID; and whether it has slim arms.
+fn skin(skins: &HashMap<u128, (String, bool)>, uuid: u128) -> (String, bool) {
+    match skins.get(&uuid) {
+        Some(skin) => skin.clone(),
+        None => {
+            let skin = mc_render::entity_model::default_skin(uuid);
+            (skin.to_owned(), skin.contains("/slim/"))
+        }
+    }
 }
 
 /// `LivingEntity.SwingState`: the swing an arm is in, as its hand, `SwingAnimationType` and
 /// length in ticks; ticks since it started; and its progress, 0 to 1, last tick and now.
 #[derive(Default)]
-struct SwingState {
-    current: Option<(u8, u8, i32)>,
+pub(crate) struct SwingState {
+    pub(crate) current: Option<(u8, u8, i32)>,
     ticks: i32,
     old: f32,
     now: f32,
@@ -257,7 +273,7 @@ struct SwingState {
 impl SwingState {
     /// `startIfAble`: a swing starts unless one is under half way through; the same swing
     /// again restarts without resetting its progress, so it runs on smoothly.
-    fn start_if_able(&mut self, swing: (u8, u8, i32)) {
+    pub(crate) fn start_if_able(&mut self, swing: (u8, u8, i32)) {
         if let Some((.., duration)) = self.current
             && self.ticks > 0
             && self.ticks <= duration / 2
@@ -271,7 +287,7 @@ impl SwingState {
         self.ticks = 0;
     }
 
-    fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) {
         self.old = self.now;
         match self.current {
             Some((.., duration)) => {
@@ -291,7 +307,7 @@ impl SwingState {
 
     /// `getAnimation`: the progress `pt` of the way to the next tick; a swing that
     /// restarted runs on past 1 rather than back.
-    fn animation(&self, pt: f32) -> f32 {
+    pub(crate) fn animation(&self, pt: f32) -> f32 {
         let now = if self.now >= self.old {
             self.now
         } else {
@@ -305,6 +321,7 @@ impl SwingState {
 /// `AgeableMob` and `Zombie` start with the baby flag, then each type's own.
 const SHARED_FLAGS: u8 = 0;
 const POSE: u8 = 6;
+const HEALTH: u8 = 9;
 /// `Avatar.DATA_PLAYER_MAIN_HAND`: `HumanoidArm`'s id, left 0 or right 1.
 const MAIN_HAND: u8 = 15;
 /// `Pose.CROUCHING`'s id.
@@ -330,6 +347,8 @@ pub struct Entities {
     tracked: HashMap<i32, Tracked>,
     /// Seeds items' bob offsets, as `Entity.random` would.
     seed: u64,
+    /// The poofs of smoke dying mobs leave.
+    particles: crate::particles::Particles,
 }
 
 impl Entities {
@@ -349,6 +368,7 @@ impl Entities {
                 .collect(),
             tracked: HashMap::new(),
             seed: 0x5DEECE66D,
+            particles: Default::default(),
         }
     }
 
@@ -361,6 +381,11 @@ impl Entities {
     }
 
     /// Names this player over its head, or forgets its name for `None`.
+    /// A player's skin sprite, and whether it has slim arms.
+    pub fn skin(&self, uuid: u128) -> (String, bool) {
+        skin(&self.skins, uuid)
+    }
+
     pub fn set_name(&mut self, uuid: u128, name: Option<String>) {
         match name {
             Some(name) => self.names.insert(uuid, name),
@@ -442,6 +467,8 @@ impl Entities {
                         data: HashMap::new(),
                         equipment: HashMap::new(),
                         swing: SwingState::default(),
+                        hurt_time: 0,
+                        death_time: 0,
                     },
                 );
             }
@@ -558,6 +585,21 @@ impl Entities {
                     e.data.extend(values);
                 }
             }
+            // `LivingEntity.handleDamageEvent` and `animateHurt`: it flashes red. The
+            // player's own pass on.
+            Event::Damaged(id) | Event::HurtAnimation { id, .. }
+                if self.tracked.contains_key(&id) =>
+            {
+                self.tracked.get_mut(&id).expect("checked").hurt_time = 10;
+            }
+            // `LivingEntity.handleEntityEvent(60)`: the mob's gone in a poof, just before
+            // the server removes it.
+            Event::EntityEvent { id, event: 60 } => {
+                if let Some(e) = self.tracked.get(&id) {
+                    let baby = matches!(e.data.get(&BABY), Some(DataValue::Bool(true)));
+                    self.particles.poof(e.now.pos, e.size(baby));
+                }
+            }
             other => return Some(other),
         }
         None
@@ -568,6 +610,16 @@ impl Entities {
         for e in self.tracked.values_mut() {
             e.tick(world, blocks);
         }
+        self.particles.tick(world, blocks);
+    }
+
+    /// The particles to draw, `partial` of the way to the next tick, lit by `light`.
+    pub fn particles(
+        &self,
+        partial: f32,
+        light: impl Fn(DVec3) -> [u8; 2],
+    ) -> Vec<mc_render::particle::Particle> {
+        self.particles.render(partial, light)
     }
 
     /// What to draw, `partial` of the way from the last tick to the next, with the sky and
@@ -620,6 +672,43 @@ impl Tracked {
         }
     }
 
+    /// `Entity.displayFireAnimation`: the bounding box's size while shared flag 0 says
+    /// it's on fire. None of these types is immune to fire.
+    fn burning(&self, baby: bool) -> Option<[f32; 2]> {
+        matches!(self.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 1 != 0)
+            .then(|| self.size(baby))
+    }
+
+    /// The bounding box's width and height (`getBbWidth` and `getBbHeight`).
+    fn size(&self, baby: bool) -> [f32; 2] {
+        match self.sort {
+            // `Avatar.POSES`, and `LivingEntity.SLEEPING_DIMENSIONS`.
+            Sort::Player => match self.pose() {
+                CROUCHING => [0.6, 1.5],
+                1 | 3 | 4 => [0.6, 0.6],
+                2 | 7 => [0.2, 0.2],
+                _ => [0.6, 1.8],
+            },
+            // `EntityTypes`' sizes, and each type's `BABY_DIMENSIONS`.
+            Sort::Item => [0.25, 0.25],
+            Sort::Mob(mob) => match (mob, baby) {
+                (MobType::Zombie, false) => [0.6, 1.95],
+                (MobType::Zombie, true) => [0.49, 0.98],
+                (MobType::Skeleton, _) => [0.6, 1.99],
+                (MobType::Creeper, _) => [0.6, 1.7],
+                (MobType::Spider, _) => [1.4, 0.9],
+                (MobType::Cow, false) => [0.9, 1.4],
+                (MobType::Cow, true) => [0.45, 0.7],
+                (MobType::Pig, false) => [0.9, 0.9],
+                (MobType::Pig, true) => [0.45, 0.45],
+                (MobType::Sheep, false) => [0.9, 1.3],
+                (MobType::Sheep, true) => [0.45, 0.65],
+                (MobType::Chicken, false) => [0.4, 0.7],
+                (MobType::Chicken, true) => [0.3, 0.4],
+            },
+        }
+    }
+
     fn living(&self) -> bool {
         self.sort != Sort::Item
     }
@@ -664,7 +753,12 @@ impl Tracked {
 
     /// `LivingEntity.tick` and `aiStep` as they run for another client's entity.
     fn tick_living(&mut self) {
-        // `LivingEntity.baseTick`.
+        // `LivingEntity.baseTick`: the hurt countdown, and `tickDeath` once its health
+        // (data 9) is gone.
+        self.hurt_time = (self.hurt_time - 1).max(0);
+        if matches!(self.data.get(&HEALTH), Some(DataValue::Float(h)) if *h <= 0.0) {
+            self.death_time += 1;
+        }
         self.swing.tick();
         if self.head_steps > 0 {
             self.head_yaw = rot_lerp(
@@ -787,6 +881,7 @@ impl Tracked {
                 pos,
                 age,
                 bob_offset: self.bob_offset,
+                burning: self.burning(false),
             }));
         }
         let flag = |i: u8| matches!(self.data.get(&i), Some(DataValue::Bool(true)));
@@ -798,24 +893,10 @@ impl Tracked {
             format!("minecraft:entity/{animal}/{animal}_{name}")
         };
         let (kind, texture) = match self.sort {
-            // `PlayerInfo.getSkin`: the downloaded skin once it's arrived, else the default
-            // skin for the UUID.
             Sort::Player => {
                 let crouching = self.pose() == CROUCHING;
-                match skins.get(&self.uuid) {
-                    Some((sprite, slim)) => (
-                        Kind::Player {
-                            slim: *slim,
-                            crouching,
-                        },
-                        sprite.clone(),
-                    ),
-                    None => {
-                        let skin = mc_render::entity_model::default_skin(self.uuid);
-                        let slim = skin.contains("/slim/");
-                        (Kind::Player { slim, crouching }, skin.to_owned())
-                    }
-                }
+                let (skin, slim) = skin(skins, self.uuid);
+                (Kind::Player { slim, crouching }, skin)
             }
             Sort::Mob(mob) => match mob {
                 MobType::Zombie => {
@@ -869,6 +950,14 @@ impl Tracked {
             name_tag: self.name_tag(names),
             equipment: self.equipment(armor),
             swing: self.swing(pt),
+            burning: self.burning(flag(BABY)),
+            // `hasRedOverlay`.
+            hurt: self.hurt_time > 0 || self.death_time > 0,
+            death_time: if self.death_time > 0 {
+                self.death_time as f32 + pt
+            } else {
+                0.0
+            },
         }))
     }
 
@@ -1006,6 +1095,7 @@ mod tests {
             names: HashMap::new(),
             armor: HashMap::new(),
             seed: 1,
+            particles: Default::default(),
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1093,6 +1183,7 @@ mod tests {
             names: HashMap::new(),
             armor: HashMap::new(),
             seed: 1,
+            particles: Default::default(),
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1124,5 +1215,56 @@ mod tests {
         assert_eq!(tag(&mut e, 1 << 5, 0), None);
         e.set_name(7, None);
         assert_eq!(tag(&mut e, 0, 0), None);
+    }
+
+    /// A hit turns an entity red for the 9 ticks after it (`hurtTime` counts down from 10
+    /// and shows while above 0); a hit on an untracked id (the player's own) passes on; a
+    /// dead one stays red as it dies.
+    #[test]
+    fn hits_and_deaths_flash_red() {
+        let mut e = Entities {
+            types: vec!["minecraft:player".into()],
+            tracked: HashMap::new(),
+            skins: HashMap::new(),
+            names: HashMap::new(),
+            armor: HashMap::new(),
+            seed: 1,
+            particles: Default::default(),
+        };
+        e.event(Event::AddEntity {
+            id: 1,
+            uuid: 7,
+            kind: 0,
+            pos: [0.0; 3],
+            velocity: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+        });
+        let hurt = |e: &Entities| match e.render(0.0, |_| [15, 0]).pop() {
+            Some((Entity::Living(l), _)) => l.hurt,
+            _ => panic!("the player isn't drawn"),
+        };
+        let tick = |e: &mut Entities| e.tracked.get_mut(&1).expect("added").tick_living();
+        assert!(!hurt(&e));
+        assert!(e.event(Event::Damaged(1)).is_none());
+        let flashing: Vec<bool> = (0..11)
+            .map(|_| {
+                let now = hurt(&e);
+                tick(&mut e);
+                now
+            })
+            .collect();
+        assert_eq!(flashing, [[true; 10].as_slice(), &[false]].concat());
+        assert!(matches!(
+            e.event(Event::Damaged(2)),
+            Some(Event::Damaged(2))
+        ));
+        let values = vec![(HEALTH, DataValue::Float(0.0))];
+        e.event(Event::EntityData { id: 1, values });
+        assert!(!hurt(&e));
+        tick(&mut e);
+        assert!(hurt(&e));
     }
 }

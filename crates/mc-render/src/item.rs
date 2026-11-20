@@ -17,8 +17,9 @@ pub enum ItemIcon {
     /// Sprite layers drawn one over another, each as its atlas rect and tint.
     Flat {
         layers: Vec<([f32; 4], [f32; 3])>,
-        /// How it sits in a mob's right and left hand.
-        hands: [Transform; 2],
+        /// How it sits in a mob's right and left hand, then in the player's own as they
+        /// see it.
+        hands: [Transform; 4],
     },
     /// A model drawn in 3D, with a colour per tint index.
     Model {
@@ -29,7 +30,7 @@ pub enum ItemIcon {
         ground: Transform,
         /// Lit from the front (`gui_light: front`) rather than the side.
         front_lit: bool,
-        hands: [Transform; 2],
+        hands: [Transform; 4],
     },
 }
 
@@ -38,6 +39,12 @@ impl ItemIcon {
     pub fn hand(&self, left: bool) -> Transform {
         let (ItemIcon::Flat { hands, .. } | ItemIcon::Model { hands, .. }) = self;
         hands[left as usize]
+    }
+
+    /// Its first person transform for a right (`false`) or left hand.
+    pub fn first_person_hand(&self, left: bool) -> Transform {
+        let (ItemIcon::Flat { hands, .. } | ItemIcon::Model { hands, .. }) = self;
+        hands[2 + left as usize]
     }
 }
 
@@ -48,11 +55,16 @@ const IDENTITY: Transform = Transform {
     scale: [1.0; 3],
 };
 
-/// A model's hand transforms: its left hand's is its right hand's when it has none
-/// (`ItemTransforms.Deserializer`).
-fn hands(model: &Model) -> [Transform; 2] {
-    let right = model.hands[0].unwrap_or(IDENTITY);
-    [right, model.hands[1].unwrap_or(right)]
+/// A model's hand transforms, third person then first: a left hand's is the right hand's
+/// when it has none (`ItemTransforms.Deserializer`).
+fn hands(model: &Model) -> [Transform; 4] {
+    let [right, first_right] = [0, 2].map(|i| model.hands[i].unwrap_or(IDENTITY));
+    [
+        right,
+        model.hands[1].unwrap_or(right),
+        first_right,
+        model.hands[3].unwrap_or(first_right),
+    ]
 }
 
 /// An item's definition, resolved to one model, before the atlas exists.

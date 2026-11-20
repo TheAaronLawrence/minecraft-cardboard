@@ -15,6 +15,10 @@ pub struct Camera {
     pub pitch: f32,
     /// Vertical field of view, as vanilla's FOV setting (70 by default).
     pub fov: f32,
+    /// A transform in view space between the view and the projection: the walking bob
+    /// and hurt tilt (`GameRenderer.bobView` and `bobHurt`), which shake the world and the
+    /// hands but not where the player looks.
+    pub bob: Mat4,
 }
 
 impl Camera {
@@ -30,7 +34,12 @@ impl Camera {
     pub fn view_proj(&self, aspect: f32, far: f32) -> Mat4 {
         // wgpu's clip space is y-up with depth 0..1, which glam calls the DirectX convention.
         glam::camera::rh::proj::directx::perspective(self.fov.to_radians(), aspect, 0.05, far)
-            * glam::camera::rh::view::look_to_mat4(self.eye, self.forward(), Vec3::Y)
+            * self.view()
+    }
+
+    /// World space to view space, bob and all.
+    pub fn view(&self) -> Mat4 {
+        self.bob * glam::camera::rh::view::look_to_mat4(self.eye, self.forward(), Vec3::Y)
     }
 }
 
@@ -132,7 +141,14 @@ pub struct Renderer {
     tag_vertices: Option<(wgpu::Buffer, u32)>,
     /// The outline around the block the player looks at, and its index count.
     outline_vertices: Option<(wgpu::Buffer, u32)>,
+    /// The player's own arm and held items, and their index count.
+    hand_vertices: Option<(wgpu::Buffer, u32)>,
+    /// The fire a burning player sees, and its index count.
+    fire_overlay_vertices: Option<(wgpu::Buffer, u32)>,
     bind_group: wgpu::BindGroup,
+    /// The same bindings, with the uniforms the hand is drawn with.
+    hand_bind_group: wgpu::BindGroup,
+    hand_uniforms: wgpu::Buffer,
     portal_bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     /// Six indices per quad, enough for the largest chunk's largest layer.
@@ -200,6 +216,12 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let hand_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hand uniforms"),
+            size: std::mem::size_of::<Uniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -231,26 +253,29 @@ impl Renderer {
                 },
             ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        &texture.create_view(&Default::default()),
-                    ),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        let atlas_view = texture.create_view(&Default::default());
+        let bind_group_with = |uniforms: &wgpu::Buffer| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniforms.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&atlas_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            })
+        };
+        let bind_group = bind_group_with(&uniforms);
+        let hand_bind_group = bind_group_with(&hand_uniforms);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&layout)],
@@ -594,7 +619,11 @@ impl Renderer {
             see_through_vertices: None,
             tag_vertices: None,
             outline_vertices: None,
+            hand_vertices: None,
+            fire_overlay_vertices: None,
             bind_group,
+            hand_bind_group,
+            hand_uniforms,
             portal_bind_group,
             uniforms,
             indices: None,
@@ -674,6 +703,20 @@ impl Renderer {
         self.eye_vertices = self.quads_buffer("entity eyes", &meshes.eyes);
         self.see_through_vertices = self.quads_buffer("name tags behind", &meshes.see_through);
         self.tag_vertices = self.quads_buffer("name tags", &meshes.tags);
+    }
+
+    /// Draws these quads (from `entity::first_person`), the player's own hands, over the
+    /// world, as vanilla draws them after clearing the depth buffer, at a field of view of
+    /// 70 whatever the view's is (`Camera.calculateHudFov`).
+    pub fn set_hand(&mut self, vertices: &[Vertex]) {
+        self.hand_vertices = self.quads_buffer("hand", vertices);
+    }
+
+    /// Draws these quads (from `entity::fire_overlay`) over the hands, blended and
+    /// whatever their depth, as `ScreenEffectRenderer` draws the fire a burning player
+    /// sees.
+    pub fn set_fire_overlay(&mut self, vertices: &[Vertex]) {
+        self.fire_overlay_vertices = self.quads_buffer("fire overlay", vertices);
     }
 
     /// Replaces a sprite's pixels in the atlas, mipmaps and all, such as a skin slot's
@@ -815,6 +858,18 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        let hand_view_proj = Camera {
+            fov: 70.0,
+            ..*camera
+        }
+        .view_proj(width as f32 / height as f32, view.distance * 2.0);
+        let hand_uniforms = Uniforms {
+            view_proj: hand_view_proj.to_cols_array_2d(),
+            inv_view_proj: hand_view_proj.inverse().to_cols_array_2d(),
+            ..uniforms
+        };
+        self.queue
+            .write_buffer(&self.hand_uniforms, 0, bytemuck::bytes_of(&hand_uniforms));
         let scale = gui_scale(width, height);
         let (gui_width, gui_height) = (width.div_ceil(scale), height.div_ceil(scale));
         let mut gui_mesh = match (&self.screen, &self.hotbar, view.hud) {
@@ -946,6 +1001,44 @@ impl Renderer {
             if view.hud && self.screen.is_none() {
                 pass.set_pipeline(&self.crosshair);
                 pass.draw(0..3, 0..1);
+            }
+        }
+        if let Some((indices, _)) = &self.indices
+            && (self.hand_vertices.is_some() || self.fire_overlay_vertices.is_some())
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hand"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth.as_ref().expect("made above").0,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &self.hand_bind_group, &[]);
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            // The hands, then the screen effects over them.
+            for (pipeline, vertices) in [
+                (&self.entity, &self.hand_vertices),
+                (&self.see_through, &self.fire_overlay_vertices),
+            ] {
+                if let Some((buffer, count)) = vertices {
+                    pass.set_pipeline(pipeline);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
             }
         }
         if gui_buffer.is_some() {

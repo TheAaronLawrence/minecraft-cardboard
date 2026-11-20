@@ -501,6 +501,7 @@ impl winit::application::ApplicationHandler for App {
                     yaw: 0.0,
                     pitch: 0.0,
                     fov: 70.0,
+                    bob: glam::Mat4::IDENTITY,
                 };
                 let view = View {
                     distance: 16.0,

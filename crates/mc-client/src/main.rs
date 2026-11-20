@@ -28,7 +28,9 @@ use mc_render::hud::menu;
 
 mod chat;
 mod entities;
+mod hands;
 mod inventory;
+mod particles;
 mod skins;
 mod stream;
 mod walk;
@@ -70,6 +72,7 @@ fn parse_args() -> Result<Args> {
             yaw: 0.0,
             pitch: 20.0,
             fov: 70.0,
+            bob: glam::Mat4::IDENTITY,
         },
         distance: 5,
         ticks: 0.0,
@@ -577,7 +580,13 @@ impl App {
     fn enter_world(&mut self, scene: Scene) -> Result<()> {
         let state = self.state.as_mut().context("no window")?;
         self.walker = match scene.outbox.clone() {
-            Some(outbox) => Some(walk::Walker::new(outbox, &scene.registry)?),
+            // An offline-mode server, which is all `connect` joins, gives the player the
+            // offline UUID for their name.
+            Some(outbox) => Some(walk::Walker::new(
+                outbox,
+                &scene.registry,
+                mc_protocol::offline_uuid(&self.args.name),
+            )?),
             None => None,
         };
         state.renderer = Renderer::new(
@@ -602,6 +611,7 @@ impl App {
             walker.leave();
         }
         (self.walker, self.streamer, self.loading) = (None, None, None);
+        self.args.camera.bob = glam::Mat4::IDENTITY;
         if let Some(state) = &mut self.state {
             state.release();
             state.renderer = Renderer::new(
@@ -1195,6 +1205,7 @@ impl winit::application::ApplicationHandler for App {
                             walker.frame(dt, input, buttons, camera.yaw, camera.pitch)
                         {
                             camera.eye = eye;
+                            camera.bob = walker.view_bob();
                         }
                         if let Some(state) = &mut self.state {
                             let mut hotbar = walker.hotbar();
@@ -1223,11 +1234,35 @@ impl winit::application::ApplicationHandler for App {
                                 renderer.write_sprite(self.models.atlas.sprite(&sprite), &skin);
                             }
                             let entities = walker.entities();
-                            renderer.set_entities(&mc_render::entity::vertices(
+                            let mut meshes = mc_render::entity::vertices(
                                 &self.models,
-                                self.view.hud.then_some(&*camera),
+                                camera,
+                                self.view.hud,
                                 &entities,
+                            );
+                            meshes.cutout.extend(mc_render::particle::vertices(
+                                &self.models.atlas,
+                                camera,
+                                &walker.particles(),
                             ));
+                            renderer.set_entities(&meshes);
+                            // F1 hides the hands with the HUD.
+                            let hand = walker
+                                .first_person(camera.yaw, camera.pitch, camera.eye)
+                                .filter(|_| self.view.hud)
+                                .map(|(hands, light)| {
+                                    mc_render::entity::first_person(
+                                        &self.models,
+                                        camera,
+                                        &hands,
+                                        light,
+                                    )
+                                });
+                            renderer.set_hand(&hand.unwrap_or_default());
+                            let fire = walker.sees_fire().then(|| {
+                                mc_render::entity::fire_overlay(&self.models.atlas, camera)
+                            });
+                            renderer.set_fire_overlay(&fire.unwrap_or_default());
                             let cracks = walker.cracks();
                             if cracks != self.shown_cracks {
                                 let vertices: Vec<_> = cracks
@@ -1339,6 +1374,7 @@ mod tests {
                 yaw,
                 pitch: 0.0,
                 fov: 70.0,
+                bob: glam::Mat4::IDENTITY,
             };
             let view_proj = camera.view_proj(1.0, 100.0);
             let screen_x = |p: Vec3| view_proj.project_point3(p).x;

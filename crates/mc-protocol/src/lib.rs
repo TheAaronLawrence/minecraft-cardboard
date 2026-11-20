@@ -45,6 +45,23 @@ pub enum Event {
     },
     /// The player's score (`Player.DATA_SCORE_ID`), which the death screen shows.
     Score(i32),
+    /// An explosion pushed the player by this much velocity, in blocks a tick
+    /// (`ClientboundExplodePacket.playerKnockback`).
+    ExplosionPush([f64; 3]),
+    /// Something happened to an entity (`ClientboundEntityEventPacket`): its id, and the
+    /// event's id, such as 60 for a mob's death poof.
+    EntityEvent {
+        id: i32,
+        event: i8,
+    },
+    /// An entity was hurt (`ClientboundDamageEventPacket`); only its id is read.
+    Damaged(i32),
+    /// An entity was hurt from a direction (`ClientboundHurtAnimationPacket`): its id, and
+    /// the direction relative to its yaw, in degrees.
+    HurtAnimation {
+        id: i32,
+        yaw: f32,
+    },
     /// The player's health, food level and saturation.
     Health {
         health: f32,
@@ -750,16 +767,14 @@ fn play(
             "set_entity_data" => {
                 let id = r.varint()?;
                 let values = entity_data(&mut r, registry, config);
-                if id == own_id {
-                    // `Player.DATA_SCORE_ID`: index 18 (after `Entity`'s 8, `LivingEntity`'s
-                    // 7, `Avatar`'s 2 and `Player`'s absorption).
-                    match values.iter().find(|(i, _)| *i == 18) {
-                        Some((_, DataValue::Int(score))) => tx.send(Event::Score(*score)).is_ok(),
-                        _ => true,
-                    }
-                } else {
-                    tx.send(Event::EntityData { id, values }).is_ok()
-                }
+                // `Player.DATA_SCORE_ID`: index 18 (after `Entity`'s 8, `LivingEntity`'s 7,
+                // `Avatar`'s 2 and `Player`'s absorption).
+                let score = match values.iter().find(|(i, _)| *i == 18) {
+                    Some((_, DataValue::Int(score))) if id == own_id => Some(*score),
+                    _ => None,
+                };
+                score.is_none_or(|score| tx.send(Event::Score(score)).is_ok())
+                    && tx.send(Event::EntityData { id, values }).is_ok()
             }
             "add_entity" => {
                 let id = r.varint()?;
@@ -792,6 +807,10 @@ fn play(
                     .map(|_| Ok(u128::from_be_bytes(r.take(16)?.try_into()?)))
                     .collect::<Result<_>>()?;
                 tx.send(Event::RemovePlayers(ids)).is_ok()
+            }
+            "entity_event" => {
+                let id = r.i32()?;
+                tx.send(Event::EntityEvent { id, event: r.i8()? }).is_ok()
             }
             "remove_entities" => {
                 let ids = (0..r.count()?).map(|_| r.varint()).collect::<Result<_>>()?;
@@ -874,6 +893,22 @@ fn play(
                     velocity: lp_vec3(&mut r)?,
                 })
                 .is_ok()
+            }
+            "damage_event" => tx.send(Event::Damaged(r.varint()?)).is_ok(),
+            // Its centre, radius and block count, then the push; its particles and sound
+            // after that aren't read.
+            "explode" => {
+                r.take(8 * 3 + 4 + 4)?;
+                if r.bool()? {
+                    let push = [r.f64()?, r.f64()?, r.f64()?];
+                    tx.send(Event::ExplosionPush(push)).is_ok()
+                } else {
+                    true
+                }
+            }
+            "hurt_animation" => {
+                let id = r.varint()?;
+                tx.send(Event::HurtAnimation { id, yaw: r.f32()? }).is_ok()
             }
             "set_health" => tx
                 .send(Event::Health {

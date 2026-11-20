@@ -19,9 +19,15 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// Tint × directional shade × ambient occlusion, RGB, then alpha 255.
     pub color: [u8; 4],
-    /// Sky and block light levels × 16 (0..240), then two unused bytes.
+    /// Sky and block light levels × 16 (0..240), an end portal's layer count, then flags:
+    /// [`RED`] and [`UNLIT`].
     pub light: [u8; 4],
 }
+
+/// A vertex flag: an entity's red hurt flash.
+pub const RED: u8 = 1;
+/// A vertex flag: drawn at full brightness, whatever the light.
+pub const UNLIT: u8 = 2;
 
 /// Four vertices per quad, drawn as two triangles.
 #[derive(Default)]

@@ -114,6 +114,7 @@ pub fn sprites(res: &Resources) -> Vec<String> {
     out.extend([POT_BASE, POT_SIDE, CONDUIT, PORTAL].map(str::to_owned));
     out.extend(DEFAULT_SKINS.map(str::to_owned));
     out.extend(crate::entity::SPRITES.map(str::to_owned));
+    out.extend(crate::particle::POOF.map(str::to_owned));
     out.extend(
         ["", "_exposed", "_weathered", "_oxidized"]
             .map(|age| format!("minecraft:entity/copper_golem/copper_golem{age}")),

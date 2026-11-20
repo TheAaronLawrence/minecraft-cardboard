@@ -197,6 +197,16 @@ pub struct Walker {
     death: Option<Death>,
     /// A respawn was asked for and the server hasn't respawned the player yet.
     respawning: bool,
+    /// The player's own UUID, for its skin.
+    uuid: u128,
+    /// The player's hands as they see them.
+    hands: crate::hands::Hands,
+    /// The view's walking bob and hurt tilt.
+    view_bob: crate::hands::ViewBob,
+    /// The server says the player is on fire.
+    on_fire: bool,
+    /// Items that place a block (`BlockItem`s, named as their block is).
+    block_items: std::collections::HashSet<String>,
 }
 
 /// The open death screen: its message, ticks since it (or its confirmation) opened, and
@@ -233,18 +243,20 @@ struct Health {
 }
 
 impl Health {
-    /// `LocalPlayer.hurtTo`.
-    fn hurt_to(&mut self, health: f32) {
+    /// `LocalPlayer.hurtTo`; returns whether it hurt the player.
+    fn hurt_to(&mut self, health: f32) -> bool {
+        let damage = self.value - health;
+        let hurt = self.flash && damage > 0.0;
         if self.flash {
-            let damage = self.value - health;
             if damage < 0.0 {
                 self.damage_cooldown = 10;
-            } else if damage > 0.0 {
+            } else if hurt {
                 self.damage_cooldown = 20;
             }
         }
         self.flash = true;
         self.value = health;
+        hurt
     }
 
     /// The part of `Hud.extractPlayerHealth` that runs each frame: when the health changes
@@ -271,9 +283,11 @@ impl Health {
 }
 
 impl Walker {
+    /// A player with this UUID, who has joined with `outbox`.
     pub fn new(
         outbox: mc_protocol::Outbox,
         registry: &mc_registry::Registry,
+        uuid: u128,
     ) -> anyhow::Result<Self> {
         let state = |name: &str| registry.block(name).map(|b| b.default_state);
         let air = state("minecraft:air").expect("air");
@@ -339,6 +353,19 @@ impl Walker {
             score: 0,
             death: None,
             respawning: false,
+            uuid,
+            hands: Default::default(),
+            view_bob: Default::default(),
+            on_fire: false,
+            block_items: (0..registry.item_count())
+                .filter_map(|id| registry.item_name(id))
+                .filter(|name| {
+                    registry
+                        .item_info(name)
+                        .is_some_and(|i| i.name.starts_with("block."))
+                })
+                .map(str::to_owned)
+                .collect(),
         })
     }
 
@@ -367,6 +394,24 @@ impl Walker {
     }
 
     pub fn server_event(&mut self, event: mc_protocol::Event) {
+        // `handleSetEntityMotion`'s `lerpMotion` on the player: the server's knockback.
+        if let mc_protocol::Event::EntityMotion { id, velocity } = event
+            && id == self.entity_id
+        {
+            self.player.velocity = DVec3::from(velocity);
+            return;
+        }
+        // The player's own shared flags (data 0): bit 0 is `isOnFire`.
+        if let mc_protocol::Event::EntityData { id, values } = &event
+            && *id == self.entity_id
+        {
+            for (index, value) in values {
+                if let (0, mc_protocol::DataValue::Byte(flags)) = (index, value) {
+                    self.on_fire = flags & 1 != 0;
+                }
+            }
+            return;
+        }
         let Some(event) = self.entities.event(event) else {
             return;
         };
@@ -417,15 +462,25 @@ impl Walker {
                 self.respawning = false;
                 self.health.value = 20.0;
                 self.health.flash = false;
+                self.view_bob.reset();
+                self.on_fire = false;
             }
             mc_protocol::Event::GameMode(mode) => self.game_mode = mode,
+            mc_protocol::Event::Damaged(id) if id == self.entity_id => self.view_bob.hurt(),
+            // `Entity.pushFromExplosion`.
+            mc_protocol::Event::ExplosionPush(push) => self.player.velocity += DVec3::from(push),
+            mc_protocol::Event::HurtAnimation { id, yaw } if id == self.entity_id => {
+                self.view_bob.hurt_from(yaw)
+            }
             // `ClientPacketListener.handleSetHealth`.
             mc_protocol::Event::Health {
                 health,
                 food,
                 saturation,
             } => {
-                self.health.hurt_to(health);
+                if self.health.hurt_to(health) {
+                    self.view_bob.hurt();
+                }
                 (self.food, self.saturation) = (food, saturation);
             }
             mc_protocol::Event::Experience { progress, level } => {
@@ -465,6 +520,13 @@ impl Walker {
     /// The entities to draw this frame, between the last tick and the next.
     pub fn entities(&self) -> Vec<mc_render::entity::Lit> {
         self.entities.render(self.since_tick / TICK, |p| {
+            self.light.at(p.floor().as_ivec3().to_array())
+        })
+    }
+
+    /// The particles to draw this frame, between the last tick and the next.
+    pub fn particles(&self) -> Vec<mc_render::particle::Particle> {
+        self.entities.particles(self.since_tick / TICK, |p| {
             self.light.at(p.floor().as_ivec3().to_array())
         })
     }
@@ -708,6 +770,38 @@ impl Walker {
         }
     }
 
+    /// `GameRenderer`'s view bob and hurt tilt this frame, for [`mc_render::gpu::Camera::bob`].
+    pub fn view_bob(&self) -> glam::Mat4 {
+        self.view_bob.matrix(self.since_tick / TICK, self.dead())
+    }
+
+    /// `ScreenEffectRenderer`'s fire: whether the player sees themselves burning, which
+    /// spectators don't (`Entity.displayFireAnimation`).
+    pub fn sees_fire(&self) -> bool {
+        self.on_fire && self.game_mode != 3
+    }
+
+    /// The player's own hands as they see them, `pt` of the way to the next tick, looking
+    /// at `yaw` and `pitch`, and the light at `eye`; none when they don't see them (dead,
+    /// or a spectator).
+    pub fn first_person(
+        &self,
+        yaw: f32,
+        pitch: f32,
+        eye: Vec3,
+    ) -> Option<(mc_render::entity::FirstPerson, [u8; 2])> {
+        if self.dead() || self.game_mode == 3 {
+            return None;
+        }
+        let hands = self.hands.view(
+            self.since_tick / TICK,
+            yaw,
+            pitch,
+            self.entities.skin(self.uuid),
+        );
+        Some((hands, self.light.at(eye.floor().as_ivec3().to_array())))
+    }
+
     /// The blocks being mined, by us or others, with their states and crack stages
     /// (`MultiPlayerGameMode.getDestroyStage`: a tenth of the progress, rounded down).
     pub fn cracks(&self) -> Vec<([i32; 3], u32, u8)> {
@@ -778,6 +872,9 @@ impl Walker {
             }
             self.previous = self.player.pos;
             self.entities.tick(&self.collision, &self.blocks);
+            let dead = self.dead();
+            self.view_bob
+                .tick(self.player.velocity, self.player.on_ground, dead);
             if self.dead() && self.inventory.is_open() {
                 self.close_inventory();
             }
@@ -799,7 +896,16 @@ impl Walker {
             if let Err(e) = self.tick_hands(buttons) {
                 eprintln!("sending block actions: {e:#}");
             }
+            let before = self.player.pos;
             self.player.tick(input, &self.collision, &self.blocks);
+            let moved = self.player.pos - before;
+            self.view_bob.walked(moved.x.hypot(moved.z) as f32);
+            let held = [36 + self.selected as usize, 45].map(|i| {
+                self.inventory.slots[i]
+                    .as_ref()
+                    .map(|(item, _)| item.as_str())
+            });
+            self.hands.tick(held, yaw, pitch);
             if let Err(e) = self.send_changes(input) {
                 eprintln!("sending movement: {e:#}");
             }
@@ -892,8 +998,10 @@ impl Walker {
                 if !self.instabuild {
                     self.miss_time = 10;
                 }
+                self.hands.reset_swap();
             }
         }
+        self.hands.swing(0);
         self.outbox.send("punch", &[])
     }
 
@@ -910,6 +1018,7 @@ impl Walker {
             Some(h) if held => {
                 if !self.is_air(h.pos) {
                     self.continue_destroy(h.pos, h.face)?;
+                    self.hands.swing(0);
                     self.outbox.send("punch", &[])?;
                 }
                 Ok(())
@@ -969,13 +1078,17 @@ impl Walker {
     fn stop_destroy(&mut self) -> anyhow::Result<()> {
         match self.destroying.take() {
             // Vanilla says down here, whatever face was mined.
-            Some((pos, ..)) => self.player_action(ABORT_DESTROY_BLOCK, pos, 0, false),
+            Some((pos, ..)) => {
+                self.hands.reset_swap();
+                self.player_action(ABORT_DESTROY_BLOCK, pos, 0, false)
+            }
             None => Ok(()),
         }
     }
 
     /// `Minecraft.startUseItem` with the main hand: use the held item on the block looked
-    /// at (placing it, if it's a block), or on nothing.
+    /// at (placing it, if it's a block), or on nothing. Placing a block swings the arm and
+    /// drops the hand (`itemUsed`); other uses' success isn't predicted, so they don't.
     fn start_use(&mut self, hit: Option<BlockHit>) -> anyhow::Result<()> {
         self.right_click_delay = 4;
         if self.destroying.is_some() {
@@ -986,6 +1099,14 @@ impl Walker {
         body.put_varint(0); // main hand
         match hit {
             Some(h) => {
+                let held = &self.inventory.slots[36 + self.selected as usize];
+                if held
+                    .as_ref()
+                    .is_some_and(|(item, _)| self.block_items.contains(item))
+                {
+                    self.hands.swing(0);
+                    self.hands.item_used(0);
+                }
                 let cursor = h.location - h.pos.as_dvec3();
                 body.put_block_pos(h.pos.to_array())
                     .put_varint(h.face as i32)

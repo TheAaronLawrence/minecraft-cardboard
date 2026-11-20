@@ -31,7 +31,15 @@ struct VertexOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) distance: f32,
+    // The lightmap's colour, and 1 where an entity flashes red.
+    @location(3) light: vec3<f32>,
+    @location(4) red: f32,
 };
+
+// Vertex flags, in the light's fourth byte: an entity's red hurt flash (`OverlayTexture`'s
+// red row), and quads drawn without the lightmap.
+const FLAG_RED: u32 = 1u;
+const FLAG_UNLIT: u32 = 2u;
 
 // LightTexture: a light level's brightness before the sky and block colours are mixed.
 fn brightness(level: f32) -> f32 {
@@ -63,8 +71,13 @@ fn vs(in: VertexIn) -> VertexOut {
     out.clip = u.view_proj * vec4<f32>(in.pos, 1.0);
     out.uv = in.uv;
     // Light bytes hold level × 16; the vertex format normalises them to 0..1.
-    let light = lightmap(in.light.x * 255.0 / 16.0, in.light.y * 255.0 / 16.0);
-    out.color = vec4<f32>(in.color.rgb * light, in.color.a);
+    let flags = u32(round(in.light.w * 255.0));
+    out.light = lightmap(in.light.x * 255.0 / 16.0, in.light.y * 255.0 / 16.0);
+    if (flags & FLAG_UNLIT) != 0u {
+        out.light = vec3<f32>(1.0);
+    }
+    out.red = select(0.0, 1.0, (flags & FLAG_RED) != 0u);
+    out.color = in.color;
     // Vanilla fogs by cylindrical distance: horizontal, and vertical separately.
     let d = in.pos - u.eye.xyz;
     out.distance = max(length(d.xz), abs(d.y));
@@ -73,7 +86,11 @@ fn vs(in: VertexIn) -> VertexOut {
 
 fn shade(in: VertexOut) -> vec4<f32> {
     let texel = textureSample(atlas, atlas_sampler, in.uv);
-    let color = texel * in.color;
+    var color = texel * in.color;
+    // The `entity` shader's overlay: the red row's 0xB2 alpha keeps that much of the
+    // colour and makes the rest red, before the lightmap.
+    let flashed = mix(vec3<f32>(1.0, 0.0, 0.0), color.rgb, 178.0 / 255.0);
+    color = vec4<f32>(mix(color.rgb, flashed, in.red) * in.light, color.a);
     let fog = smoothstep(u.params.x, u.params.y, in.distance);
     return vec4<f32>(mix(color.rgb, u.fog_color.rgb, fog), color.a);
 }

@@ -91,7 +91,7 @@ impl Resources {
             generated: false,
             gui: None,
             ground: None,
-            hands: [None; 2],
+            hands: [None; 4],
             gui_light_front: None,
         };
         let mut next = Some(id.to_owned());
@@ -267,7 +267,12 @@ fn one() -> u32 {
     1
 }
 
-const HAND_KEYS: [&str; 2] = ["thirdperson_righthand", "thirdperson_lefthand"];
+const HAND_KEYS: [&str; 4] = [
+    "thirdperson_righthand",
+    "thirdperson_lefthand",
+    "firstperson_righthand",
+    "firstperson_lefthand",
+];
 
 #[derive(Deserialize)]
 struct RawModel {
@@ -295,8 +300,9 @@ pub struct Model {
     /// How a dropped item with this model sits on the ground (`display.ground`).
     pub ground: Option<Transform>,
     /// How it sits in a mob's right and left hand (`display.thirdperson_righthand` and
-    /// `thirdperson_lefthand`).
-    pub hands: [Option<Transform>; 2],
+    /// `thirdperson_lefthand`), then in the player's own right and left hand as they see
+    /// it (`firstperson_righthand` and `firstperson_lefthand`).
+    pub hands: [Option<Transform>; 4],
     /// `gui_light`: lit from the front, as flat items are, rather than from the side as
     /// blocks are. `None` when no model in the chain says, which means side.
     pub gui_light_front: Option<bool>,
