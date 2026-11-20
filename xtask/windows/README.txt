@@ -2,14 +2,13 @@ minecraft-cardboard {version} (preview, built from {commit})
 A Rust rebuild of Minecraft: Java Edition, matching vanilla 26.3. For now it's a world viewer.
 
 Run: open minecraft-cardboard-launcher.exe, which you download on its own from the
-release. The first time, press Sign In: the repository is private, so the launcher shows a
-code to enter at github.com/login/device. It then installs the game into
-%APPDATA%\.minecraft-cardboard\game (this folder), with Minecraft 26.3's textures and data
-downloaded from Mojang (about 41 MB, once), and each time it opens it updates the
-game to the newest release, downloading just the new exe unless the resources changed.
-Set your player name and press Play. The game opens on its title screen: Singleplayer
-opens the bundled test world, and Multiplayer asks for a server's address. Only
-offline-mode servers (online-mode=false in server.properties) work so far.
+release. It installs the game into %APPDATA%\.minecraft-cardboard\game (this folder), with
+Minecraft 26.3's textures and data downloaded from Mojang (about 41 MB, once), and each
+time it opens it updates the game to the newest release, downloading just the new exe
+unless the resources changed. Set your player name and press Play. The game opens on its
+title screen: Singleplayer opens the bundled test world, and Multiplayer asks for a
+server's address. Only offline-mode servers (online-mode=false in server.properties) work
+so far.
 
 In the window: click to capture the mouse, WASD to move, Space and Shift to go up and down,
 Ctrl to fly faster, Esc to pause. On a server: Space jumps, Shift sneaks, Ctrl sprints, left

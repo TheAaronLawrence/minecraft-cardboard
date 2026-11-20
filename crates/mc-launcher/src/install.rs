@@ -46,11 +46,11 @@ pub enum Step<'a> {
 
 /// Brings `dir` up to the newest release, with the Mojang files it needs, and returns its
 /// tag.
-pub fn update(dir: &Path, token: &str, step: &mut dyn FnMut(Step)) -> Result<String> {
+pub fn update(dir: &Path, step: &mut dyn FnMut(Step)) -> Result<String> {
     step(Step::Checking);
-    let release = github::latest_release(token)?;
+    let release = github::latest_release()?;
     if read_text(&dir.join("version.txt")) != release.tag || !game_exe(dir).exists() {
-        install_release(dir, token, &release, step)?;
+        install_release(dir, &release, step)?;
     }
     if !crate::mojang::installed(dir) {
         crate::mojang::install(dir, step)?;
@@ -58,16 +58,11 @@ pub fn update(dir: &Path, token: &str, step: &mut dyn FnMut(Step)) -> Result<Str
     Ok(release.tag)
 }
 
-fn install_release(
-    dir: &Path,
-    token: &str,
-    release: &Release,
-    step: &mut dyn FnMut(Step),
-) -> Result<()> {
-    let assets = github::download(token, release.asset("assets.txt")?, |_| {})?;
+fn install_release(dir: &Path, release: &Release, step: &mut dyn FnMut(Step)) -> Result<()> {
+    let assets = github::download(release.asset("assets.txt")?, |_| {})?;
     let assets = String::from_utf8_lossy(&assets).trim().to_owned();
     let full = assets != read_text(&dir.join("assets.txt"));
-    let zip = download(release, if full { FULL } else { EXE_ONLY }, token, step)?;
+    let zip = download(release, if full { FULL } else { EXE_ONLY }, step)?;
     step(Step::Installing);
     std::fs::create_dir_all(dir)?;
     // Without these, an install cut short is redone, in full, next time.
@@ -91,19 +86,14 @@ fn install_release(
     Ok(())
 }
 
-fn download(
-    release: &Release,
-    suffix: &str,
-    token: &str,
-    step: &mut dyn FnMut(Step),
-) -> Result<Vec<u8>> {
+fn download(release: &Release, suffix: &str, step: &mut dyn FnMut(Step)) -> Result<Vec<u8>> {
     let asset = release.asset(suffix)?;
     let what = if suffix == FULL {
         release.tag.clone()
     } else {
         format!("the {} update", release.tag)
     };
-    github::download(token, asset, |done| {
+    github::download(asset, |done| {
         step(Step::Downloading {
             what: &what,
             done,

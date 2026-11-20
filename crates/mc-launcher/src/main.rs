@@ -1,6 +1,5 @@
 //! minecraft-cardboard-launcher: a window in the style of Mojang's Minecraft Launcher, and
-//! the one file a player downloads. It signs in with GitHub (the repository is private),
-//! installs the newest release into the game folder, with Minecraft's own textures and data
+//! the one file a player downloads. It installs the newest release into the game folder, with Minecraft's own textures and data
 //! from Mojang, and keeps it up to date, then Play starts the game as the player named,
 //! opening on its title screen. It hides while the game runs and comes back when the game
 //! closes, with the game's error if it failed.
@@ -77,10 +76,9 @@ fn main() -> Result<()> {
         home,
         game_dir,
         managed,
-        token: settings["token"].as_str().map(str::to_owned),
         worker: None,
     };
-    if managed && app.token.is_some() {
+    if managed {
         app.start_worker();
     }
     let event_loop = winit::event_loop::EventLoop::new()?;
@@ -124,45 +122,17 @@ fn valid_name(name: &str) -> bool {
         && name.chars().all(|c| (33..127).contains(&(c as u32)))
 }
 
-/// What the worker thread, which signs in and updates, tells the window.
+/// What the worker thread, which installs and updates the game, tells the window.
 enum Message {
-    /// The code to enter, and where.
-    Code(String, String),
-    SignedIn {
-        token: String,
-        account: String,
-    },
     Status(String, Option<f32>),
     /// The game is installed and up to date, at this release.
     Ready(String),
-    /// What went wrong, and whether it was the sign-in, which is then forgotten.
-    Failed(String, bool),
+    Failed(String),
 }
 
-/// Signs in if there's no `token`, then brings the game in `dir` up to date.
-fn work(tx: &Sender<Message>, token: Option<String>, dir: &Path) -> Result<String> {
-    let token = match token {
-        Some(token) => token,
-        None => {
-            let client_id = github::client_id().context(
-                "This launcher was built without a GitHub client ID (CARDBOARD_GITHUB_CLIENT_ID)",
-            )?;
-            let code = github::request_code(&client_id)?;
-            let _ = tx.send(Message::Code(code.user_code.clone(), code.uri.clone()));
-            let _ = tx.send(Message::Status(
-                "Waiting for you to sign in on GitHub...".into(),
-                None,
-            ));
-            open_browser(&code.uri);
-            github::wait_for_token(&client_id, &code)?
-        }
-    };
-    let account = github::login(&token)?;
-    let _ = tx.send(Message::SignedIn {
-        token: token.clone(),
-        account,
-    });
-    install::update(dir, &token, &mut |step| {
+/// Brings the game in `dir` up to date.
+fn work(tx: &Sender<Message>, dir: &Path) -> Result<String> {
+    install::update(dir, &mut |step| {
         let (status, progress) = match step {
             install::Step::Checking => ("Checking for updates...".to_owned(), None),
             install::Step::Downloading { what, done, total } => {
@@ -174,20 +144,6 @@ fn work(tx: &Sender<Message>, token: Option<String>, dir: &Path) -> Result<Strin
         };
         let _ = tx.send(Message::Status(status, progress));
     })
-}
-
-/// Opens `url` in the player's browser.
-fn open_browser(url: &str) {
-    let result = if cfg!(windows) {
-        Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", url])
-            .spawn()
-    } else {
-        Command::new("xdg-open").arg(url).spawn()
-    };
-    if let Err(e) = result {
-        eprintln!("opening {url}: {e}");
-    }
 }
 
 struct WindowState {
@@ -215,9 +171,7 @@ struct App {
     game_dir: PathBuf,
     /// The launcher installs and updates the game, rather than playing one built beside it.
     managed: bool,
-    /// The GitHub token the player signed in with.
-    token: Option<String>,
-    /// While signing in or updating, what the worker thread says.
+    /// While installing or updating, what the worker thread says.
     worker: Option<Receiver<Message>>,
 }
 
@@ -276,13 +230,13 @@ impl App {
         Some((w.div_ceil(scale) as i32, h.div_ceil(scale) as i32, mouse))
     }
 
-    /// The big button signs in, rather than playing.
-    fn signs_in(&self) -> bool {
-        self.managed && self.token.is_none() && self.worker.is_none()
+    /// The big button tries installing again, rather than playing: installing failed.
+    fn retries(&self) -> bool {
+        self.managed && self.worker.is_none() && self.screen.installed.is_none()
     }
 
     fn button_active(&self) -> bool {
-        self.signs_in()
+        self.retries()
             || (self.worker.is_none()
                 && self.screen.installed.is_some()
                 && valid_name(&self.screen.name.value))
@@ -293,12 +247,9 @@ impl App {
         self.focused_at = Instant::now();
     }
 
-    /// Saves the name and the token in `launcher.json`.
+    /// Saves the name in `launcher.json`.
     fn save(&self) {
-        let settings = serde_json::json!({
-            "name": self.screen.name.value,
-            "token": self.token,
-        });
+        let settings = serde_json::json!({ "name": self.screen.name.value });
         let path = self.home.join("launcher.json");
         let result = std::fs::create_dir_all(&self.home).and_then(|()| {
             std::fs::write(
@@ -311,17 +262,14 @@ impl App {
         }
     }
 
-    /// Signs in if need be, then updates the game, on a thread of its own.
+    /// Installs or updates the game, on a thread of its own.
     fn start_worker(&mut self) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let (token, dir) = (self.token.clone(), self.game_dir.clone());
+        let dir = self.game_dir.clone();
         std::thread::spawn(move || {
-            let message = match work(&tx, token, &dir) {
+            let message = match work(&tx, &dir) {
                 Ok(tag) => Message::Ready(tag),
-                Err(e) => Message::Failed(
-                    format!("{e:#}"),
-                    e.downcast_ref::<github::Unauthorized>().is_some(),
-                ),
+                Err(e) => Message::Failed(format!("{e:#}")),
             };
             let _ = tx.send(message);
         });
@@ -335,15 +283,6 @@ impl App {
         let messages: Vec<Message> = rx.try_iter().collect();
         for message in messages {
             match message {
-                Message::Code(code, uri) => self.screen.code = Some((code, uri)),
-                Message::SignedIn { token, account } => {
-                    self.screen.code = None;
-                    self.screen.account = Some(account);
-                    if self.token.as_ref() != Some(&token) {
-                        self.token = Some(token);
-                        self.save();
-                    }
-                }
                 Message::Status(status, progress) => {
                     self.screen.status = Some(status);
                     self.screen.progress = progress;
@@ -353,33 +292,23 @@ impl App {
                     self.screen.installed = Some(tag);
                     (self.screen.status, self.screen.progress) = (None, None);
                 }
-                Message::Failed(error, signed_out) => {
+                Message::Failed(error) => {
                     self.worker = None;
-                    self.screen.code = None;
                     (self.screen.status, self.screen.progress) = (None, None);
                     self.screen.error = Some(error);
                     // The game may have been left half updated.
                     self.screen.installed = install::installed(&self.game_dir);
-                    if signed_out {
-                        self.sign_out();
-                    }
                 }
             }
         }
     }
 
-    fn sign_out(&mut self) {
-        self.token = None;
-        self.screen.account = None;
-        self.save();
-    }
-
-    /// The big button: signs in, or plays.
+    /// The big button: tries installing again, or plays.
     fn press(&mut self) {
         if !self.button_active() {
             return;
         }
-        if self.signs_in() {
+        if self.retries() {
             return self.start_worker();
         }
         self.play();
@@ -452,12 +381,6 @@ impl App {
         }
         if launcher::contains(layout.play, mouse) {
             self.press();
-        }
-        if self.screen.account.is_some()
-            && self.worker.is_none()
-            && launcher::contains(layout.sign_out, mouse)
-        {
-            self.sign_out();
         }
     }
 
@@ -544,7 +467,7 @@ impl winit::application::ApplicationHandler for App {
                 let mouse = self.gui().and_then(|g| g.2);
                 self.screen.mouse = mouse;
                 self.screen.play_active = self.button_active();
-                self.screen.button = if self.signs_in() { "SIGN IN" } else { "" }.into();
+                self.screen.button = if self.retries() { "RETRY" } else { "" }.into();
                 // `TextCursorUtils.isCursorVisible`: on for 300 ms, off for 300.
                 self.screen.cursor_on =
                     (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2);
