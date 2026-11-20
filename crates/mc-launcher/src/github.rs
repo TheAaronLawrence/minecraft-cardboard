@@ -52,10 +52,7 @@ pub fn latest_release() -> Result<Release> {
     let releases: Vec<Value> = get(RELEASES_URL, "application/vnd.github+json")?
         .body_mut()
         .read_json()?;
-    let latest = releases
-        .iter()
-        .find(|r| r["draft"] != true)
-        .context("The game has no releases yet")?;
+    let latest = newest(&releases).context("The game has no releases yet")?;
     Ok(Release {
         tag: latest["tag_name"].as_str().unwrap_or_default().to_owned(),
         assets: latest["assets"]
@@ -72,6 +69,16 @@ pub fn latest_release() -> Result<Release> {
             })
             .collect(),
     })
+}
+
+/// The most recently published of `releases` that isn't a draft. GitHub doesn't list them
+/// newest first: it put preview.9 before preview.10. Its timestamps are UTC in one ISO 8601
+/// form, so they sort as text.
+fn newest(releases: &[Value]) -> Option<&Value> {
+    releases
+        .iter()
+        .filter(|r| r["draft"] != true)
+        .max_by_key(|r| r["published_at"].as_str().unwrap_or_default())
 }
 
 /// A release file's bytes, calling `progress` with how many have arrived.
@@ -100,4 +107,21 @@ pub fn read_body(
         progress(bytes.len() as u64);
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The newest release by when it was published, not by where GitHub lists it or by its
+    /// tag sorted as text, and never a draft.
+    #[test]
+    fn newest_release_is_the_last_published() {
+        let releases = serde_json::json!([
+            {"tag_name": "v0.0.1-preview.9", "draft": false, "published_at": "2026-11-20T07:03:33Z"},
+            {"tag_name": "v0.0.1-preview.11", "draft": true, "published_at": null},
+            {"tag_name": "v0.0.1-preview.10", "draft": false, "published_at": "2026-11-20T07:26:50Z"},
+            {"tag_name": "v0.0.1-preview.8", "draft": false, "published_at": "2026-11-19T19:12:03Z"},
+        ]);
+        let newest = super::newest(releases.as_array().unwrap()).unwrap();
+        assert_eq!(newest["tag_name"], "v0.0.1-preview.10");
+    }
 }
