@@ -1,22 +1,24 @@
 # minecraft-cardboard 0.0.1
 
 A Rust rebuild of Minecraft: Java Edition. Our code is our own; the game data under
-`resources/` is Mojang's, copied from vanilla **26.3**, the version whose data, protocol and
-save format we match.
+`resources/` is Mojang's, from vanilla **26.3**, the version whose data, protocol and save
+format we match.
 
 ## Resources
 
 `resources/` holds the vanilla `assets/` and `data/` trees (textures, models, blockstates,
-shaders, sounds, languages, worldgen, recipes, loot tables, tags). `resources/source.json`
-records exactly which vanilla files they came from. To refresh them:
+shaders, sounds, languages, worldgen, recipes, loot tables, tags). They aren't committed,
+because Mojang's EULA does not allow redistributing them: after cloning, download them once
+(the build and the tests need them):
 
 ```sh
 cargo xtask fetch-assets        # or: cargo xtask fetch-assets <vanilla version>
 ```
 
 It downloads from Mojang's public servers, checks every file's SHA-1, and copies only
-assets and data, never game code. Keep this repository private: Mojang's EULA does not allow
-redistributing these files.
+assets and data, never game code. `resources/source.json` records exactly which vanilla
+files they came from. Releases don't carry them either: the launcher downloads the same
+client jar from Mojang when it installs the game.
 
 `resources/reports/` holds what vanilla defines in code rather than data: every block's
 properties and numeric state ids (`blocks.json`), every registry's protocol ids
@@ -63,9 +65,14 @@ items as in vanilla, and the server keeps what you do.
 cargo build --release -p mc-client && cargo run --release -p mc-launcher
 ```
 
-Opens the launcher, styled after Mojang's: set a player name and press Play. It starts the
-`minecraft-cardboard` beside it, remembers the name in `launcher.json` beside it, and comes
-back when the game closes. Started without `--world` or `--server`, the game opens on its
+Opens the launcher, styled after Mojang's: set a player name and press Play. Built beside
+the game, as here, it starts the `minecraft-cardboard` beside it. On its own, as players
+download it from a release, it signs in with GitHub (the device flow, through the OAuth App
+whose client ID is in `crates/mc-launcher/src/github.rs`), installs the newest release into
+`.minecraft-cardboard/game` in the app data folder, with Mojang's files from the 26.3 client
+jar, (`CARDBOARD_HOME` overrides it), and
+updates it each time it opens. It remembers the name and the sign-in in `launcher.json`
+there, and comes back when the game closes. Started without `--world` or `--server`, the game opens on its
 title screen: Singleplayer opens the test world, and Multiplayer asks for a server's
 address, remembered as vanilla does in `options.txt`. Leaving a server, or losing the
 connection, comes back to the menus.
@@ -81,7 +88,8 @@ connection, comes back to the menus.
 - `mc-physics`: the player's movement and collision, as vanilla's
 - `mc-render`: texture atlas, model baking, chunk meshing with smooth lighting, wgpu renderer
 - `mc-client`: the `minecraft-cardboard` binary
-- `mc-launcher`: the `minecraft-cardboard-launcher` binary, which starts the game
+- `mc-launcher`: the `minecraft-cardboard-launcher` binary, which installs, updates and
+  starts the game
 
 ## Checks
 

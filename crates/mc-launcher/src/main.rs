@@ -1,60 +1,120 @@
-//! minecraft-cardboard-launcher: a window in the style of Mojang's Minecraft Launcher, where
-//! you set your player name and press Play to start the game, which opens on its title
-//! screen. It remembers the name in `launcher.json` beside it, hides while the game runs,
-//! and comes back when the game closes, with the game's error if it failed.
+//! minecraft-cardboard-launcher: a window in the style of Mojang's Minecraft Launcher, and
+//! the one file a player downloads. It signs in with GitHub (the repository is private),
+//! installs the newest release into the game folder, with Minecraft's own textures and data
+//! from Mojang, and keeps it up to date, then Play starts the game as the player named,
+//! opening on its title screen. It hides while the game runs and comes back when the game
+//! closes, with the game's error if it failed.
+//!
+//! Its own art comes from a few vanilla files built into it, so it draws before the game is
+//! installed. Built beside the game, as in this repository's `target/`, it plays that game
+//! and installs nothing.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
+
+mod github;
+mod install;
+mod mojang;
 
 use anyhow::{Context, Result};
 use mc_render::gpu::{Camera, Renderer, View};
 use mc_render::hud::HudArt;
 use mc_render::hud::launcher::{self, Launcher};
 use mc_render::hud::menu::Field;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 /// `StringUtil.isValidPlayerName`'s length.
 const NAME_MAX: usize = 16;
 
+/// The vanilla files the launcher draws with, by their paths under `resources/`.
+macro_rules! embedded {
+    ($($path:literal),* $(,)?) => {
+        &[$(($path, include_bytes!(concat!("../../../resources/", $path)))),*]
+    };
+}
+const ART: &[(&str, &[u8])] = embedded![
+    "assets/minecraft/font/include/default.json",
+    "assets/minecraft/textures/font/ascii.png",
+    "assets/minecraft/textures/gui/menu_background.png",
+    "assets/minecraft/textures/gui/title/background/panorama_0.png",
+    "assets/minecraft/textures/gui/title/minecraft.png",
+];
+
 fn main() -> Result<()> {
-    let res = mc_assets::Resources::new(mc_assets::default_root());
-    let registry = mc_registry::Registry::vanilla()?;
-    let models = mc_render::bake::BlockModels::bake(&res, &registry, &[])?;
-    let name = load_name();
+    let home = home();
+    let models = mc_render::bake::BlockModels::gui(&mc_assets::Resources::new(unpack_art(&home)?))?;
+    let settings: serde_json::Value = std::fs::read(home.join("launcher.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let name = settings["name"].as_str().unwrap_or("cardboard");
+    // A game built beside the launcher is played as it is; otherwise it's installed.
+    let beside = std::env::current_exe()?
+        .parent()
+        .context("the launcher's folder")?
+        .to_owned();
+    let managed = !install::game_exe(&beside).exists();
+    let game_dir = if managed { home.join("game") } else { beside };
     let mut app = App {
         hud: models.hud.clone(),
         models: Some(models),
         screen: Launcher {
-            name: Field::new(&name),
+            name: Field::new(name),
+            installed: if managed {
+                install::installed(&game_dir)
+            } else {
+                Some("Built from source".into())
+            },
             ..Default::default()
         },
         state: None,
         cursor: None,
         focused_at: Instant::now(),
         game: None,
+        home,
+        game_dir,
+        managed,
+        token: settings["token"].as_str().map(str::to_owned),
+        worker: None,
     };
+    if managed && app.token.is_some() {
+        app.start_worker();
+    }
     let event_loop = winit::event_loop::EventLoop::new()?;
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-/// A file beside the launcher.
-fn beside_exe(name: &str) -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.join(name)))
-        .unwrap_or_else(|| name.into())
+/// The launcher's folder, which holds its settings and the game: `.minecraft-cardboard` in
+/// the roaming app data folder, as `.minecraft` is, or in the home folder off Windows.
+/// `CARDBOARD_HOME` overrides it.
+fn home() -> PathBuf {
+    if let Some(dir) = std::env::var_os("CARDBOARD_HOME") {
+        return dir.into();
+    }
+    let base = std::env::var_os(if cfg!(windows) { "APPDATA" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".minecraft-cardboard")
 }
 
-/// The saved player name, or the default.
-fn load_name() -> String {
-    let saved: serde_json::Value = std::fs::read(beside_exe("launcher.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    saved["name"].as_str().unwrap_or("cardboard").to_owned()
+/// Writes the built-in art where the asset loaders read files, and returns that folder.
+fn unpack_art(home: &Path) -> Result<PathBuf> {
+    let root = home.join("launcher").join("resources");
+    let files = ART
+        .iter()
+        .copied()
+        // The menus' translations load with the art, but the launcher needs none.
+        .chain([("assets/minecraft/lang/en_us.json", &b"{}"[..])]);
+    for (path, bytes) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().context("an art file's folder")?)?;
+        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(root)
 }
 
 /// `StringUtil.isValidPlayerName`, and not empty.
@@ -62,6 +122,72 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.chars().count() <= NAME_MAX
         && name.chars().all(|c| (33..127).contains(&(c as u32)))
+}
+
+/// What the worker thread, which signs in and updates, tells the window.
+enum Message {
+    /// The code to enter, and where.
+    Code(String, String),
+    SignedIn {
+        token: String,
+        account: String,
+    },
+    Status(String, Option<f32>),
+    /// The game is installed and up to date, at this release.
+    Ready(String),
+    /// What went wrong, and whether it was the sign-in, which is then forgotten.
+    Failed(String, bool),
+}
+
+/// Signs in if there's no `token`, then brings the game in `dir` up to date.
+fn work(tx: &Sender<Message>, token: Option<String>, dir: &Path) -> Result<String> {
+    let token = match token {
+        Some(token) => token,
+        None => {
+            let client_id = github::client_id().context(
+                "This launcher was built without a GitHub client ID (CARDBOARD_GITHUB_CLIENT_ID)",
+            )?;
+            let code = github::request_code(&client_id)?;
+            let _ = tx.send(Message::Code(code.user_code.clone(), code.uri.clone()));
+            let _ = tx.send(Message::Status(
+                "Waiting for you to sign in on GitHub...".into(),
+                None,
+            ));
+            open_browser(&code.uri);
+            github::wait_for_token(&client_id, &code)?
+        }
+    };
+    let account = github::login(&token)?;
+    let _ = tx.send(Message::SignedIn {
+        token: token.clone(),
+        account,
+    });
+    install::update(dir, &token, &mut |step| {
+        let (status, progress) = match step {
+            install::Step::Checking => ("Checking for updates...".to_owned(), None),
+            install::Step::Downloading { what, done, total } => {
+                let mb = |b: u64| b as f64 / 1_000_000.0;
+                let status = format!("Downloading {what}: {:.1} of {:.1} MB", mb(done), mb(total));
+                (status, Some(done as f32 / total.max(1) as f32))
+            }
+            install::Step::Installing => ("Installing...".to_owned(), None),
+        };
+        let _ = tx.send(Message::Status(status, progress));
+    })
+}
+
+/// Opens `url` in the player's browser.
+fn open_browser(url: &str) {
+    let result = if cfg!(windows) {
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn()
+    } else {
+        Command::new("xdg-open").arg(url).spawn()
+    };
+    if let Err(e) = result {
+        eprintln!("opening {url}: {e}");
+    }
 }
 
 struct WindowState {
@@ -83,6 +209,16 @@ struct App {
     focused_at: Instant,
     /// The game, while it runs.
     game: Option<Child>,
+    /// The launcher's folder, with its settings.
+    home: PathBuf,
+    /// Where the game is installed, or built.
+    game_dir: PathBuf,
+    /// The launcher installs and updates the game, rather than playing one built beside it.
+    managed: bool,
+    /// The GitHub token the player signed in with.
+    token: Option<String>,
+    /// While signing in or updating, what the worker thread says.
+    worker: Option<Receiver<Message>>,
 }
 
 impl App {
@@ -140,8 +276,16 @@ impl App {
         Some((w.div_ceil(scale) as i32, h.div_ceil(scale) as i32, mouse))
     }
 
-    fn play_active(&self) -> bool {
-        valid_name(&self.screen.name.value)
+    /// The big button signs in, rather than playing.
+    fn signs_in(&self) -> bool {
+        self.managed && self.token.is_none() && self.worker.is_none()
+    }
+
+    fn button_active(&self) -> bool {
+        self.signs_in()
+            || (self.worker.is_none()
+                && self.screen.installed.is_some()
+                && valid_name(&self.screen.name.value))
     }
 
     fn focus(&mut self, focused: bool) {
@@ -149,28 +293,112 @@ impl App {
         self.focused_at = Instant::now();
     }
 
+    /// Saves the name and the token in `launcher.json`.
+    fn save(&self) {
+        let settings = serde_json::json!({
+            "name": self.screen.name.value,
+            "token": self.token,
+        });
+        let path = self.home.join("launcher.json");
+        let result = std::fs::create_dir_all(&self.home).and_then(|()| {
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&settings).unwrap_or_default(),
+            )
+        });
+        if let Err(e) = result {
+            eprintln!("saving {}: {e}", path.display());
+        }
+    }
+
+    /// Signs in if need be, then updates the game, on a thread of its own.
+    fn start_worker(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (token, dir) = (self.token.clone(), self.game_dir.clone());
+        std::thread::spawn(move || {
+            let message = match work(&tx, token, &dir) {
+                Ok(tag) => Message::Ready(tag),
+                Err(e) => Message::Failed(
+                    format!("{e:#}"),
+                    e.downcast_ref::<github::Unauthorized>().is_some(),
+                ),
+            };
+            let _ = tx.send(message);
+        });
+        self.worker = Some(rx);
+        self.screen.error = None;
+    }
+
+    /// Takes in what the worker has said since the last frame.
+    fn check_worker(&mut self) {
+        let Some(rx) = &self.worker else { return };
+        let messages: Vec<Message> = rx.try_iter().collect();
+        for message in messages {
+            match message {
+                Message::Code(code, uri) => self.screen.code = Some((code, uri)),
+                Message::SignedIn { token, account } => {
+                    self.screen.code = None;
+                    self.screen.account = Some(account);
+                    if self.token.as_ref() != Some(&token) {
+                        self.token = Some(token);
+                        self.save();
+                    }
+                }
+                Message::Status(status, progress) => {
+                    self.screen.status = Some(status);
+                    self.screen.progress = progress;
+                }
+                Message::Ready(tag) => {
+                    self.worker = None;
+                    self.screen.installed = Some(tag);
+                    (self.screen.status, self.screen.progress) = (None, None);
+                }
+                Message::Failed(error, signed_out) => {
+                    self.worker = None;
+                    self.screen.code = None;
+                    (self.screen.status, self.screen.progress) = (None, None);
+                    self.screen.error = Some(error);
+                    // The game may have been left half updated.
+                    self.screen.installed = install::installed(&self.game_dir);
+                    if signed_out {
+                        self.sign_out();
+                    }
+                }
+            }
+        }
+    }
+
+    fn sign_out(&mut self) {
+        self.token = None;
+        self.screen.account = None;
+        self.save();
+    }
+
+    /// The big button: signs in, or plays.
+    fn press(&mut self) {
+        if !self.button_active() {
+            return;
+        }
+        if self.signs_in() {
+            return self.start_worker();
+        }
+        self.play();
+    }
+
     /// Starts the game as the player named, remembering the name, and hides until the game
     /// closes.
     fn play(&mut self) {
-        if !self.play_active() {
-            return;
-        }
         let name = self.screen.name.value.clone();
-        let settings = serde_json::json!({ "name": name });
-        if let Err(e) = std::fs::write(
-            beside_exe("launcher.json"),
-            serde_json::to_vec_pretty(&settings).unwrap_or_default(),
-        ) {
-            eprintln!("saving launcher.json: {e}");
-        }
-        let exe = beside_exe(&format!(
-            "minecraft-cardboard{}",
-            std::env::consts::EXE_SUFFIX
-        ));
+        self.save();
+        let exe = install::game_exe(&self.game_dir);
         // The game writes its log only when it fails, so an old one would be mistaken for
         // this run's.
-        let _ = std::fs::remove_file(beside_exe("minecraft-cardboard.log"));
-        match Command::new(&exe).args(["--name", &name]).spawn() {
+        let _ = std::fs::remove_file(self.game_dir.join("minecraft-cardboard.log"));
+        match Command::new(&exe)
+            .args(["--name", &name])
+            .current_dir(&self.game_dir)
+            .spawn()
+        {
             Ok(child) => {
                 self.game = Some(child);
                 self.screen.error = None;
@@ -191,8 +419,8 @@ impl App {
         };
         self.game = None;
         if !status.success() {
-            let log =
-                std::fs::read_to_string(beside_exe("minecraft-cardboard.log")).unwrap_or_default();
+            let log = std::fs::read_to_string(self.game_dir.join("minecraft-cardboard.log"))
+                .unwrap_or_default();
             let mut error = match log.lines().find(|l| !l.trim().is_empty()) {
                 Some(line) => format!("The game stopped: {}", line.trim()),
                 None => format!("The game closed unexpectedly ({status})"),
@@ -223,7 +451,13 @@ impl App {
             self.focus(false);
         }
         if launcher::contains(layout.play, mouse) {
-            self.play();
+            self.press();
+        }
+        if self.screen.account.is_some()
+            && self.worker.is_none()
+            && launcher::contains(layout.sign_out, mouse)
+        {
+            self.sign_out();
         }
     }
 
@@ -231,7 +465,7 @@ impl App {
     fn key(&mut self, event: &winit::event::KeyEvent) {
         use winit::keyboard::{Key, NamedKey};
         if event.logical_key == Key::Named(NamedKey::Enter) {
-            return self.play();
+            return self.press();
         }
         if !self.screen.focused {
             return;
@@ -262,6 +496,7 @@ impl winit::application::ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         self.check_game();
+        self.check_worker();
         // Redraw often enough for the cursor's blink, and notice the game closing.
         event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
             Instant::now() + Duration::from_millis(50),
@@ -308,7 +543,8 @@ impl winit::application::ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let mouse = self.gui().and_then(|g| g.2);
                 self.screen.mouse = mouse;
-                self.screen.play_active = self.play_active();
+                self.screen.play_active = self.button_active();
+                self.screen.button = if self.signs_in() { "SIGN IN" } else { "" }.into();
                 // `TextCursorUtils.isCursorVisible`: on for 300 ms, off for 300.
                 self.screen.cursor_on =
                     (self.focused_at.elapsed().as_millis() / 300).is_multiple_of(2);

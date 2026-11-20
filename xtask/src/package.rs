@@ -1,14 +1,16 @@
 //! `cargo xtask package-windows [TAG]`: cross-compiles the client for 64-bit Windows and
 //! writes a release's files to `target/package/`:
 //!
-//! - `minecraft-cardboard-VERSION-windows-x64.zip`: the game and its launcher, the files they read
-//!   at run time and the updater (`update.cmd`, `update.ps1`).
-//! - `...-windows-x64-exe-only.zip`: the exe and updater, for updates that keep the resources.
-//! - `assets.txt`: a fingerprint of the resources, which tells the updater which zip it needs.
+//! - `minecraft-cardboard-launcher.exe`: the launcher, the one file players download. It
+//!   installs the game from the zips below and keeps it up to date.
+//! - `minecraft-cardboard-VERSION-windows-x64.zip`: the game and the files it reads at run
+//!   time, except Mojang's, which the launcher downloads from Mojang.
+//! - `...-windows-x64-exe-only.zip`: just the exe, for updates that keep the resources.
+//! - `assets.txt`: a fingerprint of the resources, which tells the launcher which zip it needs.
 //!
-//! TAG is the GitHub release tag the files are for, written to `version.txt` so the updater
-//! knows what's installed. Publish them with
-//! `gh release create TAG target/package/*.zip target/package/assets.txt --prerelease`.
+//! TAG is the GitHub release tag the files are for, written to `version.txt` so the launcher
+//! knows what's installed. Publish them with `gh release create TAG target/package/*.zip
+//! target/package/assets.txt target/package/minecraft-cardboard-launcher.exe --prerelease`.
 
 use anyhow::{Context, Result, ensure};
 use std::io::Write;
@@ -20,16 +22,11 @@ const LINKER: &str = "x86_64-w64-mingw32-gcc";
 const EXE: &str = "minecraft-cardboard.exe";
 const LAUNCHER: &str = "minecraft-cardboard-launcher.exe";
 
-/// What the client reads beside its exe (see `mc_assets::locate`), as folders or files.
-/// Sounds and other languages aren't used yet, so they stay out and the zip stays small.
+/// What the client reads beside its exe (see `mc_assets::locate`), as folders or files,
+/// besides Mojang's textures, models and data, which the launcher downloads from Mojang
+/// into `resources/` for the client jar `resources/source.json` names.
 const FILES: &[&str] = &[
-    "resources/assets/minecraft/blockstates",
-    "resources/assets/minecraft/font/include/default.json",
-    "resources/assets/minecraft/items",
-    "resources/assets/minecraft/lang/en_us.json",
-    "resources/assets/minecraft/models",
-    "resources/assets/minecraft/textures",
-    "resources/data",
+    "resources/source.json",
     "resources/reports",
     "fixtures/worlds/test-world",
 ];
@@ -69,24 +66,12 @@ pub fn package_windows(tag: Option<&str>) -> Result<()> {
         .replace("{commit}", &commit(&repo)?)
         .replace('\n', "\r\n");
     let assets = assets_fingerprint(&repo)?;
-    // What both zips hold: the game and the launcher, the updater, and what's installed.
+    let built = |exe: &str| repo.join("target").join(TARGET).join("release").join(exe);
+    // What both zips hold, which the launcher installs: the game and what's installed.
     let common = |dir: &Path| -> Result<()> {
         std::fs::create_dir_all(dir)?;
-        for exe in [EXE, LAUNCHER] {
-            std::fs::copy(
-                repo.join("target").join(TARGET).join("release").join(exe),
-                dir.join(exe),
-            )?;
-        }
+        std::fs::copy(built(EXE), dir.join(EXE))?;
         std::fs::write(dir.join("README.txt"), &readme)?;
-        std::fs::write(
-            dir.join("update.ps1"),
-            include_str!("../windows/update.ps1").replace('\n', "\r\n"),
-        )?;
-        std::fs::write(
-            dir.join("update.cmd"),
-            include_str!("../windows/update.cmd"),
-        )?;
         if let Some(tag) = tag {
             std::fs::write(dir.join("version.txt"), tag)?;
         }
@@ -101,6 +86,8 @@ pub fn package_windows(tag: Option<&str>) -> Result<()> {
     std::fs::write(dir.join("assets.txt"), &assets)?;
     common(&out.join(&exe_only))?;
     std::fs::write(out.join("assets.txt"), &assets)?;
+    // The launcher, which players download on its own.
+    std::fs::copy(built(LAUNCHER), out.join(LAUNCHER))?;
 
     for folder in [&name, &exe_only] {
         let zip_path = out.join(format!("{folder}.zip"));
@@ -112,8 +99,9 @@ pub fn package_windows(tag: Option<&str>) -> Result<()> {
             size as f64 / 1_000_000.0
         );
     }
+    println!("{}", out.join(LAUNCHER).display());
     if tag.is_none() {
-        println!("no tag given, so the zips have no version.txt and the updater will update them");
+        println!("no tag given, so the zips have no version.txt and the launcher will update them");
     }
     Ok(())
 }

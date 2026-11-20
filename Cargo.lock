@@ -1106,12 +1106,14 @@ dependencies = [
  "anyhow",
  "glam",
  "mc-assets",
- "mc-registry",
  "mc-render",
  "pollster",
  "serde_json",
+ "sha1_smol",
+ "ureq",
  "wgpu",
  "winit",
+ "zip",
 ]
 
 [[package]]

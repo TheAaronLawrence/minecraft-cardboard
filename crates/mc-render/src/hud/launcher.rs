@@ -1,6 +1,8 @@
 //! The launcher's window, in the style of Mojang's Minecraft Launcher: a dark sidebar with
 //! the player's name and the game, a header with the Play tab, the logo over the menu
 //! background, and a bar along the bottom with the version and a big green Play button.
+//! Before the game is installed the button signs in with GitHub, showing the code to enter
+//! there, and while an update downloads a bar along the bottom fills.
 
 use super::menu::{Field, LABEL};
 use super::{GuiMesh, HudArt};
@@ -33,12 +35,25 @@ pub struct Launcher {
     pub mouse: Option<[f32; 2]>,
     /// Shown in red over the bottom bar, such as when the game wouldn't start.
     pub error: Option<String>,
+    /// The big button's label; empty is "PLAY".
+    pub button: String,
+    /// What the launcher is doing, such as downloading the game, over the bottom bar.
+    pub status: Option<String>,
+    /// How far a download has got, from 0 to 1, as a bar along the top of the bottom bar.
+    pub progress: Option<f32>,
+    /// While signing in: the code to enter and where.
+    pub code: Option<(String, String)>,
+    /// The installed release's tag.
+    pub installed: Option<String>,
+    /// The GitHub account signed in.
+    pub account: Option<String>,
 }
 
 /// Where the launcher's controls are: x, y, width and height in GUI pixels.
 pub struct Layout {
     pub name: [i32; 4],
     pub play: [i32; 4],
+    pub sign_out: [i32; 4],
 }
 
 const SIDEBAR_WIDTH: i32 = 96;
@@ -50,6 +65,7 @@ pub fn layout(width: i32, height: i32) -> Layout {
     Layout {
         name: [6, 22, SIDEBAR_WIDTH - 12, 16],
         play: [centre - 55, height - BOTTOM_HEIGHT + 10, 110, 28],
+        sign_out: [6, 106, 44, 10],
     }
 }
 
@@ -72,7 +88,22 @@ pub fn launcher(art: &HudArt, l: &Launcher, width: u32, height: u32) -> GuiMesh 
     let hero_top = HEADER_HEIGHT;
     let hero_height = h - HEADER_HEIGHT - BOTTOM_HEIGHT;
     let centre = (SIDEBAR_WIDTH + w) / 2;
-    mesh.logo_at(art, centre, hero_top + (hero_height - 58) / 2);
+    match &l.code {
+        None => mesh.logo_at(art, centre, hero_top + (hero_height - 58) / 2),
+        Some((code, uri)) => {
+            let top = hero_top + (hero_height - 74) / 2;
+            let panel = [centre - 120, top - 8, 240, 82];
+            mesh.rect(art, panel, PANEL, [24, 24, 24, 235]);
+            let centred = |mesh: &mut GuiMesh, t: &str, y: i32, scale: f32, rgb| {
+                let x = centre - (text_width(t) as f32 * scale / 2.0) as i32;
+                text(mesh, t, x, y, scale, rgb);
+            };
+            centred(&mut mesh, "Sign in with GitHub", top, 1.0, WHITE);
+            centred(&mut mesh, &format!("Go to {uri}"), top + 14, 1.0, GREY);
+            centred(&mut mesh, "and enter this code:", top + 24, 1.0, GREY);
+            centred(&mut mesh, code, top + 38, 3.0, WHITE);
+        }
+    }
 
     // The sidebar: who's playing, then the game, selected.
     mesh.rect(art, [0, 0, SIDEBAR_WIDTH, h], PANEL, SIDEBAR);
@@ -98,6 +129,26 @@ pub fn launcher(art: &HudArt, l: &Launcher, width: u32, height: u32) -> GuiMesh 
     mesh.rect(art, [0, 50, 2, 26], BOX + 1.0, GREEN);
     text(&mut mesh, "MINECRAFT", 8, 53, 1.0, GREY);
     text(&mut mesh, "Cardboard", 8, 64, 1.0, WHITE);
+    if let Some(account) = &l.account {
+        text(&mut mesh, "GITHUB", 6, 84, 1.0, GREY);
+        // Shortened to fit the sidebar.
+        let max = SIDEBAR_WIDTH - 12;
+        let mut shown = account.clone();
+        if text_width(&shown) > max {
+            while !shown.is_empty() && text_width(&format!("{shown}...")) > max {
+                shown.pop();
+            }
+            shown.push_str("...");
+        }
+        text(&mut mesh, &shown, 6, 95, 1.0, WHITE);
+        let [x, y, ..] = layout.sign_out;
+        let hovered = l.mouse.is_some_and(|m| contains(layout.sign_out, m));
+        let rgb = if hovered { WHITE } else { GREY };
+        text(&mut mesh, "Sign out", x, y, 1.0, rgb);
+        let underline = [x, y + 9, text_width("Sign out") - 1, 1];
+        let c = (rgb[0] * 255.0) as u8;
+        mesh.rect(art, underline, BOX, [c, c, c, 255]);
+    }
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     text(&mut mesh, &version, 6, h - 12, 1.0, GREY);
 
@@ -133,16 +184,19 @@ pub fn launcher(art: &HudArt, l: &Launcher, width: u32, height: u32) -> GuiMesh 
         BOTTOM_HEIGHT,
     ];
     mesh.rect(art, bar, PANEL, BOTTOM);
+    if let Some(progress) = l.progress {
+        let [x, y, w, _] = bar;
+        let filled = (w as f32 * progress.clamp(0.0, 1.0)) as i32;
+        mesh.rect(art, [x, y, w, 2], BOX, [60, 60, 60, 255]);
+        mesh.rect(art, [x, y, filled, 2], BOX + 1.0, GREEN);
+    }
     let left = SIDEBAR_WIDTH + 10;
-    text(
-        &mut mesh,
-        "Latest release",
-        left,
-        h - BOTTOM_HEIGHT + 14,
-        1.0,
-        WHITE,
-    );
-    text(&mut mesh, &version, left, h - BOTTOM_HEIGHT + 26, 1.0, GREY);
+    let (label, tag) = match &l.installed {
+        Some(tag) => ("Latest release", tag.as_str()),
+        None => ("Not installed", ""),
+    };
+    text(&mut mesh, label, left, h - BOTTOM_HEIGHT + 14, 1.0, WHITE);
+    text(&mut mesh, tag, left, h - BOTTOM_HEIGHT + 26, 1.0, GREY);
     let hovered = l.mouse.is_some_and(|m| contains(layout.play, m));
     let color = match (l.play_active, hovered) {
         (false, _) => DISABLED,
@@ -151,18 +205,27 @@ pub fn launcher(art: &HudArt, l: &Launcher, width: u32, height: u32) -> GuiMesh 
     };
     mesh.rect(art, layout.play, BOX, color);
     let [px, py, pw, ph] = layout.play;
-    let label = "PLAY";
+    let label = if l.button.is_empty() {
+        "PLAY"
+    } else {
+        &l.button
+    };
     let label_x = px + (pw - text_width(label) * 2) / 2;
     let rgb = if l.play_active { WHITE } else { GREY };
     text(&mut mesh, label, label_x, py + (ph - 14) / 2, 2.0, rgb);
 
-    if let Some(error) = &l.error {
-        let lines = art.wrap(error, w - SIDEBAR_WIDTH - 20);
+    let message = match (&l.error, &l.status) {
+        (Some(error), _) => Some((error, RED)),
+        (None, Some(status)) => Some((status, WHITE)),
+        (None, None) => None,
+    };
+    if let Some((message, rgb)) = message {
+        let lines = art.wrap(message, w - SIDEBAR_WIDTH - 20);
         let bottom = h - BOTTOM_HEIGHT - 4;
         for (i, line) in lines.iter().enumerate() {
             let y = bottom - (lines.len() - i) as i32 * 9;
             let x = centre - text_width(line) / 2;
-            mesh.shadowed(art, line, x as f32, y as f32, LABEL, 1.0, RED);
+            mesh.shadowed(art, line, x as f32, y as f32, LABEL, 1.0, rgb);
         }
     }
     mesh

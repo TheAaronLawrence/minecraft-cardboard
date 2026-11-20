@@ -233,12 +233,32 @@ impl BlockModels {
             }
         }
         let icons = crate::item::bake(items, &atlas, &states, registry)?;
-        let hud = crate::hud::HudArt::new(res, &atlas, icons)?;
+        let hud = crate::hud::HudArt::new(res, &atlas, icons, crate::hud::item_names()?)?;
         Ok(Self {
             states,
             atlas,
             hud,
             portal_textures: PortalTextures::load(res)?,
+        })
+    }
+}
+
+impl BlockModels {
+    /// Just the GUI's sprites, with no blocks or items, for drawing menus from a few files,
+    /// such as the launcher's before the game is installed. Sprites without a file in `res`
+    /// are the missing texture.
+    pub fn gui(res: &Resources) -> Result<Self> {
+        let atlas = Atlas::build(res, crate::hud::sprites(), &[])?;
+        let hud = crate::hud::HudArt::new(res, &atlas, HashMap::new(), HashMap::new())?;
+        let blank = || image::RgbaImage::new(16, 16);
+        Ok(Self {
+            states: Vec::new(),
+            atlas,
+            hud,
+            portal_textures: PortalTextures {
+                sky: blank(),
+                stars: blank(),
+            },
         })
     }
 }

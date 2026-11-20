@@ -12,9 +12,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 glam = "0.34"
 mc-assets = { path = "../mc-assets" }
-mc-registry = { path = "../mc-registry" }
 mc-render = { path = "../mc-render" }
 pollster = "1"
 serde_json.workspace = true
+sha1_smol = "1"
+ureq = { version = "3", features = ["json"] }
 wgpu = "30"
 winit = "0.30"
+zip = { version = "2", default-features = false, features = ["deflate"] }

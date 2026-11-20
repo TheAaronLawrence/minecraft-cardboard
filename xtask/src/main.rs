@@ -1,5 +1,6 @@
 //! Project tasks. `cargo xtask fetch-assets [version]` copies Mojang's assets for a
-//! vanilla Java Edition version into `resources/`, which is committed to the repo.
+//! vanilla Java Edition version into `resources/`. They aren't committed: run it once after
+//! cloning.
 //! `cargo xtask package-windows [tag]` builds a Windows release (see `package.rs`).
 //! `cargo xtask compare [views]` renders views in vanilla and in our client and measures the
 //! difference (see `compare.rs`).

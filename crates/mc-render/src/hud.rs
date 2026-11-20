@@ -161,6 +161,7 @@ impl HudArt {
         res: &mc_assets::Resources,
         atlas: &Atlas,
         items: HashMap<String, ItemIcon>,
+        item_names: HashMap<String, (String, String)>,
     ) -> Result<Self> {
         Ok(Self {
             items: Arc::new(items),
@@ -188,14 +189,14 @@ impl HudArt {
                 [(u0 + u1) / 2.0, (v0 + v1) / 2.0]
             },
             lang: gui_lang(res)?,
-            item_names: item_names()?,
+            item_names,
         })
     }
 }
 
 /// Each item's name key and rarity, from the `items.json` report (`[key, max stack, rarity,
 /// slot]`).
-fn item_names() -> Result<HashMap<String, (String, String)>> {
+pub(crate) fn item_names() -> Result<HashMap<String, (String, String)>> {
     let path = mc_registry::default_reports_dir().join("items.json");
     let items: HashMap<String, (String, i32, String, Option<String>)> = serde_json::from_slice(
         &std::fs::read(&path).with_context(|| format!("{}", path.display()))?,

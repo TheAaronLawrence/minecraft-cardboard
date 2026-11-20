@@ -1,1 +1,4 @@
 /target
+# Mojang's files, downloaded by `cargo xtask fetch-assets`
+/resources/assets
+/resources/data
