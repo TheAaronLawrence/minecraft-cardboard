@@ -117,7 +117,8 @@ pub struct BlockModels {
     pub atlas: Atlas,
     /// Each item's icon, by name such as `minecraft:stone`, and the HUD's sprites.
     pub hud: crate::hud::HudArt,
-    /// The end portal shader's own textures, which it tiles, so they aren't in the atlas.
+    /// The end portal shader's and the underwater overlay's own textures, which they tile,
+    /// so they aren't in the atlas.
     pub portal_textures: PortalTextures,
     /// Armour's layers, by equipment asset (`entity::equipment_assets`).
     pub equipment: HashMap<String, crate::entity::EquipmentLayers>,
@@ -127,6 +128,8 @@ pub struct BlockModels {
 pub struct PortalTextures {
     pub sky: image::RgbaImage,
     pub stars: image::RgbaImage,
+    /// `ScreenEffectRenderer.UNDERWATER_LOCATION`.
+    pub underwater: image::RgbaImage,
 }
 
 impl PortalTextures {
@@ -140,6 +143,7 @@ impl PortalTextures {
         Ok(Self {
             sky: load("minecraft:environment/end_sky")?,
             stars: load("minecraft:entity/end_portal/end_portal")?,
+            underwater: load("minecraft:misc/underwater")?,
         })
     }
 }
@@ -149,6 +153,8 @@ pub const WATER_SPRITE: &str = "minecraft:block/water_still";
 pub const LAVA_SPRITE: &str = "minecraft:block/lava_still";
 pub const WATER_FLOW_SPRITE: &str = "minecraft:block/water_flow";
 pub const LAVA_FLOW_SPRITE: &str = "minecraft:block/lava_flow";
+/// Water's side against glass and leaves (`FluidModel.overlayMaterial`).
+pub const WATER_OVERLAY_SPRITE: &str = "minecraft:block/water_overlay";
 
 impl BlockModels {
     /// `extra_sprites` are images to add to the atlas under their ids, such as the skins of
@@ -166,6 +172,7 @@ impl BlockModels {
             LAVA_SPRITE,
             WATER_FLOW_SPRITE,
             LAVA_FLOW_SPRITE,
+            WATER_OVERLAY_SPRITE,
         ]
         .map(str::to_owned)
         .into();
@@ -265,6 +272,7 @@ impl BlockModels {
             portal_textures: PortalTextures {
                 sky: blank(),
                 stars: blank(),
+                underwater: blank(),
             },
             equipment: HashMap::new(),
         })

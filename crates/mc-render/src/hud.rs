@@ -27,6 +27,9 @@ const FONT: &str = "minecraft:font/ascii";
 const XP_BACKGROUND: &str = "hud/experience_bar_background";
 const XP_PROGRESS: &str = "hud/experience_bar_progress";
 const FOOD: [&str; 3] = ["hud/food_empty", "hud/food_half", "hud/food_full"];
+const AIR: [&str; 3] = ["hud/air", "hud/air_bursting", "hud/air_empty"];
+/// `Entity.getMaxAirSupply` for a player: 15 seconds.
+const MAX_AIR: i32 = 300;
 
 /// `Hud.HeartType`'s sprites for a container or a normal heart, which come in hardcore,
 /// half and blinking forms; a container has no half form.
@@ -57,6 +60,7 @@ fn named_sprites() -> Vec<String> {
     let mut names: Vec<String> = [XP_BACKGROUND, XP_PROGRESS]
         .into_iter()
         .chain(FOOD)
+        .chain(AIR)
         .chain(BUTTON)
         .chain(menu::TEXT_FIELD)
         .chain(pause::ICONS)
@@ -403,6 +407,9 @@ pub struct Vitals {
     /// Progress through the level, 0 to 1, and the level.
     pub xp_progress: f32,
     pub xp_level: i32,
+    /// `Entity.getAirSupply` in ticks, up to 300, and whether the eye is in water.
+    pub air: i32,
+    pub eye_in_water: bool,
 }
 
 /// Quads in GUI pixels. Vertices are `Vertex`es whose x and y are in GUI pixels, whose z is
@@ -665,7 +672,8 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
 }
 
 impl GuiMesh {
-    /// `Hud.extractHearts` and `extractFood` (without absorption, armour, air or effects),
+    /// `Hud.extractHearts`, `extractFood` and `extractAirBubbles` (without absorption,
+    /// armour or effects),
     /// then `ExperienceBar.extractBackground` and `ContextualBar.extractExperienceLevel`, for
     /// a GUI `width` × `height` GUI pixels. Each sprite goes a little in front of the one
     /// before, so they overlap as vanilla draws them, in order.
@@ -716,6 +724,34 @@ impl GuiMesh {
             }
             if i * 2 + 1 == v.food {
                 sprite(self, half, x, y, 9, 9);
+            }
+        }
+
+        // `extractAirBubbles`: shown under water or while the air refills, a row above the
+        // food (`getAirBubbleYLine` adds back the row it takes off for a vehicle's hearts).
+        // A bubble bursts as it empties, and empty ones wobble once all are gone.
+        let air = v.air.clamp(0, MAX_AIR);
+        if v.eye_in_water || air < MAX_AIR {
+            let bubble = |offset: i32| ((air + offset) * 10) as f32 / MAX_AIR as f32;
+            let bubble = |offset| bubble(offset).ceil() as i32;
+            let (full, popping) = (bubble(-2), bubble(0));
+            let empty = 10 - bubble((air != 0 && v.eye_in_water) as i32);
+            let [air_full, bursting, air_empty] = AIR;
+            let y = y_base - 10;
+            for b in 1..=10 {
+                let x = x_right - (b - 1) * 8 - 9;
+                if b <= full {
+                    sprite(self, air_full, x, y, 9, 9);
+                } else if full != popping && b == popping && v.eye_in_water {
+                    sprite(self, bursting, x, y, 9, 9);
+                } else if b > 10 - empty {
+                    let wobble = if empty == 10 && v.tick % 2 == 0 {
+                        random.next_int(2)
+                    } else {
+                        0
+                    };
+                    sprite(self, air_empty, x, y + wobble, 9, 9);
+                }
             }
         }
 

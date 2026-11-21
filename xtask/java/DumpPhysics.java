@@ -2,7 +2,10 @@
 // state's collision shape and outline shape (as boxes, in block units, with each shape's
 // edges as `forAllEdges` gives them for drawing outlines), each block's friction,
 // speed factor and jump factor where they differ from the defaults, and every block's destroy
-// time and whether it drops only when mined with the right tool. `cargo xtask gen-reports` runs it on the
+// time and whether it drops only when mined with the right tool, and every state's fluid and
+// which of its faces are sturdy, for swimming, and how every state affects light: its
+// dampening and emission, and the faces of its occlusion shape as the light engine sees them
+// (`LightEngine.getOcclusionShape`). `cargo xtask gen-reports` runs it on the
 // unpacked server with `java DumpPhysics.java OUT.json`, which needs a JDK.
 //
 // Shapes are taken at the origin with an empty collision context, as for a block nothing is
@@ -18,9 +21,14 @@ import java.util.Map;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.Direction;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.IceBlock;
+import net.minecraft.world.level.material.FlowingFluid;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
@@ -35,16 +43,57 @@ public class DumpPhysics {
         List<String> edges = new ArrayList<>();
         StringBuilder states = new StringBuilder();
         StringBuilder outlines = new StringBuilder();
+        StringBuilder fluids = new StringBuilder();
+        StringBuilder sturdy = new StringBuilder();
+        StringBuilder light = new StringBuilder();
+        StringBuilder occlusion = new StringBuilder();
+        Map<String, Integer> occlusionIds = new HashMap<>();
+        List<String> occlusionFaces = new ArrayList<>();
         for (int id = 0; id < Block.BLOCK_STATE_REGISTRY.size(); id++) {
             BlockState state = Block.BLOCK_STATE_REGISTRY.byId(id);
             if (id > 0) {
                 states.append(',');
                 outlines.append(',');
+                fluids.append(',');
+                sturdy.append(',');
+                light.append(',');
+                occlusion.append(',');
             }
             VoxelShape collision = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
             states.append(shapeId(collision, shapeIds, shapes, edges));
             VoxelShape outline = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
             outlines.append(shapeId(outline, shapeIds, shapes, edges));
+            // The fluid (tags aren't loaded here, so by type): 1 water or 2 lava, 4 a source, 8 falling, and the amount times 16.
+            FluidState fluid = state.getFluidState();
+            int type = fluid.getType().isSame(Fluids.WATER) ? 1 : fluid.getType().isSame(Fluids.LAVA) ? 2 : 0;
+            fluids.append(type == 0 ? 0
+                : type | (fluid.isSource() ? 4 : 0) | (fluid.getValue(FlowingFluid.FALLING) ? 8 : 0) | fluid.getAmount() << 4);
+            // A bit per `Direction` (down, up, north, south, west, east) whose face is sturdy,
+            // and 64 for ice, which `FlowingFluid.isSolidFace` doesn't count.
+            int faces = state.getBlock() instanceof IceBlock ? 64 : 0;
+            for (Direction direction : Direction.values()) {
+                if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, direction)) {
+                    faces |= 1 << direction.ordinal();
+                }
+            }
+            sturdy.append(faces);
+            // `getLightDampening`, `getLightEmission` times 16, and 256 for `useShapeForLightOcclusion`.
+            light.append(state.getLightDampening() | state.getLightEmission() << 4
+                | (state.useShapeForLightOcclusion() ? 256 : 0));
+            // 0 for `LightEngine.isEmptyShape`, else 1 + an index into `occlusion_faces`.
+            int occlusionId = 0;
+            if (state.canOcclude() && state.useShapeForLightOcclusion()) {
+                StringBuilder key = new StringBuilder("[");
+                for (Direction direction : Direction.values()) {
+                    if (direction.ordinal() > 0) key.append(',');
+                    key.append('"').append(faceMask(state.getFaceOcclusionShape(direction), direction.getAxis())).append('"');
+                }
+                occlusionId = occlusionIds.computeIfAbsent(key.append(']').toString(), k -> {
+                    occlusionFaces.add(k);
+                    return occlusionFaces.size();
+                });
+            }
+            occlusion.append(occlusionId);
         }
 
         StringBuilder blocks = new StringBuilder();
@@ -82,11 +131,43 @@ public class DumpPhysics {
             out.println("  ],");
             out.println("  \"states\": [" + states + "],");
             out.println("  \"outlines\": [" + outlines + "],");
+            out.println("  \"fluids\": [" + fluids + "],");
+            out.println("  \"sturdy\": [" + sturdy + "],");
+            out.println("  \"light\": [" + light + "],");
+            out.println("  \"occlusion\": [" + occlusion + "],");
+            out.println("  \"occlusion_faces\": [\n    " + String.join(",\n    ", occlusionFaces) + "\n  ],");
             out.println("  \"blocks\": {\n    " + blocks + "\n  },");
             out.println("  \"mining\": {\n    " + mining + "\n  }");
             out.println("}");
         }
         System.out.println(shapes.size() + " collision and outline shapes for " + Block.BLOCK_STATE_REGISTRY.size() + " states");
+    }
+
+    /**
+     * Which sixteenths of a face shape cover the face, as 64 hex digits: bit `v * 16 + u` of
+     * four longs, where `u` and `v` are x and z across a y face, x and y across a z face, and
+     * y and z across an x face. A face shape spans the whole block along its axis, so its
+     * middle is sampled.
+     */
+    static String faceMask(VoxelShape face, Direction.Axis axis) {
+        long[] bits = new long[4];
+        List<AABB> boxes = face.toAabbs();
+        for (int v = 0; v < 16; v++) {
+            for (int u = 0; u < 16; u++) {
+                double a = (u + 0.5) / 16, b = (v + 0.5) / 16;
+                double x = axis == Direction.Axis.X ? 0.5 : a;
+                double y = axis == Direction.Axis.Y ? 0.5 : axis == Direction.Axis.X ? a : b;
+                double z = axis == Direction.Axis.Z ? 0.5 : b;
+                for (AABB box : boxes) {
+                    if (box.minX <= x && x < box.maxX && box.minY <= y && y < box.maxY && box.minZ <= z && z < box.maxZ) {
+                        int bit = v * 16 + u;
+                        bits[bit / 64] |= 1L << (bit % 64);
+                        break;
+                    }
+                }
+            }
+        }
+        return String.format("%016x%016x%016x%016x", bits[0], bits[1], bits[2], bits[3]);
     }
 
     /** The shape's index in `shapes`, adding it the first time it's seen. */

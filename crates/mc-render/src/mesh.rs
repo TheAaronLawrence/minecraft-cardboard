@@ -4,7 +4,7 @@
 use crate::atlas::Layer;
 use crate::bake::{
     self, BlockModels, Dir, JavaRandom, LAVA_FLOW_SPRITE, LAVA_SPRITE, Quad, WATER_FLOW_SPRITE,
-    WATER_SPRITE,
+    WATER_OVERLAY_SPRITE, WATER_SPRITE,
 };
 use crate::tint::{Biomes, Tint, block_tint};
 use glam::Vec3;
@@ -90,6 +90,9 @@ struct StateInfo {
     /// Leaves draw the faces between them: `LeavesBlock.skipRendering` only hides them when
     /// the Cutout Leaves option is off, and it is on by default.
     leaves: bool,
+    /// A `HalfTransparentBlock`: glass, stained and tinted glass, ice, frosted and blue ice,
+    /// slime, honey and copper grates (vanilla's classes in `Blocks`).
+    half_transparent: bool,
     /// Its block entity's data can change how it looks (see `entity_model::uses_data`).
     data: bool,
 }
@@ -140,6 +143,17 @@ fn state_infos(registry: &Registry) -> Vec<StateInfo> {
                 offset,
                 air: name.ends_with("air") && block.properties.is_empty(),
                 leaves: name.ends_with("_leaves"),
+                half_transparent: matches!(
+                    name,
+                    "glass"
+                        | "tinted_glass"
+                        | "ice"
+                        | "frosted_ice"
+                        | "blue_ice"
+                        | "slime_block"
+                        | "honey_block"
+                ) || name.ends_with("_stained_glass")
+                    || name.ends_with("copper_grate"),
                 data: crate::entity_model::uses_data(name),
             });
         }
@@ -230,6 +244,15 @@ impl WorldView {
         } else {
             section.block_light = Some(light);
         }
+    }
+
+    /// A loaded chunk, by chunk coordinates.
+    pub fn column(&self, cx: i32, cz: i32) -> Option<&Chunk> {
+        self.chunks.get(&(cx, cz))
+    }
+
+    pub fn column_mut(&mut self, cx: i32, cz: i32) -> Option<&mut Chunk> {
+        self.chunks.get_mut(&(cx, cz))
     }
 
     /// The loaded chunks' positions, in chunk coordinates.
@@ -577,7 +600,10 @@ impl<'a> Mesher<'a> {
     /// Water and lava are drawn by code in vanilla (`LiquidBlockRenderer`), not by models.
     /// Each top corner sits at a weighted average of the fluid heights around it, the top
     /// uses the flowing texture turned to the direction the fluid flows, and faces are only
-    /// drawn where they touch something other than the same fluid.
+    /// drawn where they touch something other than the same fluid. Faces are drawn from
+    /// both sides, so they show from inside the fluid, except water's against glass and
+    /// leaves, which shows its overlay texture from outside only. Sides and the bottom sit
+    /// 0.001 inside the block, off the faces of the blocks they touch.
     fn mesh_fluid(
         &self,
         view: &WorldView,
@@ -630,9 +656,10 @@ impl<'a> Mesher<'a> {
             ),
             Fluid::Lava => (LAVA_SPRITE, LAVA_FLOW_SPRITE, Layer::Opaque, [1.0; 3]),
         };
-        let (still, flowing) = (
+        let (still, flowing, overlay) = (
             self.models.atlas.sprite(still).rect,
             self.models.atlas.sprite(flowing).rect,
+            self.models.atlas.sprite(WATER_OVERLAY_SPRITE).rect,
         );
         let at = |rect: [f32; 4], u: f32, v: f32| {
             [
@@ -692,18 +719,19 @@ impl<'a> Mesher<'a> {
                     at(flowing, 0.5 + (c - s), 0.5 + (-c - s)),
                 ]
             };
-            // Seen from below too, so the surface shows from underwater.
-            emit(
-                Dir::Up,
-                pos,
-                uv,
-                light_at(x, y, z, true),
-                fluid == Fluid::Water,
-            );
+            // `FluidState.shouldRenderBackwardUpFace`: seen from below too, unless the fluid
+            // or solid blocks fill all nine blocks over it.
+            let backward = (-1..=1).any(|dx| {
+                (-1..=1).any(|dz| {
+                    let (bx, bz) = (x + dx, z + dz);
+                    !same(bx, y + 1, bz) && !self.occludes(view.state(bx, y + 1, bz))
+                })
+            });
+            emit(Dir::Up, pos, uv, light_at(x, y, z, true), backward);
         }
         if !same(x, y - 1, z) && !self.occludes(view.state(x, y - 1, z)) {
             let pos =
-                bake::corners(Dir::Down, Vec3::ZERO, Vec3::ONE).map(|p| Vec3::new(p.x, 0.0, p.z));
+                bake::corners(Dir::Down, Vec3::ZERO, Vec3::ONE).map(|p| Vec3::new(p.x, 0.001, p.z));
             let uv = [
                 at(still, 0.0, 1.0),
                 at(still, 0.0, 0.0),
@@ -718,7 +746,11 @@ impl<'a> Mesher<'a> {
                 continue;
             }
             // Top corners at the fluid's height there; the texture is the top-left quarter
-            // of the flowing texture, cut off where the fluid ends.
+            // of the flowing texture (or water's overlay), cut off where the fluid ends.
+            let neighbour = info(x + dx, y, z + dz);
+            let is_overlay =
+                fluid == Fluid::Water && (neighbour.half_transparent || neighbour.leaves);
+            let sprite = if is_overlay { overlay } else { flowing };
             let mut pos = bake::corners(dir, Vec3::ZERO, Vec3::ONE);
             let mut uv = [[0.0; 2]; 4];
             for (i, p) in pos.iter_mut().enumerate() {
@@ -728,14 +760,16 @@ impl<'a> Mesher<'a> {
                 } else {
                     0.5
                 };
-                uv[i] = at(flowing, if i < 2 { 0.0 } else { 0.5 }, v);
+                uv[i] = at(sprite, if i < 2 { 0.0 } else { 0.5 }, v);
+                // The 0.001 inset, toward the block's middle.
+                *p -= Vec3::new(dx as f32, 0.0, dz as f32) * 0.001;
             }
             emit(
                 dir,
                 pos,
                 uv,
                 light_at(x + dx, y, z + dz, false),
-                fluid == Fluid::Water,
+                !is_overlay,
             );
         }
     }

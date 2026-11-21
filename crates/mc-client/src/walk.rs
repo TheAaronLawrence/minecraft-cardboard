@@ -138,10 +138,18 @@ pub struct Walker {
     player: Player,
     /// Feet at the previous tick, to draw between ticks.
     previous: DVec3,
+    /// `Camera.eyeHeightOld` and `eyeHeight`: the eye height the view eases towards the
+    /// pose's, half the way each tick.
+    camera_eye: [f32; 2],
     placed: bool,
     since_tick: f32,
     collision: Collision,
     light: Light,
+    /// Each chunk's biomes by section, for the water fog, and the biomes' attributes.
+    biomes: HashMap<(i32, i32), Vec<crate::stream::SectionBiomes>>,
+    biome_data: std::sync::Arc<mc_render::tint::Biomes>,
+    /// The mob effects the player has, such as `minecraft:fire_resistance`.
+    effects: std::collections::HashSet<String>,
     blocks: BlockPhysics,
     outbox: mc_protocol::Outbox,
     entity_id: i32,
@@ -205,6 +213,8 @@ pub struct Walker {
     view_bob: crate::hands::ViewBob,
     /// The server says the player is on fire.
     on_fire: bool,
+    /// The player's air supply in ticks (data 1), which the server counts down under water.
+    air: i32,
     /// Items that place a block (`BlockItem`s, named as their block is).
     block_items: std::collections::HashSet<String>,
 }
@@ -287,6 +297,7 @@ impl Walker {
     pub fn new(
         outbox: mc_protocol::Outbox,
         registry: &mc_registry::Registry,
+        biomes: std::sync::Arc<mc_render::tint::Biomes>,
         uuid: u128,
     ) -> anyhow::Result<Self> {
         let state = |name: &str| registry.block(name).map(|b| b.default_state);
@@ -299,6 +310,7 @@ impl Walker {
         Ok(Self {
             player: Player::new(DVec3::ZERO, 0.0, 0.0),
             previous: DVec3::ZERO,
+            camera_eye: [1.62; 2],
             placed: false,
             since_tick: 0.0,
             collision: Collision {
@@ -306,6 +318,9 @@ impl Walker {
                 air,
             },
             light: Light::default(),
+            biomes: HashMap::new(),
+            biome_data: biomes,
+            effects: Default::default(),
             blocks: BlockPhysics::vanilla(registry)?,
             outbox,
             entity_id: 0,
@@ -357,6 +372,7 @@ impl Walker {
             hands: Default::default(),
             view_bob: Default::default(),
             on_fire: false,
+            air: 300,
             block_items: (0..registry.item_count())
                 .filter_map(|id| registry.item_name(id))
                 .filter(|name| {
@@ -369,16 +385,88 @@ impl Walker {
         })
     }
 
-    pub fn chunk(&mut self, key: (i32, i32), blocks: Option<Vec<(i32, Blocks)>>) {
-        match blocks {
-            Some(b) => {
-                self.collision.chunks.insert(key, b);
+    pub fn chunk(&mut self, key: (i32, i32), data: Option<crate::stream::ChunkData>) {
+        match data {
+            Some((blocks, biomes)) => {
+                self.collision.chunks.insert(key, blocks);
+                self.biomes.insert(key, biomes);
             }
             None => {
                 self.collision.chunks.remove(&key);
                 self.light.chunks.remove(&key);
+                self.biomes.remove(&key);
             }
         }
+    }
+
+    /// The biome at a quart position (a 4×4×4 cell), as `ChunkAccess.getNoiseBiome` gives
+    /// it, with the height clamped into the chunk's sections; where nothing has arrived,
+    /// plains (`ClientLevel.getUncachedNoiseBiome`).
+    fn biome_at_quart(&self, [x, y, z]: [i32; 3]) -> &str {
+        let found = self
+            .biomes
+            .get(&(x.div_euclid(4), z.div_euclid(4)))
+            .and_then(|sections| {
+                // The sections with biomes, leaving out the light's padding above and below.
+                let with = || sections.iter().filter(|s| !s.1.is_empty());
+                let (low, high) = (with().map(|s| s.0).min()?, with().map(|s| s.0).max()?);
+                let y = y.clamp(low * 4, high * 4 + 3);
+                with().find(|s| s.0 == y.div_euclid(4)).map(|s| (y, s))
+            })
+            .and_then(|(y, (_, palette, cells))| {
+                let (lx, ly, lz) = (x.rem_euclid(4), y.rem_euclid(4), z.rem_euclid(4));
+                let index = cells[((ly * 4 + lz) * 4 + lx) as usize];
+                palette.get(index as usize)
+            });
+        found.map_or("minecraft:plains", String::as_str)
+    }
+
+    /// The water fog's colour and end distance at `eye`: `EnvironmentAttributeProbe.tick`'s
+    /// Gaussian sample of the biomes around it, blended as `SpatialAttributeInterpolator`
+    /// does, each biome applied to the defaults.
+    fn water_fog(&self, eye: DVec3, color: [f32; 3], end: f32) -> ([f32; 3], f32) {
+        // `GaussianSampler.sample`, at quart resolution.
+        const KERNEL: [f64; 7] = [0.0, 1.0, 4.0, 6.0, 4.0, 1.0, 0.0];
+        let p = eye * 0.25 - DVec3::splat(0.5);
+        let base = p.floor();
+        let rel = p - base;
+        let base = base.as_ivec3();
+        let weight = |i: usize, r: f64| KERNEL[i + 1] + (KERNEL[i] - KERNEL[i + 1]) * r;
+        // Weights summed per biome, in the order biomes are first met.
+        let mut weights: Vec<(&str, f64)> = Vec::new();
+        for z in 0..6 {
+            for x in 0..6 {
+                for y in 0..6 {
+                    let w = weight(x, rel.x) * weight(y, rel.y) * weight(z, rel.z);
+                    let biome = self.biome_at_quart([
+                        base.x - 2 + x as i32,
+                        base.y - 2 + y as i32,
+                        base.z - 2 + z as i32,
+                    ]);
+                    match weights.iter_mut().find(|(b, _)| *b == biome) {
+                        Some((_, total)) => *total += w,
+                        None => weights.push((biome, w)),
+                    }
+                }
+            }
+        }
+        let mut result: Option<([f32; 3], f32)> = None;
+        let mut accumulated = 0.0;
+        for (biome, w) in weights {
+            let (c, e) = self.biome_data.water_fog(biome, color, end);
+            accumulated += w;
+            result = Some(match result {
+                None => (c, e),
+                Some((rc, re)) => {
+                    let t = (w / accumulated) as f32;
+                    (
+                        std::array::from_fn(|i| rc[i] + (c[i] - rc[i]) * t),
+                        re + (e - re) * t,
+                    )
+                }
+            });
+        }
+        result.unwrap_or((color, end))
     }
 
     /// The server's light for these sections of a chunk; `whole` replaces all it had.
@@ -401,13 +489,16 @@ impl Walker {
             self.player.velocity = DVec3::from(velocity);
             return;
         }
-        // The player's own shared flags (data 0): bit 0 is `isOnFire`.
+        // The player's own shared flags (data 0), where bit 0 is `isOnFire`, and air supply
+        // (data 1).
         if let mc_protocol::Event::EntityData { id, values } = &event
             && *id == self.entity_id
         {
             for (index, value) in values {
-                if let (0, mc_protocol::DataValue::Byte(flags)) = (index, value) {
-                    self.on_fire = flags & 1 != 0;
+                match (index, value) {
+                    (0, mc_protocol::DataValue::Byte(flags)) => self.on_fire = flags & 1 != 0,
+                    (1, mc_protocol::DataValue::Int(air)) => self.air = *air,
+                    _ => {}
                 }
             }
             return;
@@ -464,8 +555,17 @@ impl Walker {
                 self.health.flash = false;
                 self.view_bob.reset();
                 self.on_fire = false;
+                self.air = 300;
+                self.effects.clear();
             }
             mc_protocol::Event::GameMode(mode) => self.game_mode = mode,
+            mc_protocol::Event::Effect { effect, active } => {
+                if active {
+                    self.effects.insert(effect);
+                } else {
+                    self.effects.remove(&effect);
+                }
+            }
             mc_protocol::Event::Damaged(id) if id == self.entity_id => self.view_bob.hurt(),
             // `Entity.pushFromExplosion`.
             mc_protocol::Event::ExplosionPush(push) => self.player.velocity += DVec3::from(push),
@@ -760,6 +860,8 @@ impl Walker {
             saturation: self.saturation,
             xp_progress: self.xp_progress,
             xp_level: self.xp_level,
+            air: self.air,
+            eye_in_water: self.player.eye_in_water(),
         });
         mc_render::hud::Hotbar {
             slots: std::array::from_fn(|i| self.inventory.slots[36 + i].clone()),
@@ -773,6 +875,49 @@ impl Walker {
     /// `GameRenderer`'s view bob and hurt tilt this frame, for [`mc_render::gpu::Camera::bob`].
     pub fn view_bob(&self) -> glam::Mat4 {
         self.view_bob.matrix(self.since_tick / TICK, self.dead())
+    }
+
+    /// What the camera at `eye` sees from inside water or lava: `FogRenderer.setupFog` with
+    /// `WaterFogEnvironment` or `LavaFogEnvironment`, and `LevelExtractor`'s underwater
+    /// overlay while the player's eye is in water. The darkening near the bottom of the
+    /// world isn't applied yet.
+    pub fn in_fluid(&self, eye: Vec3, yaw: f32, pitch: f32) -> Option<mc_render::gpu::InFluid> {
+        use mc_physics::fluid::FluidKind;
+        let kind = mc_physics::fluid::camera_fluid(&self.collision, &self.blocks, eye.as_dvec3())?;
+        let rgb = |c: u32| [c >> 16, c >> 8 & 0xFF, c & 0xFF].map(|v| v as f32 / 255.0);
+        Some(match kind {
+            FluidKind::Water => {
+                // `WATER_FOG_COLOR` and `WATER_FOG_END_DISTANCE`, from their defaults and
+                // the biomes around, brightened toward the brightest channel as the eye
+                // gets used to the water (`computeFogColor`).
+                let vision = self.player.water_vision();
+                let (base, end) = self.water_fog(eye.as_dvec3(), rgb(0x050533), 96.0);
+                let scale = 1.0 / base[0].max(base[1]).max(base[2]);
+                let overlay = self.player.eye_in_water().then(|| {
+                    // `Lightmap.getBrightness` of the eye's light at noon.
+                    let level = self.light.at(eye.floor().as_ivec3().to_array());
+                    let v = level[0].max(level[1]) as f32 / 15.0;
+                    [-yaw / 64.0, pitch / 64.0, v / (4.0 - 3.0 * v)]
+                });
+                mc_render::gpu::InFluid {
+                    fog_color: base.map(|c| c + (c * scale - c) * vision),
+                    // `WATER_FOG_START_DISTANCE`'s default; no biome changes it.
+                    fog_start: -8.0,
+                    fog_end: end * vision.max(0.25),
+                    overlay,
+                }
+            }
+            // Fire resistance sees 5 blocks into lava instead of 1.
+            FluidKind::Lava => {
+                let resistant = self.effects.contains("minecraft:fire_resistance");
+                mc_render::gpu::InFluid {
+                    fog_color: rgb(0x991A00),
+                    fog_start: if resistant { 0.0 } else { 0.25 },
+                    fog_end: if resistant { 5.0 } else { 1.0 },
+                    overlay: None,
+                }
+            }
+        })
     }
 
     /// `ScreenEffectRenderer`'s fire: whether the player sees themselves burning, which
@@ -870,11 +1015,20 @@ impl Walker {
             if let Some(death) = &mut self.death {
                 death.ticks += 1;
             }
+            // `Camera.tick`, before the entities move.
+            let eye = self.player.eye_height() as f32;
+            self.camera_eye = [
+                self.camera_eye[1],
+                self.camera_eye[1] + (eye - self.camera_eye[1]) * 0.5,
+            ];
             self.previous = self.player.pos;
             self.entities.tick(&self.collision, &self.blocks);
             let dead = self.dead();
-            self.view_bob
-                .tick(self.player.velocity, self.player.on_ground, dead);
+            self.view_bob.tick(
+                self.player.velocity,
+                self.player.on_ground && !self.player.swimming,
+                dead,
+            );
             if self.dead() && self.inventory.is_open() {
                 self.close_inventory();
             }
@@ -913,12 +1067,15 @@ impl Walker {
         let feet = self
             .previous
             .lerp(self.player.pos, (self.since_tick / TICK) as f64);
+        let pt = self.since_tick / TICK;
+        let camera_eye = self.camera_eye[0] + (self.camera_eye[1] - self.camera_eye[0]) * pt;
+        // Aiming uses the pose's own eye height, as `Entity.pick` does.
         let eye = feet + DVec3::Y * self.player.eye_height();
         // `Player.blockInteractionRange`: 4.5, and half a block more in creative.
         let reach = if self.instabuild { 5.0 } else { 4.5 };
         let look = mc_physics::view_vector(yaw, pitch);
         self.hit = mc_physics::pick(&self.collision, &self.blocks, eye, eye + look * reach);
-        Some(eye.as_vec3())
+        Some((feet + DVec3::Y * camera_eye as f64).as_vec3())
     }
 
     /// One tick of `Minecraft.handleKeybinds` for the mouse: clicks start mining, using and

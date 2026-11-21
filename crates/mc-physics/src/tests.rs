@@ -196,3 +196,55 @@ fn destroy_progress_matches_vanilla() {
     );
     assert!(physics.destroy_progress(state("minecraft:short_grass"), true) >= 1.0);
 }
+
+/// In still water, from `travelInWater`'s 0.8 drag (0.9 sprinting), 0.02 strokes and 1/16 of
+/// gravity: sinking settles at 0.025 a tick (0.5 m/s), walking along the bottom at
+/// 0.0196 / 0.2 a tick (1.96 m/s), and sprinting under water swims at 0.0196 / 0.1 a tick
+/// (3.92 m/s), lying down with the eye 0.4 up.
+#[test]
+fn swims_in_still_water() {
+    let (registry, physics, mut world) = setup(|_, _| true);
+    let water = registry.block("minecraft:water").unwrap().default_state;
+    for x in -3..=3 {
+        for y in 64..=71 {
+            for z in -3..=40 {
+                world.blocks.insert([x, y, z], water);
+            }
+        }
+    }
+    let step = |p: &mut Player, input: Input| {
+        let before = p.pos;
+        p.tick(input, &world, &physics);
+        p.pos - before
+    };
+
+    let mut p = Player::new(DVec3::new(0.5, 69.0, 0.5), 0.0, 0.0);
+    run(&mut p, Input::default(), 60, &world, &physics);
+    let sink = step(&mut p, Input::default());
+    assert!((sink.y + 0.025).abs() < 1e-6, "sank {}", sink.y);
+    assert!(p.in_water && p.under_water && !p.swimming);
+
+    let mut p = Player::new(DVec3::new(0.5, 64.0, 0.5), 0.0, 0.0);
+    run(&mut p, FORWARD, 60, &world, &physics);
+    let walk = step(&mut p, FORWARD);
+    assert!(
+        (walk.z * 20.0 - 1.96).abs() < 1e-3,
+        "walked {} m/s",
+        walk.z * 20.0
+    );
+    assert!(p.on_ground && p.pose == Pose::Standing);
+
+    let sprint = Input {
+        sprint: true,
+        ..FORWARD
+    };
+    let mut p = Player::new(DVec3::new(0.5, 66.0, 0.5), 0.0, 0.0);
+    run(&mut p, sprint, 120, &world, &physics);
+    let swim = step(&mut p, sprint);
+    assert!(
+        (swim.z * 20.0 - 3.92).abs() < 1e-3,
+        "swam {} m/s",
+        swim.z * 20.0
+    );
+    assert!(p.swimming && p.pose == Pose::Swimming && p.eye_height() == 0.4);
+}

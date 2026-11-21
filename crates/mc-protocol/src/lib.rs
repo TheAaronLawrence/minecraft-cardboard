@@ -202,6 +202,12 @@ pub enum Event {
         id: i32,
         values: Vec<(u8, DataValue)>,
     },
+    /// The player gained a mob effect, such as `minecraft:fire_resistance`, or lost it.
+    /// Other entities' effects aren't passed on.
+    Effect {
+        effect: String,
+        active: bool,
+    },
     /// The connection ended, with the server's reason.
     Disconnected(String),
 }
@@ -811,6 +817,20 @@ fn play(
             "entity_event" => {
                 let id = r.i32()?;
                 tx.send(Event::EntityEvent { id, event: r.i8()? }).is_ok()
+            }
+            // `ClientboundUpdateMobEffectPacket` and `ClientboundRemoveMobEffectPacket`: the
+            // entity, then the effect's id; the amplifier, duration and flags follow an update.
+            name @ ("update_mob_effect" | "remove_mob_effect") => {
+                let (id, effect) = (r.varint()?, r.count()? as u32);
+                match registry.mob_effect(effect) {
+                    Some(effect) if id == own_id => tx
+                        .send(Event::Effect {
+                            effect: effect.to_owned(),
+                            active: name == "update_mob_effect",
+                        })
+                        .is_ok(),
+                    _ => true,
+                }
             }
             "remove_entities" => {
                 let ids = (0..r.count()?).map(|_| r.varint()).collect::<Result<_>>()?;

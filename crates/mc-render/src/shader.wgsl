@@ -13,6 +13,12 @@ struct Uniforms {
     time: vec4<f32>,
     // Width and height in pixels, outline width in pixels, GUI scale.
     screen: vec4<f32>,
+    // The environment's fog (`FogEnvironmentalStart` and `End`), by spherical distance:
+    // water's and lava's; out of them it never reaches anything.
+    fog_env: vec4<f32>,
+    // The underwater overlay: its texture's offsets, brightness, and the tangent of half
+    // the hand's field of view.
+    water: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -34,6 +40,7 @@ struct VertexOut {
     // The lightmap's colour, and 1 where an entity flashes red.
     @location(3) light: vec3<f32>,
     @location(4) red: f32,
+    @location(5) spherical: f32,
 };
 
 // Vertex flags, in the light's fourth byte: an entity's red hurt flash (`OverlayTexture`'s
@@ -81,7 +88,15 @@ fn vs(in: VertexIn) -> VertexOut {
     // Vanilla fogs by cylindrical distance: horizontal, and vertical separately.
     let d = in.pos - u.eye.xyz;
     out.distance = max(length(d.xz), abs(d.y));
+    out.spherical = length(d);
     return out;
+}
+
+// `total_fog_value`: the environment's linear fog or the render distance's, whichever is
+// thicker. Vanilla's render distance fog is linear too; this keeps its smoother curve.
+fn fog_value(cylindrical: f32, spherical: f32) -> f32 {
+    let env = clamp((spherical - u.fog_env.x) / (u.fog_env.y - u.fog_env.x), 0.0, 1.0);
+    return max(env, smoothstep(u.params.x, u.params.y, cylindrical));
 }
 
 fn shade(in: VertexOut) -> vec4<f32> {
@@ -91,7 +106,7 @@ fn shade(in: VertexOut) -> vec4<f32> {
     // colour and makes the rest red, before the lightmap.
     let flashed = mix(vec3<f32>(1.0, 0.0, 0.0), color.rgb, 178.0 / 255.0);
     color = vec4<f32>(mix(color.rgb, flashed, in.red) * in.light, color.a);
-    let fog = smoothstep(u.params.x, u.params.y, in.distance);
+    let fog = fog_value(in.distance, in.spherical);
     return vec4<f32>(mix(color.rgb, u.fog_color.rgb, fog), color.a);
 }
 
@@ -237,6 +252,18 @@ fn fs_portal(in: PortalOut) -> @location(0) vec4<f32> {
     }
     let fog = smoothstep(u.params.x, u.params.y, in.distance);
     return vec4<f32>(mix(color, u.fog_color.rgb, fog), 1.0);
+}
+
+// The underwater overlay (`ScreenEffectRenderer.submitWater`): `misc/underwater.png`
+// four times across a quad from -1 to 1 half a block in front of the eye, seen through the
+// hand's projection, shifted as the view turns, and 10% opaque. It's bound in the portal's
+// sky slot, tiled the same way.
+@fragment
+fn fs_underwater(in: SkyOut) -> @location(0) vec4<f32> {
+    let half = 0.5 * u.water.w;
+    let xy = in.ndc * vec2<f32>(half * u.screen.x / u.screen.y, half);
+    let uv = u.water.xy + 2.0 * (vec2<f32>(1.0) - xy);
+    return textureSample(portal_sky, portal_sampler, uv) * vec4<f32>(vec3<f32>(u.water.z), 0.1);
 }
 
 // The block outline: vanilla's `rendertype_lines`. Each corner of an edge's quad is placed

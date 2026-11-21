@@ -1,17 +1,19 @@
 //! How the player moves, as vanilla 26.3's `LocalPlayer`, `LivingEntity` and `Entity` do it:
 //! walking, sprinting and sneaking input, jumping, gravity and drag, block friction and
 //! speed factors, collision with block shapes and stepping up, backing off edges while
-//! sneaking, ladders, and creative flight.
+//! sneaking, ladders, creative flight, and wading, swimming and sinking in water and lava,
+//! pushed by their currents (`fluid`).
 //!
 //! `pick` finds the block the player looks at, against block outline shapes, as
 //! `Entity.pick` does; `BlockPhysics::destroy_progress` is how far a tick of mining gets.
 //!
 //! Collision and outline shapes, block friction and destroy times come from `resources/reports/physics.json`, which
 //! `cargo xtask gen-reports` dumps from vanilla, so they match it exactly. Not yet covered:
-//! swimming and other fluid movement, bouncing on slime and beds, cobwebs and powder snow,
-//! and entities as obstacles.
+//! bubble columns, depth strider and dolphin's grace, bouncing on slime and beds, cobwebs
+//! and powder snow, and entities as obstacles.
 
 mod collide;
+pub mod fluid;
 mod pick;
 
 use anyhow::{Context, Result};
@@ -65,6 +67,21 @@ pub struct BlockPhysics {
     jump_factor: Vec<f32>,
     /// States in the `#minecraft:climbable` tag.
     climbable: Vec<bool>,
+    /// Per state id: its fluid, packed as `fluid::Fluid::unpack` reads it, and a bit per
+    /// direction whose face is sturdy (`BlockState.isFaceSturdy`), plus 64 for ice.
+    fluids: Vec<u8>,
+    sturdy: Vec<u8>,
+    /// States in `#minecraft:blocks_fluid_flow`.
+    blocks_fluid_flow: Vec<bool>,
+    /// Per state id: `getLightDampening`, `getLightEmission` times 16, and 256 for
+    /// `useShapeForLightOcclusion`.
+    light: Vec<u16>,
+    /// Per state id: 0 for `LightEngine.isEmptyShape`, else 1 + an index into
+    /// `occlusion_faces`.
+    occlusion: Vec<u16>,
+    /// Each occlusion shape's faces, by `Direction` ordinal: a bit per sixteenth of the face
+    /// it covers, as `DumpPhysics.faceMask` lays them out.
+    occlusion_faces: Vec<[[u64; 4]; 6]>,
 }
 
 impl BlockPhysics {
@@ -177,13 +194,64 @@ impl BlockPhysics {
             requires_tool[states].fill(mining[1].as_bool().context("requires tool")?);
         }
 
-        let mut climbable = vec![false; n];
-        for name in block_tag("minecraft:climbable")? {
-            if let Some(block) = registry.block(&name) {
-                let first = block.first_state as usize;
-                climbable[first..first + block.state_count() as usize].fill(true);
+        let tagged = |tag: &str| -> Result<Vec<bool>> {
+            let mut states = vec![false; n];
+            for name in block_tag(tag)? {
+                if let Some(block) = registry.block(&name) {
+                    let first = block.first_state as usize;
+                    states[first..first + block.state_count() as usize].fill(true);
+                }
             }
-        }
+            Ok(states)
+        };
+        let per_state = |key: &str| -> Result<Vec<u16>> {
+            let values: Vec<u16> = report[key]
+                .as_array()
+                .with_context(|| {
+                    format!("physics.json has no {key}; run `cargo xtask gen-reports`")
+                })?
+                .iter()
+                .map(|v| v.as_u64().map(|v| v as u16).context(key.to_owned()))
+                .collect::<Result<_>>()?;
+            anyhow::ensure!(
+                values.len() == n,
+                "physics.json's {key} don't fit the registry"
+            );
+            Ok(values)
+        };
+        let bytes = |values: Vec<u16>| values.into_iter().map(|v| v as u8).collect();
+        let occlusion_faces = report["occlusion_faces"]
+            .as_array()
+            .context("physics.json has no occlusion_faces; run `cargo xtask gen-reports`")?
+            .iter()
+            .map(|faces| {
+                let faces: Vec<[u64; 4]> = faces
+                    .as_array()
+                    .context("occlusion faces are not a list")?
+                    .iter()
+                    .map(|face| {
+                        let hex = face.as_str().filter(|h| h.len() == 64);
+                        let hex = hex.context("a face mask needs 64 hex digits")?;
+                        let mut words = [0; 4];
+                        for (i, word) in words.iter_mut().enumerate() {
+                            *word = u64::from_str_radix(&hex[i * 16..i * 16 + 16], 16)?;
+                        }
+                        Ok(words)
+                    })
+                    .collect::<Result<_>>()?;
+                faces
+                    .try_into()
+                    .ok()
+                    .context("an occlusion shape needs 6 faces")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let occlusion = per_state("occlusion")?;
+        anyhow::ensure!(
+            occlusion
+                .iter()
+                .all(|&i| i as usize <= occlusion_faces.len()),
+            "physics.json's occlusion indices don't fit its occlusion_faces"
+        );
         Ok(Self {
             shapes,
             edges,
@@ -194,7 +262,13 @@ impl BlockPhysics {
             friction,
             speed_factor,
             jump_factor,
-            climbable,
+            climbable: tagged("minecraft:climbable")?,
+            fluids: bytes(per_state("fluids")?),
+            sturdy: bytes(per_state("sturdy")?),
+            blocks_fluid_flow: tagged("minecraft:blocks_fluid_flow")?,
+            light: per_state("light")?,
+            occlusion,
+            occlusion_faces,
         })
     }
 
@@ -202,6 +276,52 @@ impl BlockPhysics {
         self.state_shapes
             .get(state as usize)
             .map_or(&[], |&i| &self.shapes[i as usize])
+    }
+
+    /// `BlockState.getLightDampening`: how much light passing into the block loses, 0 to 15.
+    pub fn light_dampening(&self, state: u32) -> u8 {
+        self.light
+            .get(state as usize)
+            .map_or(0, |&l| (l & 15) as u8)
+    }
+
+    /// `BlockState.getLightEmission`: the block light it gives off, 0 to 15.
+    pub fn light_emission(&self, state: u32) -> u8 {
+        self.light
+            .get(state as usize)
+            .map_or(0, |&l| (l >> 4 & 15) as u8)
+    }
+
+    /// `LightEngine.hasDifferentLightProperties`: whether replacing `old` with `new` can
+    /// change the light around it.
+    pub fn light_differs(&self, old: u32, new: u32) -> bool {
+        let shaped = |state: u32| {
+            self.light
+                .get(state as usize)
+                .is_some_and(|&l| l & 256 != 0)
+        };
+        old != new
+            && (self.light_dampening(old) != self.light_dampening(new)
+                || self.light_emission(old) != self.light_emission(new)
+                || shaped(old)
+                || shaped(new))
+    }
+
+    /// `LightEngine.isEmptyShape`: light ignores the block's shape.
+    pub fn empty_light_shape(&self, state: u32) -> bool {
+        self.occlusion.get(state as usize).is_none_or(|&i| i == 0)
+    }
+
+    /// `LightEngine.shapeOccludes`: whether light going from `from` to `to` in direction
+    /// `direction` (a `Direction` ordinal) is blocked by the two faces between them, which
+    /// together cover the whole face.
+    pub fn light_occludes(&self, from: u32, to: u32, direction: usize) -> bool {
+        let face = |state: u32, direction: usize| match self.occlusion.get(state as usize) {
+            Some(&i) if i > 0 => self.occlusion_faces[i as usize - 1][direction],
+            _ => [0; 4],
+        };
+        let (a, b) = (face(from, direction), face(to, direction ^ 1));
+        (0..4).all(|i| a[i] | b[i] == u64::MAX)
     }
 
     /// `Block.getFriction`: how slippery the block is, 0.6 for most.
@@ -303,11 +423,33 @@ impl Input {
 }
 
 const WIDTH: f64 = 0.6;
-const HEIGHT: f64 = 1.8;
-const CROUCH_HEIGHT: f64 = 1.5;
-const EYE: f64 = 1.62;
-const CROUCH_EYE: f64 = 1.27;
 const STEP: f32 = 0.6;
+/// `Entity.getFluidJumpThreshold` for an eye at least 0.4 high, as all the player's are.
+const FLUID_JUMP: f64 = 0.4;
+/// `EntityFluidInteraction.applyCurrentTo`'s scales: water's, and lava's outside the
+/// nether (`EnvironmentAttributes.FAST_LAVA` there makes it 0.007).
+const WATER_CURRENT: f64 = 0.014;
+const LAVA_CURRENT: f64 = 0.0023333333333333335;
+
+/// The player's `Pose`, which sets its box and eye height.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pose {
+    Standing,
+    Crouching,
+    /// Swimming, or crawling where nothing taller fits.
+    Swimming,
+}
+
+impl Pose {
+    /// `Avatar.POSES`: the box's height and the eye height.
+    fn size(self) -> (f64, f64) {
+        match self {
+            Pose::Standing => (1.8, 1.62),
+            Pose::Crouching => (1.5, 1.27),
+            Pose::Swimming => (0.6, 0.4),
+        }
+    }
+}
 /// `Attributes.GRAVITY`'s default.
 const GRAVITY: f64 = 0.08;
 /// `Attributes.JUMP_STRENGTH`'s default, a float widened to double.
@@ -327,7 +469,20 @@ pub struct Player {
     pub on_ground: bool,
     pub horizontal_collision: bool,
     pub sprinting: bool,
+    /// `LocalPlayer.crouching`: moving slowly and backing off edges, set as each tick starts.
     pub crouching: bool,
+    /// The box and eye height, set as each tick ends (`Player.updatePlayerPose`).
+    pub pose: Pose,
+    /// `Entity.isSwimming`: sprinting under water.
+    pub swimming: bool,
+    /// `Entity.isInWater`: the box touches water.
+    pub in_water: bool,
+    /// `LocalPlayer.isUnderWater`: the eye was in water as the tick started.
+    pub under_water: bool,
+    /// `LocalPlayer.waterVisionTime`: ticks the eye has spent in water, up to 600, which
+    /// clears the water's fog; it falls 10 a tick out of it.
+    pub water_vision_time: i32,
+    touching: fluid::Touching,
     pub flying: bool,
     /// May start flying by double-tapping jump (creative and spectator).
     pub may_fly: bool,
@@ -350,6 +505,12 @@ impl Player {
             horizontal_collision: false,
             sprinting: false,
             crouching: false,
+            pose: Pose::Standing,
+            swimming: false,
+            in_water: false,
+            under_water: false,
+            water_vision_time: 0,
+            touching: fluid::Touching::default(),
             flying: false,
             may_fly: false,
             flying_speed: 0.05,
@@ -361,7 +522,7 @@ impl Player {
     }
 
     pub fn eye_height(&self) -> f64 {
-        if self.crouching { CROUCH_EYE } else { EYE }
+        self.pose.size().1
     }
 
     /// Where the server put the player; any motion stops.
@@ -372,12 +533,86 @@ impl Player {
     }
 
     fn bounding_box(&self) -> Aabb {
-        let height = if self.crouching {
-            CROUCH_HEIGHT
+        Aabb::at_feet(self.pos, WIDTH, self.pose.size().0)
+    }
+
+    /// `Player.canPlayerFitWithinBlocksAndEntitiesWhen`.
+    fn fits(&self, pose: Pose, c: &collide::Collider<impl World>) -> bool {
+        c.no_collision(&Aabb::at_feet(self.pos, WIDTH, pose.size().0).deflate(1e-7))
+    }
+
+    /// `Entity.isEyeInFluid(WATER)`, as the last fluid update left it.
+    pub fn eye_in_water(&self) -> bool {
+        self.touching.eye_in_water
+    }
+
+    /// `LocalPlayer.getWaterVision`: 0 out of water, rising to 0.6 over the first 5
+    /// seconds in it and to 1 over the next 25.
+    pub fn water_vision(&self) -> f32 {
+        if !self.eye_in_water() {
+            return 0.0;
+        }
+        let t = self.water_vision_time as f32;
+        if t >= 600.0 {
+            return 1.0;
+        }
+        let a = (t / 100.0).clamp(0.0, 1.0);
+        let b = if t < 100.0 {
+            0.0
         } else {
-            HEIGHT
+            ((t - 100.0) / 500.0).clamp(0.0, 1.0)
         };
-        Aabb::at_feet(self.pos, WIDTH, height)
+        a * 0.6 + b * 0.39999998
+    }
+
+    fn in_lava(&self) -> bool {
+        self.touching.lava_height > 0.0
+    }
+
+    /// `Entity.updateFluidInteraction`: what fluid the box touches, and its current's push.
+    fn update_fluid_interaction(&mut self, c: &collide::Collider<impl World>) {
+        let b = self.bounding_box();
+        let eye = self.pos + DVec3::Y * self.eye_height();
+        // `Player.isPushedByFluid`.
+        let pushed = !self.flying;
+        self.touching = fluid::touching(c.world, c.blocks, &b.deflate(0.001), b.min.y, eye, pushed);
+        self.in_water = self.touching.water_height > 0.0;
+        if self.in_water {
+            self.fall_distance = 0.0;
+        }
+        if pushed {
+            if self.in_water {
+                self.velocity += self
+                    .touching
+                    .water_current
+                    .push(self.velocity, WATER_CURRENT);
+            }
+            if self.in_lava() {
+                self.velocity += self.touching.lava_current.push(self.velocity, LAVA_CURRENT);
+            }
+        }
+    }
+
+    /// `Player.updatePlayerPose`: swimming, crouching or standing, whichever is wanted and
+    /// fits, else the lowest that fits.
+    fn update_pose(&mut self, sneak: bool, c: &collide::Collider<impl World>) {
+        if !self.fits(Pose::Swimming, c) {
+            return;
+        }
+        let desired = if self.swimming {
+            Pose::Swimming
+        } else if sneak && !self.flying {
+            Pose::Crouching
+        } else {
+            Pose::Standing
+        };
+        self.pose = if self.fits(desired, c) {
+            desired
+        } else if self.fits(Pose::Crouching, c) {
+            Pose::Crouching
+        } else {
+            Pose::Swimming
+        };
     }
 
     /// One game tick (1/20 s) with these keys held.
@@ -388,14 +623,37 @@ impl Player {
         }
         let collider = collide::Collider { world, blocks };
 
-        // Pose: crouching while sneak is held and not flying, standing only where it fits.
-        let wants_crouch = input.sneak && !self.flying;
-        if wants_crouch {
-            self.crouching = true;
-        } else if self.crouching {
-            let standing = Aabb::at_feet(self.pos, WIDTH, HEIGHT).deflate(1e-7);
-            self.crouching = !collider.no_collision(&standing);
+        // `Player.updateIsUnderwater`, from where the eye was last tick, then
+        // `Entity.baseTick`'s fluid update and `Player.updateSwimming`.
+        self.under_water = self.touching.eye_in_water;
+        self.update_fluid_interaction(&collider);
+        if self.in_lava() {
+            self.fall_distance *= 0.5;
         }
+        // `LocalPlayer.aiStep`'s water vision.
+        if self.touching.eye_in_water {
+            self.water_vision_time = (self.water_vision_time + 1).min(600);
+        } else if self.water_vision_time > 0 {
+            self.water_vision_time = (self.water_vision_time - 10).max(0);
+        }
+        let water_here = fluid::fluid_at(world, blocks, self.block_pos())
+            .is_some_and(|f| f.kind == fluid::FluidKind::Water);
+        self.swimming = !self.flying
+            && self.sprinting
+            && if self.swimming {
+                self.in_water
+            } else {
+                self.under_water && water_here
+            };
+
+        // `LocalPlayer.aiStep`: crouching while sneak is held, or where only crouching fits.
+        self.crouching = !self.flying
+            && !self.swimming
+            && self.fits(Pose::Crouching, &collider)
+            && (input.sneak || !self.fits(Pose::Standing, &collider));
+        // `isMovingSlowly`: crouching or crawling.
+        let slowly = self.crouching || (self.pose == Pose::Swimming && !self.in_water);
+        let shallow = self.in_water && !self.under_water;
 
         self.jump_trigger_time = self.jump_trigger_time.saturating_sub(1);
         // `KeyboardInput.tick`: x is left minus right, y forward minus back, normalised.
@@ -412,31 +670,50 @@ impl Player {
         // `LocalPlayer.modifyInput`.
         if mv.length_squared() != 0.0 {
             mv *= 0.98;
-            if self.crouching {
+            if slowly {
                 mv *= 0.3; // `sneaking_speed`
             }
             mv = square_movement(mv);
         }
 
-        // Sprinting: started by the sprint key while moving forward, stopped by letting go
-        // of forward, sneaking, or walking into a wall.
+        // Sprinting: started by the sprint key while moving forward, but not in shallow
+        // water or while moving slowly unless under water. Running stops by letting go of
+        // forward, sneaking, walking into a wall or wading; swimming stops by leaving the
+        // water, or by letting go of forward while floating.
         let forward = mv.y > 1.0e-5;
-        if self.sprinting && (!forward || self.crouching || self.horizontal_collision) {
-            self.sprinting = false;
-        } else if !self.sprinting && input.sprint && forward && !self.crouching {
+        if !self.sprinting
+            && input.sprint
+            && forward
+            && (self.flying || !shallow)
+            && (!slowly || self.under_water)
+        {
             self.sprinting = true;
         }
+        if self.sprinting {
+            let stop = if self.swimming {
+                !self.in_water || (!forward && !self.on_ground && !input.sneak)
+            } else {
+                !forward || self.crouching || self.horizontal_collision || (!self.flying && shallow)
+            };
+            if stop {
+                self.sprinting = false;
+            }
+        }
 
-        // Double-tapping jump toggles flight, within 7 ticks.
+        // Double-tapping jump toggles flight, within 7 ticks, but not while swimming.
         if input.jump && !self.was_jumping && self.may_fly {
             if self.jump_trigger_time == 0 {
                 self.jump_trigger_time = 7;
-            } else {
+            } else if !self.swimming {
                 self.flying = !self.flying;
                 self.jump_trigger_time = 0;
             }
         }
         self.was_jumping = input.jump;
+        // `goDownInWater`: sneaking sinks.
+        if self.in_water && input.sneak && !self.flying {
+            self.velocity.y -= 0.04f32 as f64;
+        }
         if self.flying {
             let vertical = input.jump as i32 - input.sneak as i32;
             self.velocity.y += (vertical as f32 * self.flying_speed * 3.0) as f64;
@@ -450,24 +727,114 @@ impl Player {
         if self.velocity.y.abs() < 0.003 {
             self.velocity.y = 0.0;
         }
+        // Jumping: off the ground or out of shallow fluid, else rising through it
+        // (`jumpInLiquid`).
         let jumping = input.jump && !self.flying;
         if jumping {
-            if self.on_ground && self.no_jump_delay == 0 {
-                self.jump_from_ground(&collider);
-                self.no_jump_delay = 10;
+            let height = if self.in_lava() {
+                self.touching.lava_height
+            } else {
+                self.touching.water_height
+            };
+            let in_water = self.in_water && height > 0.0;
+            let rise = if !in_water || self.on_ground && height <= FLUID_JUMP {
+                if !self.in_lava() || self.on_ground && self.touching.lava_height <= FLUID_JUMP {
+                    if (self.on_ground || in_water && height <= FLUID_JUMP)
+                        && self.no_jump_delay == 0
+                    {
+                        self.jump_from_ground(&collider);
+                        self.no_jump_delay = 10;
+                    }
+                    false
+                } else {
+                    true
+                }
+            } else {
+                true
+            };
+            if rise {
+                self.velocity.y += 0.04f32 as f64;
             }
         } else {
             self.no_jump_delay = 0;
         }
 
-        // `Player.travel`: flight keeps 60% of the vertical speed instead of falling.
+        // `Player.travel`: a swimmer heads where it looks, and flight keeps 60% of the
+        // vertical speed instead of falling.
+        if self.swimming {
+            let look = view_vector(self.yaw, self.pitch).y;
+            let multiplier = if look < -0.2 { 0.085 } else { 0.06 };
+            let head = DVec3::new(self.pos.x, self.pos.y + 1.0 - 0.1, self.pos.z).floor();
+            let under = fluid::fluid_at(world, blocks, head.as_ivec3().to_array()).is_some();
+            if look <= 0.0 || input.jump || under {
+                self.velocity.y += (look - self.velocity.y) * multiplier;
+            }
+        }
         let y_before = self.velocity.y;
-        self.travel_in_air(mv, jumping, &collider);
+        // `LivingEntity.shouldTravelInFluid`.
+        if (self.in_water || self.in_lava()) && !self.flying {
+            self.travel_in_fluid(mv, &collider);
+        } else {
+            self.travel_in_air(mv, jumping, &collider);
+        }
         if self.flying {
             self.velocity.y = y_before * 0.6;
             if self.on_ground {
                 self.flying = false;
             }
+        }
+        self.update_pose(input.sneak, &collider);
+    }
+
+    /// `LivingEntity.travelInFluid`: slow strokes, the fluid's drag, and a little gravity.
+    fn travel_in_fluid(&mut self, mv: glam::Vec2, c: &collide::Collider<impl World>) {
+        let falling = self.velocity.y <= 0.0;
+        let old_y = self.pos.y;
+        let water = self.in_water;
+        let input = DVec3::new(mv.x as f64, 0.0, mv.y as f64);
+        self.velocity += input_vector(input, 0.02, self.yaw);
+        self.move_by(self.velocity, c);
+        if water {
+            // `travelInWater`.
+            let slow_down = if self.sprinting { 0.9f32 } else { 0.8f32 } as f64;
+            if self.horizontal_collision && self.on_climbable(c) {
+                self.velocity.y = 0.2;
+            }
+            self.velocity *= DVec3::new(slow_down, 0.8f32 as f64, slow_down);
+            self.velocity.y = self.fluid_falling_adjusted(falling);
+        } else {
+            // `travelInLava`.
+            if self.touching.lava_height <= FLUID_JUMP {
+                self.velocity *= DVec3::new(0.5, 0.8f32 as f64, 0.5);
+                self.velocity.y = self.fluid_falling_adjusted(falling);
+            } else {
+                self.velocity *= 0.5;
+            }
+            self.velocity.y -= GRAVITY / 4.0;
+        }
+        // `jumpOutOfFluid`: against a wall with room above it, climb out.
+        if self.horizontal_collision {
+            let v = self.velocity;
+            let lifted = self.bounding_box().offset(DVec3::new(
+                v.x,
+                v.y + 0.6f32 as f64 - self.pos.y + old_y,
+                v.z,
+            ));
+            if c.no_collision(&lifted) && !fluid::contains_any_liquid(c.world, c.blocks, &lifted) {
+                self.velocity.y = 0.3f32 as f64;
+            }
+        }
+    }
+
+    /// `LivingEntity.getFluidFallingAdjustedMovement`: sinking slowly unless sprinting.
+    fn fluid_falling_adjusted(&self, falling: bool) -> f64 {
+        let y = self.velocity.y;
+        if self.sprinting {
+            y
+        } else if falling && (y - 0.005).abs() >= 0.003 && (y - GRAVITY / 16.0).abs() < 0.003 {
+            -0.003
+        } else {
+            y - GRAVITY / 16.0
         }
     }
 
@@ -587,9 +954,13 @@ impl Player {
         self.horizontal_collision = hit_x || hit_z;
         let vertical = wanted.y != moved.y;
         self.on_ground = vertical && wanted.y < 0.0;
+        // `LivingEntity.checkFallDamage`: out of water, see whether this move went in.
+        if !self.in_water {
+            self.update_fluid_interaction(c);
+        }
         if self.on_ground || self.flying {
             self.fall_distance = 0.0;
-        } else if moved.y < 0.0 {
+        } else if !self.in_water && moved.y < 0.0 {
             self.fall_distance -= moved.y;
         }
 

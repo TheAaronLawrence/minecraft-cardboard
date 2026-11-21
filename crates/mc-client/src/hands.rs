@@ -159,7 +159,7 @@ impl ViewBob {
 
     /// The start of a tick: `ClientAvatarState.tick`, `LivingEntity.baseTick`'s hurt
     /// countdown and `tickDeath`, then `AbstractClientPlayer.updateBob`, from the
-    /// player's movement last tick. The bob only follows walking on the ground.
+    /// player's movement last tick. The bob only follows walking on the ground, not swimming.
     pub fn tick(&mut self, velocity: glam::DVec3, on_ground: bool, dead: bool) {
         self.walk[0] = self.walk[1];
         self.hurt_time = (self.hurt_time - 1).max(0);

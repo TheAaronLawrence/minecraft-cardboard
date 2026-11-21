@@ -54,6 +54,19 @@ pub struct View {
     pub hud: bool,
 }
 
+/// What a camera inside water or lava sees (`FogRenderer.setupFog`): the fluid's fog,
+/// which also narrows the field of view to 6/7 of it (`Camera.modifyFovBasedOnDeathOrFluid`),
+/// and in water the underwater overlay (`ScreenEffectRenderer.submitWater`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InFluid {
+    pub fog_color: [f32; 3],
+    /// Where the fog starts and is complete, in blocks from the eye.
+    pub fog_start: f32,
+    pub fog_end: f32,
+    /// The overlay texture's u and v offsets, and its brightness.
+    pub overlay: Option<[f32; 3]>,
+}
+
 /// A corner of an outline edge's quad: the edge's end, its direction, and which side of
 /// the line this corner is on. The vertex shader widens the line on screen.
 #[repr(C)]
@@ -76,6 +89,10 @@ struct Uniforms {
     time: [f32; 4],
     /// Width and height in pixels, the outline width in pixels, and the GUI scale.
     screen: [f32; 4],
+    /// The environment's fog start and end.
+    fog_env: [f32; 4],
+    /// The underwater overlay's offsets and brightness, and tan(half the hand's fov).
+    water: [f32; 4],
 }
 
 /// Vanilla's plains sky and fog colours at noon.
@@ -145,6 +162,9 @@ pub struct Renderer {
     hand_vertices: Option<(wgpu::Buffer, u32)>,
     /// The fire a burning player sees, and its index count.
     fire_overlay_vertices: Option<(wgpu::Buffer, u32)>,
+    in_fluid: Option<InFluid>,
+    underwater: wgpu::RenderPipeline,
+    underwater_bind_group: wgpu::BindGroup,
     bind_group: wgpu::BindGroup,
     /// The same bindings, with the uniforms the hand is drawn with.
     hand_bind_group: wgpu::BindGroup,
@@ -310,6 +330,7 @@ impl Renderer {
         let portal_textures = &models.portal_textures;
         let portal_sky = portal_texture("end sky", &portal_textures.sky);
         let portal_stars = portal_texture("end portal", &portal_textures.stars);
+        let underwater_texture = portal_texture("underwater", &portal_textures.underwater);
         let repeat = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
@@ -349,6 +370,24 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&portal_stars),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&repeat),
+                },
+            ],
+        });
+        let underwater_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("underwater"),
+            layout: &portal_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&underwater_texture),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&underwater_texture),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -445,14 +484,15 @@ impl Renderer {
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32],
         });
         // Drawn over the world, tested against its depth but not writing it.
-        let overlay = |vertex: &str,
+        let overlay = |layout: &wgpu::PipelineLayout,
+                       vertex: &str,
                        fragment: &str,
                        buffers: &[Option<wgpu::VertexBufferLayout>],
                        blend: wgpu::BlendState,
                        depth_compare: wgpu::CompareFunction| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fragment),
-                layout: Some(&pipeline_layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(vertex),
@@ -483,6 +523,7 @@ impl Renderer {
             })
         };
         let outline = overlay(
+            &pipeline_layout,
             "vs_line",
             "fs_line",
             std::slice::from_ref(&line_layout),
@@ -496,6 +537,7 @@ impl Renderer {
             operation: wgpu::BlendOperation::Add,
         };
         let crosshair = overlay(
+            &pipeline_layout,
             "vs_sky",
             "fs_crosshair",
             &[],
@@ -508,9 +550,19 @@ impl Renderer {
         let vertex_layouts = std::slice::from_ref(&vertex_layout);
         // `RenderPipelines.TEXT_SEE_THROUGH`: blended over whatever is in front.
         let see_through = overlay(
+            &pipeline_layout,
             "vs",
             "fs_translucent",
             vertex_layouts,
+            wgpu::BlendState::ALPHA_BLENDING,
+            wgpu::CompareFunction::Always,
+        );
+        // `RenderPipelines.BLOCK_SCREEN_EFFECT`: blended over the whole view.
+        let underwater = overlay(
+            &portal_pipeline_layout,
+            "vs_sky",
+            "fs_underwater",
+            &[],
             wgpu::BlendState::ALPHA_BLENDING,
             wgpu::CompareFunction::Always,
         );
@@ -621,6 +673,9 @@ impl Renderer {
             outline_vertices: None,
             hand_vertices: None,
             fire_overlay_vertices: None,
+            in_fluid: None,
+            underwater,
+            underwater_bind_group,
             bind_group,
             hand_bind_group,
             hand_uniforms,
@@ -715,6 +770,10 @@ impl Renderer {
     /// Draws these quads (from `entity::fire_overlay`) over the hands, blended and
     /// whatever their depth, as `ScreenEffectRenderer` draws the fire a burning player
     /// sees.
+    pub fn set_in_fluid(&mut self, in_fluid: Option<InFluid>) {
+        self.in_fluid = in_fluid;
+    }
+
     pub fn set_fire_overlay(&mut self, vertices: &[Vertex]) {
         self.fire_overlay_vertices = self.quads_buffer("fire overlay", vertices);
     }
@@ -828,6 +887,13 @@ impl Renderer {
             });
             self.depth = Some((depth.create_view(&Default::default()), width, height));
         }
+        let fluid = self.in_fluid;
+        let fov_scale = if fluid.is_some() { 0.85714287 } else { 1.0 };
+        let camera = &Camera {
+            fov: camera.fov * fov_scale,
+            ..*camera
+        };
+        let hand_fov = 70.0 * fov_scale;
         let view_proj = camera.view_proj(width as f32 / height as f32, view.distance * 2.0);
         // Vanilla's terrain fog: it ends at the render distance and starts a tenth before.
         let fog_end = view.distance;
@@ -837,14 +903,25 @@ impl Renderer {
         let chunks = view.distance / 16.0;
         let toward_sky = 1.0 - (0.25 + 0.75 * chunks / 32.0).clamp(0.25, 1.0).powf(0.25);
         let (fog, sky) = (color(FOG), color(SKY));
-        let fog_color = std::array::from_fn(|i| fog[i] + (sky[i] - fog[i]) * toward_sky);
+        let mut fog_color = std::array::from_fn(|i| fog[i] + (sky[i] - fog[i]) * toward_sky);
+        // Out of fluids the environment's fog ends past anything drawn.
+        let (mut fog_env, mut sky_end, mut water) =
+            ([1e30, 2e30, 0.0, 0.0], view.distance, [0.0; 4]);
+        if let Some(f) = fluid {
+            fog_color = [f.fog_color[0], f.fog_color[1], f.fog_color[2], 1.0];
+            fog_env = [f.fog_start, f.fog_end, 0.0, 0.0];
+            sky_end = f.fog_end;
+            if let Some([u, v, brightness]) = f.overlay {
+                water = [u, v, brightness, (hand_fov / 2.0f32).to_radians().tan()];
+            }
+        }
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
             eye: camera.eye.extend(1.0).into(),
             fog_color,
-            // The sky fogs out at the render distance (`FogData.skyEnd`).
-            sky_color: [sky[0], sky[1], sky[2], view.distance],
+            // The sky fogs out at the render distance, or the fluid's fog (`FogData.skyEnd`).
+            sky_color: [sky[0], sky[1], sky[2], sky_end],
             params: [fog_start, fog_end, 1.0, 0.5],
             // `GlobalSettingsUniform`'s GameTime.
             time: [(view.ticks % 24000.0) / 24000.0, 0.0, 0.0, 0.0],
@@ -855,11 +932,13 @@ impl Renderer {
                 (width as f32 / 1920.0 * 2.5).max(2.5),
                 gui_scale(width, height) as f32,
             ],
+            fog_env,
+            water,
         };
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
         let hand_view_proj = Camera {
-            fov: 70.0,
+            fov: hand_fov,
             ..*camera
         }
         .view_proj(width as f32 / height as f32, view.distance * 2.0);
@@ -1004,7 +1083,9 @@ impl Renderer {
             }
         }
         if let Some((indices, _)) = &self.indices
-            && (self.hand_vertices.is_some() || self.fire_overlay_vertices.is_some())
+            && (self.hand_vertices.is_some()
+                || self.fire_overlay_vertices.is_some()
+                || fluid.is_some_and(|f| f.overlay.is_some()))
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hand"),
@@ -1029,17 +1110,22 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.hand_bind_group, &[]);
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            // The hands, then the screen effects over them.
-            for (pipeline, vertices) in [
-                (&self.entity, &self.hand_vertices),
-                (&self.see_through, &self.fire_overlay_vertices),
-            ] {
-                if let Some((buffer, count)) = vertices {
-                    pass.set_pipeline(pipeline);
-                    pass.set_vertex_buffer(0, buffer.slice(..));
-                    pass.draw_indexed(0..*count, 0, 0..1);
-                }
+            // The hands, then the screen effects over them: water, then fire.
+            let draw =
+                |pass: &mut wgpu::RenderPass, pipeline, vertices: &Option<(wgpu::Buffer, u32)>| {
+                    if let Some((buffer, count)) = vertices {
+                        pass.set_pipeline(pipeline);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw_indexed(0..*count, 0, 0..1);
+                    }
+                };
+            draw(&mut pass, &self.entity, &self.hand_vertices);
+            if fluid.is_some_and(|f| f.overlay.is_some()) {
+                pass.set_pipeline(&self.underwater);
+                pass.set_bind_group(1, &self.underwater_bind_group, &[]);
+                pass.draw(0..3, 0..1);
             }
+            draw(&mut pass, &self.see_through, &self.fire_overlay_vertices);
         }
         if gui_buffer.is_some() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

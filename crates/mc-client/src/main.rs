@@ -30,6 +30,7 @@ mod chat;
 mod entities;
 mod hands;
 mod inventory;
+mod light;
 mod particles;
 mod skins;
 mod stream;
@@ -585,6 +586,7 @@ impl App {
             Some(outbox) => Some(walk::Walker::new(
                 outbox,
                 &scene.registry,
+                scene.biomes.clone(),
                 mc_protocol::offline_uuid(&self.args.name),
             )?),
             None => None,
@@ -1263,6 +1265,11 @@ impl winit::application::ApplicationHandler for App {
                                 mc_render::entity::fire_overlay(&self.models.atlas, camera)
                             });
                             renderer.set_fire_overlay(&fire.unwrap_or_default());
+                            renderer.set_in_fluid(walker.in_fluid(
+                                camera.eye,
+                                camera.yaw,
+                                camera.pitch,
+                            ));
                             let cracks = walker.cracks();
                             if cracks != self.shown_cracks {
                                 let vertices: Vec<_> = cracks

@@ -13,6 +13,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
+/// A section's biomes: its y, its palette of biome names, and each 4×4×4 cell's index
+/// into the palette.
+pub type SectionBiomes = (i32, Vec<String>, [u8; 64]);
+
+/// A chunk's blocks by section y, and its biomes.
+pub type ChunkData = (Vec<(i32, mc_world::Blocks)>, Vec<SectionBiomes>);
+
 pub enum Update {
     /// Draw this mesh for the chunk, replacing what it drew before.
     Mesh((i32, i32), Mesh),
@@ -24,8 +31,9 @@ pub enum Update {
     Teleport(Vec3, f32, f32),
     /// The server connection ended, for this reason.
     Disconnected(String),
-    /// A server chunk's blocks by section y, for collision; `None` when it's dropped.
-    Collision((i32, i32), Option<Vec<(i32, mc_world::Blocks)>>),
+    /// A server chunk's blocks by section y, for collision, and its biomes; `None` when
+    /// it's dropped.
+    Collision((i32, i32), Option<ChunkData>),
     /// The server changed these blocks: position and new state.
     Blocks(Vec<([i32; 3], u32)>),
     /// A server chunk's light, for lighting entities: sky and block light by section y.
@@ -116,6 +124,17 @@ fn work(
         registry,
     } = sources;
     let mesher = Mesher::new(&models, &biomes, &registry);
+    // Only server chunks change after they load; a save's light is already right.
+    let lighting = match &source {
+        Source::Server(_) => match crate::light::Lighting::new(&registry) {
+            Ok(lighting) => Some(lighting),
+            Err(e) => {
+                eprintln!("relighting changed blocks is off: {e:#}");
+                None
+            }
+        },
+        Source::Save(_) => None,
+    };
     // Chunks the save doesn't have, so they aren't looked for again.
     let mut missing: HashSet<(i32, i32)> = HashSet::new();
     // Chunks meshed (or found unmeshable) and not removed since.
@@ -127,7 +146,14 @@ fn work(
         if let Source::Server(events) = &source {
             for event in events.try_iter() {
                 idle = false;
-                if !receive(event, &mut view, &mut meshed, &mut dirty, tx) {
+                if !receive(
+                    event,
+                    &mut view,
+                    lighting.as_ref(),
+                    &mut meshed,
+                    &mut dirty,
+                    tx,
+                ) {
                     return;
                 }
             }
@@ -230,7 +256,14 @@ fn work(
                         match events.recv_timeout(std::time::Duration::from_millis(50)) {
                             Ok(event) => {
                                 idle = false;
-                                if !receive(event, &mut view, &mut meshed, &mut dirty, tx) {
+                                if !receive(
+                                    event,
+                                    &mut view,
+                                    lighting.as_ref(),
+                                    &mut meshed,
+                                    &mut dirty,
+                                    tx,
+                                ) {
                                     return;
                                 }
                             }
@@ -255,6 +288,7 @@ fn work(
 fn receive(
     event: mc_protocol::Event,
     view: &mut WorldView,
+    lighting: Option<&crate::light::Lighting>,
     meshed: &mut HashSet<(i32, i32)>,
     dirty: &mut HashSet<(i32, i32)>,
     tx: &Sender<Update>,
@@ -279,6 +313,11 @@ fn receive(
                 .iter()
                 .map(|s| (s.y, s.blocks.clone()))
                 .collect();
+            let biomes = chunk
+                .sections
+                .iter()
+                .map(|s| (s.y, s.biome_palette.clone(), s.biomes))
+                .collect();
             let light = chunk
                 .sections
                 .iter()
@@ -296,11 +335,20 @@ fn receive(
                 return false;
             }
             view.insert(chunk);
-            return tx.send(Update::Collision(key, Some(blocks))).is_ok();
+            return tx
+                .send(Update::Collision(key, Some((blocks, biomes))))
+                .is_ok();
         }
         Event::Blocks(changes) => {
+            // Blocks whose change can change the light, to relight as the vanilla client
+            // does: the server sends new light only to players at the edge of its view.
+            let mut relight = Vec::new();
             for &([x, y, z], state) in &changes {
+                let old = view.state(x, y, z);
                 if view.set_block([x, y, z], state) {
+                    if lighting.is_some_and(|l| l.differs(old, state)) {
+                        relight.push([x, y, z]);
+                    }
                     // Only blocks on a chunk's edge show in the next chunk over.
                     let near = |c: i32| match c.rem_euclid(16) {
                         0 => -1..=0,
@@ -308,6 +356,34 @@ fn receive(
                         _ => 0..=0,
                     };
                     touch(x.div_euclid(16), z.div_euclid(16), near(x), near(z));
+                }
+            }
+            if let Some(lighting) = lighting.filter(|_| !relight.is_empty()) {
+                let mut columns: std::collections::BTreeMap<(i32, i32), Vec<i32>> =
+                    Default::default();
+                for (cx, section_y, cz) in lighting.relight(view, &relight) {
+                    columns.entry((cx, cz)).or_default().push(section_y);
+                }
+                for ((cx, cz), section_ys) in columns {
+                    // Light at a chunk's edge shades the faces next to it, and smooth
+                    // lighting reaches one block further.
+                    touch(cx, cz, -1..=1, -1..=1);
+                    let Some(chunk) = view.column(cx, cz) else {
+                        continue;
+                    };
+                    let sections = section_ys
+                        .into_iter()
+                        .filter_map(|y| chunk.section(y))
+                        .map(|s| (s.y, [s.sky_light.clone(), s.block_light.clone()]))
+                        .collect();
+                    let light = Update::Light {
+                        chunk: (cx, cz),
+                        sections,
+                        whole: false,
+                    };
+                    if tx.send(light).is_err() {
+                        return false;
+                    }
                 }
             }
             Update::Blocks(changes)

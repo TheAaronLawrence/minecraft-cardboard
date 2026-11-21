@@ -1,4 +1,4 @@
-//! Biome colours for grass, leaves, leaf litter and water.
+//! Biome colours for grass, leaves, leaf litter and water, and the water fog biomes set.
 
 use anyhow::{Context, Result};
 use mc_assets::Resources;
@@ -95,6 +95,52 @@ struct BiomeColors {
     foliage: [f32; 3],
     dry_foliage: [f32; 3],
     water: [f32; 3],
+    /// The `minecraft:visual/water_fog_color` and `water_fog_end_distance` attributes.
+    water_fog_color: Option<[f32; 3]>,
+    water_fog_end: Option<FloatModifier>,
+}
+
+/// An environment attribute's float value: replacing the value below it, or one of
+/// `FloatModifier`'s operations on it.
+#[derive(Clone, Copy, Debug)]
+enum FloatModifier {
+    Override(f32),
+    Add(f32),
+    Subtract(f32),
+    Multiply(f32),
+    Minimum(f32),
+    Maximum(f32),
+}
+
+impl FloatModifier {
+    /// A number, or `{"argument": n, "modifier": "multiply"}` (`AttributeModifier.FLOAT_LIBRARY`
+    /// without `alpha_blend`).
+    fn parse(v: &serde_json::Value) -> Option<Self> {
+        if let Some(n) = v.as_f64() {
+            return Some(Self::Override(n as f32));
+        }
+        let n = v["argument"].as_f64()? as f32;
+        Some(match v["modifier"].as_str()? {
+            "override" => Self::Override(n),
+            "add" => Self::Add(n),
+            "subtract" => Self::Subtract(n),
+            "multiply" => Self::Multiply(n),
+            "minimum" => Self::Minimum(n),
+            "maximum" => Self::Maximum(n),
+            _ => return None,
+        })
+    }
+
+    fn apply(self, value: f32) -> f32 {
+        match self {
+            Self::Override(n) => n,
+            Self::Add(n) => value + n,
+            Self::Subtract(n) => value - n,
+            Self::Multiply(n) => value * n,
+            Self::Minimum(n) => value.min(n),
+            Self::Maximum(n) => value.max(n),
+        }
+    }
 }
 
 pub struct Biomes {
@@ -131,6 +177,11 @@ impl Biomes {
             let water = parse_hex(&effects["water_color"])
                 .map(rgb)
                 .unwrap_or(rgb(0x3F76E4));
+            let attributes = &json["attributes"];
+            let water_fog_color =
+                parse_hex(&attributes["minecraft:visual/water_fog_color"]).map(rgb);
+            let water_fog_end =
+                FloatModifier::parse(&attributes["minecraft:visual/water_fog_end_distance"]);
             match effects["grass_color_modifier"].as_str() {
                 // Vanilla picks between two swamp colours with noise; this is the common one.
                 Some("swamp") => grass = rgb(0x6A7039),
@@ -147,6 +198,8 @@ impl Biomes {
                     foliage,
                     dry_foliage,
                     water,
+                    water_fog_color,
+                    water_fog_end,
                 },
             );
         }
@@ -155,8 +208,20 @@ impl Biomes {
             foliage: lookup(&foliage_map, 0.8, 0.4),
             dry_foliage: lookup(&dry_foliage_map, 0.8, 0.4),
             water: rgb(0x3F76E4),
+            water_fog_color: None,
+            water_fog_end: None,
         };
         Ok(Self { colors, fallback })
+    }
+
+    /// The biome's water fog colour and end distance, from the dimension's `color` and `end`
+    /// (`Biome.getAttributes().applyModifier`).
+    pub fn water_fog(&self, biome: &str, color: [f32; 3], end: f32) -> ([f32; 3], f32) {
+        let b = self.colors.get(biome).unwrap_or(&self.fallback);
+        (
+            b.water_fog_color.unwrap_or(color),
+            b.water_fog_end.map_or(end, |m| m.apply(end)),
+        )
     }
 
     pub fn color(&self, tint: Tint, biome: Option<&str>) -> [f32; 3] {
@@ -199,5 +264,25 @@ mod tests {
         assert_eq!(fixed("redstone_wire", &[("power", "15")]), 0xFF3200);
         assert_eq!(fixed("pumpkin_stem", &[("age", "0")]), 0x00FF00);
         assert_eq!(fixed("melon_stem", &[("age", "7")]), 0xE0C71C);
+    }
+
+    /// Swamps set their own water fog colour and multiply its distance by 0.85; warm oceans
+    /// only set the colour; plains keep the dimension's.
+    #[test]
+    fn biome_water_fog() {
+        let res = Resources::new(mc_assets::default_root());
+        let names = [
+            "minecraft:swamp",
+            "minecraft:warm_ocean",
+            "minecraft:plains",
+        ];
+        let biomes = Biomes::load(&res, names.map(str::to_owned)).unwrap();
+        let fog = |biome| {
+            let (color, end) = biomes.water_fog(biome, rgb(0x050533), 96.0);
+            (to_u32(color), end)
+        };
+        assert_eq!(fog("minecraft:swamp"), (0x232317, 96.0 * 0.85));
+        assert_eq!(fog("minecraft:warm_ocean"), (0x041F33, 96.0));
+        assert_eq!(fog("minecraft:plains"), (0x050533, 96.0));
     }
 }

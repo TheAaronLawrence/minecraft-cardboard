@@ -25,6 +25,7 @@ pub struct Registry {
     /// Indexed by data component type id.
     component_types: Vec<String>,
     entity_types: Vec<String>,
+    mob_effects: Vec<String>,
     /// What the inventory needs to know of each item, by name.
     item_info: HashMap<String, ItemInfo>,
 }
@@ -190,6 +191,7 @@ impl Registry {
         let component_types =
             names_by_id(&protocol_ids(&registries, "minecraft:data_component_type")?);
         let entity_types = names_by_id(&protocol_ids(&registries, "minecraft:entity_type")?);
+        let mob_effects = names_by_id(&protocol_ids(&registries, "minecraft:mob_effect")?);
 
         type Report = (String, i32, String, Option<String>, Option<String>);
         let item_info: HashMap<String, Report> = read_json(&reports_dir.join("items.json"))?;
@@ -217,6 +219,7 @@ impl Registry {
             block_entity_types,
             component_types,
             entity_types,
+            mob_effects,
         })
     }
 
@@ -274,6 +277,11 @@ impl Registry {
     /// An entity type's name, such as `minecraft:zombie`, from its protocol id.
     pub fn entity_type(&self, id: u32) -> Option<&str> {
         self.entity_types.get(id as usize).map(String::as_str)
+    }
+
+    /// A mob effect's name, such as `minecraft:fire_resistance`, from its protocol id.
+    pub fn mob_effect(&self, id: u32) -> Option<&str> {
+        self.mob_effects.get(id as usize).map(String::as_str)
     }
 
     pub fn item_count(&self) -> u32 {
