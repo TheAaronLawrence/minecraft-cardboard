@@ -1268,6 +1268,13 @@ impl Walker {
         self.placed = true;
     }
 
+    /// Accepts the server's teleport, now that the player has moved there.
+    pub fn accept_teleport(&self, teleport: &mc_protocol::Teleport) {
+        if let Err(e) = self.outbox.accept_teleport(teleport) {
+            eprintln!("accepting a teleport: {e:#}");
+        }
+    }
+
     /// Runs the ticks `dt` seconds hold, looking where the camera looks, and returns the
     /// eye position to draw from, between the last two ticks.
     pub fn frame(
@@ -1281,9 +1288,13 @@ impl Walker {
         if !self.placed {
             return None;
         }
+        // `DeltaTracker.Timer.advanceGameTime`: every whole tick the time holds is due and
+        // only the fraction carries over, but `Minecraft.runTick` runs at most 10 of them a
+        // frame, so after a long stall the game falls behind instead of racing to catch up.
         self.since_tick += dt;
-        while self.since_tick >= TICK {
-            self.since_tick -= TICK;
+        let due = (self.since_tick / TICK).floor();
+        self.since_tick -= due * TICK;
+        for _ in 0..(due as u32).min(10) {
             // `Hud.tick` and `LivingEntity.baseTick`'s countdown.
             self.health.tick = self.health.tick.wrapping_add(1);
             self.health.damage_cooldown = self.health.damage_cooldown.saturating_sub(1);

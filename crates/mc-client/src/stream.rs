@@ -27,8 +27,8 @@ pub enum Update {
     Remove((i32, i32)),
     /// Everything in range is loaded and meshed; the thread waits for the camera to move.
     Idle,
-    /// The server placed the player: eye position, yaw and pitch.
-    Teleport(Vec3, f32, f32),
+    /// The server placed the player; the game moves the player there and accepts it.
+    Teleport(mc_protocol::Teleport),
     /// The server connection ended, for this reason.
     Disconnected(String),
     /// A server chunk's blocks by section y, for collision, and its biomes; `None` when
@@ -420,11 +420,7 @@ fn receive(
             }
             Update::Remove((x, z))
         }
-        Event::Position { pos, yaw, pitch } => {
-            let [x, y, z] = pos.map(|c| c as f32);
-            // Vanilla's standing eye height.
-            Update::Teleport(Vec3::new(x, y + 1.62, z), yaw, pitch)
-        }
+        Event::Position(teleport) => Update::Teleport(teleport),
         Event::Disconnected(reason) => Update::Disconnected(reason),
         other => Update::Server(other),
     };

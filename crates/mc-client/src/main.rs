@@ -263,9 +263,13 @@ fn run() -> Result<()> {
         Some(path) if args.server.is_some() => {
             let scene = load_scene(&args)?;
             let models = scene.models.clone();
+            let outbox = scene
+                .outbox
+                .clone()
+                .context("joined without a connection")?;
             let mut streamer = spawn_streamer(scene, &args);
             let mut renderer = Renderer::headless(&models)?;
-            server_screenshot(&mut args, &mut streamer, &mut renderer)?;
+            server_screenshot(&mut args, &outbox, &mut streamer, &mut renderer)?;
             let image = renderer.screenshot(args.size.0, args.size.1, &args.camera, &view)?;
             image
                 .save(&path)
@@ -393,10 +397,17 @@ fn spawn_streamer(scene: Scene, args: &Args) -> stream::Streamer {
     )
 }
 
+/// Where the server put the player's eyes: vanilla's standing eye height over the feet.
+fn teleport_eye(teleport: &mc_protocol::Teleport) -> Vec3 {
+    let [x, y, z] = teleport.pos.map(|c| c as f32);
+    Vec3::new(x, y + 1.62, z)
+}
+
 /// Points the camera where the server put the player (unless `--pos`/`--look` say
 /// otherwise), and uploads chunks until none has arrived for a few seconds.
 fn server_screenshot(
     args: &mut Args,
+    outbox: &mc_protocol::Outbox,
     streamer: &mut stream::Streamer,
     renderer: &mut Renderer,
 ) -> Result<()> {
@@ -411,8 +422,9 @@ fn server_screenshot(
                     (last_mesh, chunks) = (Instant::now(), chunks + 1);
                 }
                 stream::Update::Remove(key) => renderer.remove_chunk(key),
-                stream::Update::Teleport(eye, yaw, pitch) => {
-                    args.place(eye, yaw, pitch);
+                stream::Update::Teleport(teleport) => {
+                    outbox.accept_teleport(&teleport)?;
+                    args.place(teleport_eye(&teleport), teleport.yaw, teleport.pitch);
                     (placed, last_mesh) = (true, Instant::now());
                 }
                 stream::Update::Disconnected(reason) => bail!("disconnected: {reason}"),
@@ -1343,7 +1355,10 @@ impl winit::application::ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
-                let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+                let elapsed = (now - self.last_frame).as_secs_f32();
+                // The game's own ticks get the real time, and run at most 10 a frame
+                // (`Walker::frame`); flying and animations here cap a long frame at 0.1 s.
+                let dt = elapsed.min(0.1);
                 self.last_frame = now;
                 // 20 game ticks a second.
                 self.view.ticks += dt * 20.0;
@@ -1386,13 +1401,17 @@ impl winit::application::ApplicationHandler for App {
                     match update {
                         stream::Update::Mesh(key, mesh) => state.renderer.upload_chunk(key, &mesh),
                         stream::Update::Remove(key) => state.renderer.remove_chunk(key),
-                        stream::Update::Teleport(eye, yaw, pitch) => {
-                            self.args.place(eye, yaw, pitch);
+                        stream::Update::Teleport(teleport) => {
+                            let eye = teleport_eye(&teleport);
+                            self.args.place(eye, teleport.yaw, teleport.pitch);
                             // Only the first placement is a choice; later ones are moves.
                             (self.args.pos_given, self.args.look_given) = (false, false);
                             if let Some(walker) = &mut self.walker {
                                 let camera = &self.args.camera;
                                 walker.teleport(eye - Vec3::Y * 1.62, camera.yaw, camera.pitch);
+                                // `ClientPacketListener.handleMovePlayer`: accepted from the
+                                // game's thread, once the player is there.
+                                walker.accept_teleport(&teleport);
                             }
                         }
                         stream::Update::Collision(key, blocks) => {
@@ -1445,7 +1464,7 @@ impl winit::application::ApplicationHandler for App {
                             Default::default()
                         };
                         if let Some(eye) =
-                            walker.frame(dt, input, buttons, camera.yaw, camera.pitch)
+                            walker.frame(elapsed, input, buttons, camera.yaw, camera.pitch)
                         {
                             camera.eye = eye;
                             camera.bob = walker.view_bob();

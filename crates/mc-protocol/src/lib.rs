@@ -127,12 +127,8 @@ pub enum Event {
         pos: [i32; 3],
         stage: Option<u8>,
     },
-    /// The server placed the player: feet position, yaw and pitch.
-    Position {
-        pos: [f64; 3],
-        yaw: f32,
-        pitch: f32,
-    },
+    /// The server placed the player. The game accepts it with `Outbox::accept_teleport`.
+    Position(Teleport),
     Chunk(mc_world::Chunk),
     /// The chunk left the player's view.
     Forget(i32, i32),
@@ -399,6 +395,20 @@ pub struct Session {
     pub outbox: Outbox,
 }
 
+/// A `ClientboundPlayerPositionPacket`, made absolute: where the server put the player.
+#[derive(Debug, Clone, Copy)]
+pub struct Teleport {
+    /// The teleport's id, which the acceptance echoes.
+    pub id: i32,
+    /// Feet position, yaw and pitch.
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    /// The first placement since joining or respawning, after which the client says it
+    /// has loaded.
+    pub load: bool,
+}
+
 /// Sends play-state packets by name, from any thread.
 #[derive(Clone)]
 pub struct Outbox {
@@ -432,6 +442,29 @@ impl Outbox {
         let mut body = Vec::new();
         body.put_string(command);
         self.send("chat_command", &body)
+    }
+
+    /// `ClientPacketListener.handleMovePlayer`'s answer, which vanilla sends from the game's
+    /// thread once the player has moved there, not as the packet arrives: answered at once,
+    /// it can reach a server that hasn't ticked the newly joined player yet, which measures
+    /// the move from the origin, calls it too quick and teleports the player again, over
+    /// and over until it ticks.
+    pub fn accept_teleport(&self, teleport: &Teleport) -> Result<()> {
+        let mut accept = Vec::new();
+        accept.put_varint(teleport.id);
+        for c in teleport.pos {
+            accept.put_f64(c);
+        }
+        accept.put_f32(teleport.yaw).put_f32(teleport.pitch);
+        // Since 26.3 the acceptance carries the position, and no movement packet
+        // follows: the server kicks a client that sends two positions in one tick.
+        self.send("accept_teleportation", &accept)?;
+        if teleport.load {
+            // Until the client says it has loaded, the server keeps the player frozen and
+            // invulnerable.
+            self.send("player_loaded", &[])?;
+        }
+        Ok(())
     }
 
     /// Leaves the server: closes the connection, as quitting does.
@@ -1089,23 +1122,16 @@ fn play(
                 let yaw = pick(3, yaw as f64, position.1 as f64) as f32;
                 let pitch = pick(4, pitch as f64, position.2 as f64) as f32;
                 position = (pos, yaw, pitch);
-
-                let mut accept = Vec::new();
-                accept.put_varint(teleport);
-                for c in pos {
-                    accept.put_f64(c);
-                }
-                accept.put_f32(yaw).put_f32(pitch);
-                // Since 26.3 the acceptance carries the position, and no movement packet
-                // follows: the server kicks a client that sends two positions in one tick.
-                send(conn, "accept_teleportation", &accept)?;
-                if !loaded {
-                    // Until the client says it has loaded, the server keeps the player
-                    // frozen and invulnerable.
-                    send(conn, "player_loaded", &[])?;
-                    loaded = true;
-                }
-                tx.send(Event::Position { pos, yaw, pitch }).is_ok()
+                let load = !loaded;
+                loaded = true;
+                tx.send(Event::Position(Teleport {
+                    id: teleport,
+                    pos,
+                    yaw,
+                    pitch,
+                    load,
+                }))
+                .is_ok()
             }
             "chunk_batch_finished" => {
                 // How many chunks a tick we can take; the server's upper limit.
