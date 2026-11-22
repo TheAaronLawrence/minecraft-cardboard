@@ -3,7 +3,7 @@
 use crate::bake::BlockModels;
 use crate::mesh::{Mesh, Vertex};
 use anyhow::{Context, Result};
-use glam::{Mat4, Vec3};
+use glam::{EulerRot, Mat4, Quat, Vec3};
 use wgpu::util::DeviceExt;
 
 /// A first-person camera, in Minecraft's conventions: yaw 0 looks south (+Z) and turns
@@ -31,6 +31,17 @@ impl Camera {
         )
     }
 
+    /// `Camera.setRotation`: the camera's turn from looking down -z with y up, so it looks
+    /// along `forward`. Built from the angles, it stays upright looking straight up or down.
+    pub fn rotation(&self) -> Quat {
+        Quat::from_euler(
+            EulerRot::YXZ,
+            std::f32::consts::PI - self.yaw.to_radians(),
+            -self.pitch.to_radians(),
+            0.0,
+        )
+    }
+
     pub fn view_proj(&self, aspect: f32, far: f32) -> Mat4 {
         // wgpu's clip space is y-up with depth 0..1, which glam calls the DirectX convention.
         glam::camera::rh::proj::directx::perspective(self.fov.to_radians(), aspect, 0.05, far)
@@ -39,7 +50,7 @@ impl Camera {
 
     /// World space to view space, bob and all.
     pub fn view(&self) -> Mat4 {
-        self.bob * glam::camera::rh::view::look_to_mat4(self.eye, self.forward(), Vec3::Y)
+        self.bob * Mat4::from_quat(self.rotation().inverse()) * Mat4::from_translation(-self.eye)
     }
 }
 
@@ -167,6 +178,7 @@ pub struct Renderer {
     portal: wgpu::RenderPipeline,
     outline: wgpu::RenderPipeline,
     crosshair: wgpu::RenderPipeline,
+    gui_inverted: wgpu::RenderPipeline,
     gui: wgpu::RenderPipeline,
     crack: wgpu::RenderPipeline,
     hud_art: crate::hud::HudArt,
@@ -782,37 +794,48 @@ impl Renderer {
             wgpu::CompareFunction::Always,
         );
         // The HUD has a depth buffer of its own, so items' faces hide each other.
-        let gui = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("gui"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_gui"),
-                buffers: vertex_layouts,
-                compilation_options: Default::default(),
+        let gui_pipeline = |label: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_gui"),
+                    buffers: vertex_layouts,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_gui"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let gui = gui_pipeline("gui", wgpu::BlendState::ALPHA_BLENDING);
+        // `RenderPipelines.CROSSHAIR`'s blend, for the attack indicator.
+        let gui_inverted = gui_pipeline(
+            "gui inverted",
+            wgpu::BlendState {
+                color: invert,
+                alpha: wgpu::BlendComponent::OVER,
             },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_gui"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: Default::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        );
         // `RenderTypes.crumbling`: the crack texture doubles or darkens what's under it, drawn
         // just in front of the block's faces.
         let crack = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -890,6 +913,7 @@ impl Renderer {
             portal,
             outline,
             crosshair,
+            gui_inverted,
             gui,
             crack,
             hud_art: models.hud.clone(),
@@ -1361,6 +1385,12 @@ impl Renderer {
             _ => {}
         }
         let gui_buffer = self.quads_buffer("gui", &gui_mesh.vertices);
+        // The attack indicator goes with the crosshair, which a screen hides.
+        let inverted_buffer = if view.hud && self.screen.is_none() {
+            self.quads_buffer("gui inverted", &gui_mesh.inverted)
+        } else {
+            None
+        };
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -1556,7 +1586,7 @@ impl Renderer {
         }
         // `Hud.extractCameraOverlays`: the vignette first, under the rest of the HUD.
         let vignette = view.hud && state.vignette > 0.0;
-        if gui_buffer.is_some() || vignette {
+        if gui_buffer.is_some() || inverted_buffer.is_some() || vignette {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hud"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1583,6 +1613,12 @@ impl Renderer {
                 pass.set_pipeline(&self.vignette);
                 pass.set_bind_group(1, &self.vignette_bind_group, &[]);
                 pass.draw(0..3, 0..1);
+            }
+            if let (Some((buffer, count)), Some((indices, _))) = (&inverted_buffer, &self.indices) {
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_pipeline(&self.gui_inverted);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw_indexed(0..*count, 0, 0..1);
             }
             if let (Some((buffer, count)), Some((indices, _))) = (&gui_buffer, &self.indices) {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -1686,5 +1722,38 @@ impl Renderer {
             pixels.extend_from_slice(&data[start..start + (width * 4) as usize]);
         }
         Ok(image::RgbaImage::from_raw(width, height, pixels).expect("size matches"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn camera(yaw: f32, pitch: f32) -> Camera {
+        Camera {
+            eye: Vec3::new(3.0, 7.0, -5.0),
+            yaw,
+            pitch,
+            fov: 70.0,
+            bob: Mat4::IDENTITY,
+        }
+    }
+
+    /// The view looks along `forward` with the world upright, and looking straight up or
+    /// down is the limit of looking nearly so, not a turned or broken view.
+    #[test]
+    fn the_view_looks_where_the_camera_faces_even_straight_down() {
+        for (yaw, pitch) in [(0.0, 0.0), (37.0, -20.0), (-120.0, 45.0), (200.0, 90.0)] {
+            let c = camera(yaw, pitch);
+            let ahead = c.view().transform_point3(c.eye + c.forward());
+            assert!(ahead.abs_diff_eq(-Vec3::Z, 1e-5), "{yaw} {pitch}: {ahead}");
+        }
+        for (yaw, pitch, near) in [(30.0, 90.0, 89.999), (-75.0, -90.0, -89.999)] {
+            let (at, close) = (camera(yaw, pitch).view(), camera(yaw, near).view());
+            assert!(at.abs_diff_eq(close, 1e-3), "{yaw} {pitch}:\n{at}\n{close}");
+        }
+        // Level, the world's up is the screen's up.
+        let up = camera(37.0, 0.0).view().transform_vector3(Vec3::Y);
+        assert!(up.abs_diff_eq(Vec3::Y, 1e-5), "{up}");
     }
 }

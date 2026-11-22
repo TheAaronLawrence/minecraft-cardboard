@@ -887,10 +887,7 @@ pub fn first_person(
     let mut out = Vec::new();
     // The pose stack starts as the inverse view rotation (`Camera.rotation`), so the
     // quads end up in world space and the world's entity lights shade them.
-    let view = Mat4::from_quat(
-        Quat::from_rotation_y(PI - camera.yaw.to_radians())
-            * Quat::from_rotation_x(-camera.pitch.to_radians()),
-    );
+    let view = Mat4::from_quat(camera.rotation());
     let root = view
         * Mat4::from_rotation_x((hands.sway[0] * 0.1).to_radians())
         * Mat4::from_rotation_y((hands.sway[1] * 0.1).to_radians());

@@ -349,6 +349,9 @@ pub struct Entities {
     seed: u64,
     /// The poofs of smoke dying mobs leave.
     particles: crate::particles::Particles,
+    /// `TrackingEmitter`s: sparks burst from an entity hit critically, for three ticks.
+    /// The entity, the particle, and the bursts left.
+    emitters: Vec<(i32, crate::particles::Kind, u8)>,
     /// Lightning bolts, which `LightningBolt.tick` runs on the client too.
     bolts: HashMap<i32, Bolt>,
     random: mc_render::bake::JavaRandom,
@@ -381,6 +384,7 @@ impl Entities {
             tracked: HashMap::new(),
             seed: 0x5DEECE66D,
             particles: Default::default(),
+            emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(
                 std::time::SystemTime::now()
@@ -592,6 +596,57 @@ impl Entities {
                     e.velocity = DVec3::from(velocity);
                 }
             }
+            // `handleAnimate`: `createTrackingEmitter`, which bursts once at once.
+            Event::Crit { id, magic } => {
+                use crate::particles::Kind;
+                let kind = if magic {
+                    Kind::EnchantedHit
+                } else {
+                    Kind::Crit
+                };
+                self.emitters.push((id, kind, 3));
+                self.emit();
+            }
+            // `handleParticleEvent`.
+            Event::Particles {
+                name,
+                pos,
+                dist,
+                speed,
+                count,
+                alternative,
+            } => {
+                use crate::particles::Kind;
+                let kind = match name.as_str() {
+                    "minecraft:crit" => Kind::Crit,
+                    "minecraft:enchanted_hit" => Kind::EnchantedHit,
+                    _ => Kind::Damage,
+                };
+                let (pos, dist, speed) = (
+                    DVec3::from(pos),
+                    DVec3::from(dist.map(f64::from)),
+                    DVec3::from(speed.map(f64::from)),
+                );
+                let p = &mut self.particles;
+                if count == 0 {
+                    p.crit(kind, pos, speed * dist);
+                }
+                for _ in 0..count {
+                    if alternative != 0 {
+                        let mut r = || f64::from(p.random());
+                        let offset = DVec3::new(r(), r(), r()) * dist;
+                        let mut aux = speed;
+                        if alternative == 2 {
+                            aux *= DVec3::new(r(), r(), r());
+                        }
+                        p.crit(kind, pos + offset, aux);
+                    } else {
+                        let offset = DVec3::new(p.gaussian(), p.gaussian(), p.gaussian()) * dist;
+                        let aux = DVec3::new(p.gaussian(), p.gaussian(), p.gaussian()) * speed;
+                        p.crit(kind, pos + offset, aux);
+                    }
+                }
+            }
             // `handleSwingAnimation`.
             Event::Swing {
                 id,
@@ -638,6 +693,37 @@ impl Entities {
         None
     }
 
+    /// `TrackingEmitter.tick` for each emitter: 16 tries at a spark from inside a sphere
+    /// around the entity's middle, thrown outward and up; gone after three bursts or when
+    /// its entity is.
+    fn emit(&mut self) {
+        let (tracked, particles) = (&self.tracked, &mut self.particles);
+        self.emitters.retain_mut(|(id, kind, left)| {
+            let Some(e) = tracked.get(id) else {
+                return false;
+            };
+            let baby = matches!(e.data.get(&BABY), Some(DataValue::Bool(true)));
+            let [width, height] = e.size(baby).map(f64::from);
+            for _ in 0..16 {
+                let mut r = || f64::from(particles.random() * 2.0 - 1.0);
+                let (xa, ya, za) = (r(), r(), r());
+                if xa * xa + ya * ya + za * za > 1.0 {
+                    continue;
+                }
+                // `Entity.getX(scale)` and `getY(scale)`: scaled by the box.
+                let at = e.now.pos
+                    + DVec3::new(
+                        width * xa / 4.0,
+                        height * (0.5 + ya / 4.0),
+                        width * za / 4.0,
+                    );
+                particles.crit(*kind, at, DVec3::new(xa, ya + 0.2, za));
+            }
+            *left -= 1;
+            *left > 0
+        });
+    }
+
     /// One game tick for every entity, against the world's blocks. Returns whether a
     /// lightning bolt lights the sky (`setSkyFlashTime(2)`).
     pub fn tick(
@@ -649,6 +735,7 @@ impl Entities {
             e.tick(world, blocks);
         }
         self.particles.tick(world, blocks);
+        self.emit();
         // `LightningBolt.tick`: a bolt shows for its life, then may flash again after up
         // to ten ticks with a new shape, and goes once its flashes run out.
         let random = &mut self.random;
@@ -668,6 +755,38 @@ impl Entities {
             true
         });
         flash
+    }
+
+    /// `ProjectileUtil.getEntityHitResult` for `EntitySelector.CAN_BE_PICKED`: the living
+    /// entity whose box the ray from `from` to `to` enters first (or that `from` is inside),
+    /// with where it's hit, if that's nearer than `max_sq` squared blocks; and whether it's
+    /// alive.
+    pub fn pick(&self, from: DVec3, to: DVec3, max_sq: f64) -> Option<(i32, DVec3, bool)> {
+        let mut nearest = max_sq;
+        let mut found = None;
+        for (&id, e) in &self.tracked {
+            if !e.living() {
+                continue;
+            }
+            let baby = matches!(e.data.get(&BABY), Some(DataValue::Bool(true)));
+            let [width, height] = e.size(baby);
+            let bb = mc_physics::Aabb::at_feet(e.now.pos, f64::from(width), f64::from(height));
+            let clip = bb.clip(from, to).map(|(t, _)| from + (to - from) * t);
+            let alive = e.death_time == 0;
+            if bb.contains(from) {
+                if nearest >= 0.0 {
+                    found = Some((id, clip.unwrap_or(from), alive));
+                    nearest = 0.0;
+                }
+            } else if let Some(p) = clip {
+                let distance = from.distance_squared(p);
+                if distance < nearest || nearest == 0.0 {
+                    found = Some((id, p, alive));
+                    nearest = distance;
+                }
+            }
+        }
+        found
     }
 
     /// The lightning bolts to draw (`LightningBoltRenderer`), while each shows.
@@ -1148,6 +1267,43 @@ mod tests {
         assert!(now.pos.x > 36.0, "{}", now.pos.x);
     }
 
+    /// `ProjectileUtil.getEntityHitResult`: the nearer of two cows in line is hit on its
+    /// near face, a cow behind the eye isn't, and nothing is past the range.
+    #[test]
+    fn picks_the_nearest_entity_in_reach() {
+        let mut e = Entities {
+            types: vec!["minecraft:cow".into()],
+            tracked: HashMap::new(),
+            skins: HashMap::new(),
+            names: HashMap::new(),
+            armor: HashMap::new(),
+            seed: 1,
+            particles: Default::default(),
+            emitters: Vec::new(),
+            bolts: HashMap::new(),
+            random: mc_render::bake::JavaRandom::new(1),
+        };
+        for (id, x) in [(1, 5.0), (2, 2.5), (3, -2.0)] {
+            e.event(Event::AddEntity {
+                id,
+                uuid: 0,
+                kind: 0,
+                pos: [x, 0.0, 0.0],
+                velocity: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            });
+        }
+        // Along +x at y 1: cow 2's box (0.9 wide) starts at x 2.05.
+        let (from, to) = (DVec3::new(0.0, 1.0, 0.0), DVec3::new(6.0, 1.0, 0.0));
+        let (id, at, alive) = e.pick(from, to, 36.0).unwrap();
+        assert_eq!((id, alive), (2, true));
+        assert!((at.x - 2.05).abs() < 1e-6, "{at}");
+        assert_eq!(e.pick(from, to, 2.0 * 2.0), None);
+    }
+
     /// `BodyRotationControl`: a standing mob's body follows its head once it turns past
     /// 75 degrees, and turns to face where the head looks after the head has been still
     /// for 20 ticks.
@@ -1161,6 +1317,7 @@ mod tests {
             armor: HashMap::new(),
             seed: 1,
             particles: Default::default(),
+            emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
         };
@@ -1251,6 +1408,7 @@ mod tests {
             armor: HashMap::new(),
             seed: 1,
             particles: Default::default(),
+            emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
         };
@@ -1299,6 +1457,7 @@ mod tests {
             armor: HashMap::new(),
             seed: 1,
             particles: Default::default(),
+            emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
         };

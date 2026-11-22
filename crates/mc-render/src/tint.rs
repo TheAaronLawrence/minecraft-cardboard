@@ -94,6 +94,8 @@ fn parse_hex(v: &serde_json::Value) -> Option<u32> {
 
 struct BiomeColors {
     grass: [f32; 3],
+    /// `GrassColorModifier.SWAMP`: the grass is one of two colours, by noise.
+    swamp: bool,
     foliage: [f32; 3],
     dry_foliage: [f32; 3],
     water: [f32; 3],
@@ -202,19 +204,17 @@ impl Biomes {
                 parse_hex(&attributes["minecraft:visual/water_fog_color"]).map(rgb);
             let water_fog_end =
                 FloatModifier::parse(&attributes["minecraft:visual/water_fog_end_distance"]);
-            match effects["grass_color_modifier"].as_str() {
-                // Vanilla picks between two swamp colours with noise; this is the common one.
-                Some("swamp") => grass = rgb(0x6A7039),
-                Some("dark_forest") => {
-                    let c = to_u32(grass);
-                    grass = rgb(((c & 0xFEFEFE) + 0x28340A) >> 1);
-                }
-                _ => {}
+            let modifier = effects["grass_color_modifier"].as_str();
+            // `GrassColorModifier.DARK_FOREST`; `SWAMP` depends on the position (`color`).
+            if modifier == Some("dark_forest") {
+                let c = to_u32(grass);
+                grass = rgb(((c & 0xFEFEFE) + 0x28340A) >> 1);
             }
             colors.insert(
                 name,
                 BiomeColors {
                     grass,
+                    swamp: modifier == Some("swamp"),
                     foliage,
                     dry_foliage,
                     water,
@@ -228,6 +228,7 @@ impl Biomes {
         }
         let fallback = BiomeColors {
             grass: lookup(&grass_map, 0.8, 0.4),
+            swamp: false,
             foliage: lookup(&foliage_map, 0.8, 0.4),
             dry_foliage: lookup(&dry_foliage_map, 0.8, 0.4),
             water: rgb(0x3F76E4),
@@ -304,11 +305,17 @@ impl Biomes {
         )
     }
 
-    pub fn color(&self, tint: Tint, biome: Option<&str>) -> [f32; 3] {
+    /// The tint's colour in the biome at block `x`, `z` (`ColorResolver.getColor`).
+    pub fn color(&self, tint: Tint, biome: Option<&str>, [x, z]: [i32; 2]) -> [f32; 3] {
         let colors = biome
             .and_then(|b| self.colors.get(b))
             .unwrap_or(&self.fallback);
         match tint {
+            // `GrassColorModifier.SWAMP.modifyColor`.
+            Tint::Grass if colors.swamp => {
+                let ground = self.info_noise.get(x as f64 * 0.0225, z as f64 * 0.0225);
+                rgb(if ground < -0.1 { 0x4C763C } else { 0x6A7039 })
+            }
             Tint::Grass => colors.grass,
             Tint::Foliage => colors.foliage,
             Tint::DryFoliage => colors.dry_foliage,

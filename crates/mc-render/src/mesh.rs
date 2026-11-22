@@ -393,6 +393,36 @@ impl<'a> Mesher<'a> {
         self.models.states[state as usize].occludes
     }
 
+    /// `getFaceOcclusionShape(dir)`: which sixteenths of the state's `dir` face it fills.
+    fn face(&self, state: u32, dir: Dir) -> [u64; 4] {
+        self.models.states[state as usize]
+            .faces
+            .as_ref()
+            .map_or([0; 4], |faces| faces[dir as usize])
+    }
+
+    /// The state's `dir` face is filled, as `Shapes.block()` fills it.
+    fn full_face(&self, state: u32, dir: Dir) -> bool {
+        self.face(state, dir) == [u64::MAX; 4]
+    }
+
+    /// `BlockState.isSolidRender`: its occlusion shape fills the whole block.
+    fn solid_render(&self, state: u32) -> bool {
+        Dir::ALL.iter().all(|&d| self.full_face(state, d))
+    }
+
+    /// `Block.shouldRenderFace`: whether `state`'s face toward `dir` shows past `neighbor`,
+    /// which hides the part of it that `neighbor`'s facing occlusion shape covers. `skip`
+    /// is `skipRendering`, as between two blocks of glass.
+    fn should_render_face(&self, state: u32, neighbor: u32, dir: Dir, skip: bool) -> bool {
+        let occluder = self.face(neighbor, dir.opposite());
+        if occluder == [u64::MAX; 4] || skip {
+            return false;
+        }
+        let shape = self.face(state, dir);
+        occluder == [0; 4] || shape == [0; 4] || (0..4).any(|i| shape[i] & !occluder[i] != 0)
+    }
+
     fn mesh_block(&self, view: &WorldView, mesh: &mut Mesh, state: u32, x: i32, y: i32, z: i32) {
         let info = self.infos[state as usize];
         let model = &self.models.states[state as usize];
@@ -434,12 +464,11 @@ impl<'a> Mesher<'a> {
             for quad in &baked.quads {
                 if let Some(cull) = quad.cull {
                     let other = neighbor(cull);
-                    if self.occludes(other) {
-                        continue;
-                    }
                     // Glass and ice hide the faces between two blocks of the same kind.
                     let same_kind = self.infos[other as usize].block == info.block;
-                    if same_kind && !info.leaves && quad.layer != Layer::Opaque && quad.on_face {
+                    let skip =
+                        same_kind && !info.leaves && quad.layer != Layer::Opaque && quad.on_face;
+                    if !self.should_render_face(state, other, cull, skip) {
                         continue;
                     }
                 }
@@ -485,12 +514,14 @@ impl<'a> Mesher<'a> {
     /// Vanilla's default biome blend: the average over the 5×5 columns around the block.
     fn blended_tint(&self, view: &WorldView, tint: Tint, x: i32, y: i32, z: i32) -> [f32; 3] {
         if matches!(tint, Tint::Fixed(_)) {
-            return self.biomes.color(tint, None);
+            return self.biomes.color(tint, None, [x, z]);
         }
         let mut sum = [0.0; 3];
         for dx in -2..=2 {
             for dz in -2..=2 {
-                let c = self.biomes.color(tint, view.biome(x + dx, y, z + dz));
+                let c = self
+                    .biomes
+                    .color(tint, view.biome(x + dx, y, z + dz), [x + dx, z + dz]);
                 (0..3).for_each(|i| sum[i] += c[i]);
             }
         }
@@ -724,12 +755,13 @@ impl<'a> Mesher<'a> {
             let backward = (-1..=1).any(|dx| {
                 (-1..=1).any(|dz| {
                     let (bx, bz) = (x + dx, z + dz);
-                    !same(bx, y + 1, bz) && !self.occludes(view.state(bx, y + 1, bz))
+                    !same(bx, y + 1, bz) && !self.solid_render(view.state(bx, y + 1, bz))
                 })
             });
             emit(Dir::Up, pos, uv, light_at(x, y, z, true), backward);
         }
-        if !same(x, y - 1, z) && !self.occludes(view.state(x, y - 1, z)) {
+        // `FluidRenderer.isFaceOccludedByNeighbor`, for a neighbour whose face is full.
+        if !same(x, y - 1, z) && !self.full_face(view.state(x, y - 1, z), Dir::Up) {
             let pos =
                 bake::corners(Dir::Down, Vec3::ZERO, Vec3::ONE).map(|p| Vec3::new(p.x, 0.001, p.z));
             let uv = [
@@ -742,7 +774,9 @@ impl<'a> Mesher<'a> {
         }
         for dir in [Dir::North, Dir::South, Dir::West, Dir::East] {
             let [dx, _, dz] = dir.offset();
-            if same(x + dx, y, z + dz) || self.occludes(view.state(x + dx, y, z + dz)) {
+            if same(x + dx, y, z + dz)
+                || self.full_face(view.state(x + dx, y, z + dz), dir.opposite())
+            {
                 continue;
             }
             // Top corners at the fluid's height there; the texture is the top-left quarter

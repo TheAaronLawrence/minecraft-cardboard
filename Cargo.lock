@@ -1170,6 +1170,7 @@ dependencies = [
  "image",
  "mc-assets",
  "mc-nbt",
+ "mc-physics",
  "mc-protocol",
  "mc-registry",
  "mc-world",

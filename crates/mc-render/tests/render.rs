@@ -81,6 +81,71 @@ fn a_lone_block_in_the_sky_gets_six_sky_lit_faces() {
     );
 }
 
+/// `Block.shouldRenderFace` hides a face by what the neighbour's occlusion shape covers of
+/// it, not by the neighbour's model: grass (whose model has a cutout overlay) hides the
+/// grass beside it, and a bottom slab hides the grass under it and its own side against the
+/// grass, but not the grass's side, which its half-height side leaves half uncovered.
+#[test]
+fn faces_hide_behind_their_neighbours_occlusion_shapes() {
+    let (res, registry, models) = setup();
+    let mut world = mc_world::World::open(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/worlds/test-world"
+    ));
+    let mut view = WorldView::load(&mut world, &registry, -24, 1, 1).unwrap();
+    let state = |name: &str| registry.block(name).unwrap().default_state;
+    let (grass, slab) = (state("minecraft:grass_block"), state("minecraft:oak_slab"));
+    // Grass at x -24 and -23, a bottom slab east of them at -22 and one on top of -24.
+    for (pos, state) in [
+        ([-24, 250, 1], grass),
+        ([-23, 250, 1], grass),
+        ([-22, 250, 1], slab),
+        ([-24, 251, 1], slab),
+    ] {
+        assert!(view.set_block(pos, state));
+    }
+    let biomes = Biomes::load(&res, view.biome_names()).unwrap();
+    let mesh = Mesher::new(&models, &biomes, &registry).mesh_world(&view);
+    let all: Vec<_> = mesh
+        .opaque
+        .iter()
+        .chain(&mesh.cutout)
+        .chain(&mesh.translucent)
+        .collect();
+    // The quads lying in a plane across the row: x or y fixed, within z 1 to 2.
+    let quads_at = |axis: usize, at: f32, y: std::ops::RangeInclusive<f32>| {
+        all.chunks(4)
+            .filter(|q| {
+                q.iter().all(|v| {
+                    v.pos[axis] == at && y.contains(&v.pos[1]) && (1.0..=2.0).contains(&v.pos[2])
+                })
+            })
+            .count()
+    };
+    assert_eq!(
+        quads_at(0, -23.0, 250.0..=251.0),
+        0,
+        "between the two grass"
+    );
+    // Only the grass at -23's side and its overlay face the slab; the slab's half side is
+    // hidden.
+    assert_eq!(
+        quads_at(0, -22.0, 250.0..=251.0),
+        2,
+        "grass beside the slab"
+    );
+    // Nothing between the grass at -24 and the slab on it: each hides the other's face.
+    let tops = all
+        .chunks(4)
+        .filter(|q| {
+            q.iter()
+                .all(|v| v.pos[1] == 251.0 && (1.0..=2.0).contains(&v.pos[2]))
+        })
+        .filter(|q| q.iter().all(|v| (-24.0..=-23.0).contains(&v.pos[0])))
+        .count();
+    assert_eq!(tops, 0, "the grass under the slab");
+}
+
 /// Every block draws something except invisible ones and fluids, which the fluid mesher
 /// draws. A block that silently loses its model shows up here.
 #[test]

@@ -80,6 +80,9 @@ pub struct BlockPhysics {
     /// Per state id: 0 for `LightEngine.isEmptyShape`, else 1 + an index into
     /// `occlusion_faces`.
     occlusion: Vec<u16>,
+    /// Per state id: 0 unless it `canOcclude`, else 1 + an index into `occlusion_faces` for
+    /// its `getFaceOcclusionShape`s, which hide its neighbours' faces.
+    render_occlusion: Vec<u16>,
     /// Each occlusion shape's faces, by `Direction` ordinal: a bit per sixteenth of the face
     /// it covers, as `DumpPhysics.faceMask` lays them out.
     occlusion_faces: Vec<[[u64; 4]; 6]>,
@@ -247,9 +250,11 @@ impl BlockPhysics {
             })
             .collect::<Result<Vec<_>>>()?;
         let occlusion = per_state("occlusion")?;
+        let render_occlusion = per_state("render_occlusion")?;
         anyhow::ensure!(
             occlusion
                 .iter()
+                .chain(&render_occlusion)
                 .all(|&i| i as usize <= occlusion_faces.len()),
             "physics.json's occlusion indices don't fit its occlusion_faces"
         );
@@ -269,6 +274,7 @@ impl BlockPhysics {
             blocks_fluid_flow: tagged("minecraft:blocks_fluid_flow")?,
             light: per_state("light")?,
             occlusion,
+            render_occlusion,
             occlusion_faces,
         })
     }
@@ -323,6 +329,15 @@ impl BlockPhysics {
         };
         let (a, b) = (face(from, direction), face(to, direction ^ 1));
         (0..4).all(|i| a[i] | b[i] == u64::MAX)
+    }
+
+    /// `BlockState.getFaceOcclusionShape` for each `Direction` ordinal, laid out as
+    /// `light_occludes` reads them; none when the state can't occlude.
+    pub fn face_occlusion(&self, state: u32) -> Option<&[[u64; 4]; 6]> {
+        match self.render_occlusion.get(state as usize) {
+            Some(&i) if i > 0 => Some(&self.occlusion_faces[i as usize - 1]),
+            _ => None,
+        }
     }
 
     /// `Block.getFriction`: how slippery the block is, 0.6 for most.

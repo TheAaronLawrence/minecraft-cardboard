@@ -36,6 +36,18 @@ impl Hands {
         self.swap_ticker = 0;
     }
 
+    /// `Player.getCurrentItemAttackStrengthDelay`: ticks for the held item's attack to
+    /// recharge.
+    pub fn attack_delay(&self) -> f32 {
+        20.0 / attack_speed(self.last_main.as_deref())
+    }
+
+    /// `Player.getAttackStrengthScale(0)`: how far the attack has recharged, 0 to 1. The
+    /// item swap's ticker is the attack's too: both reset together.
+    pub fn attack_strength(&self) -> f32 {
+        (self.swap_ticker as f32 / self.attack_delay()).clamp(0.0, 1.0)
+    }
+
     /// `FirstPersonHandsAndItems.itemUsed`: placing or using drops the hand at once, to
     /// rise again.
     pub fn item_used(&mut self, hand: usize) {

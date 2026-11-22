@@ -29,6 +29,11 @@ impl Dir {
         Dir::East,
     ];
 
+    /// `Direction.getOpposite`.
+    pub fn opposite(self) -> Dir {
+        Dir::ALL[self as usize ^ 1]
+    }
+
     pub fn offset(self) -> [i32; 3] {
         match self {
             Dir::Down => [0, -1, 0],
@@ -107,8 +112,11 @@ pub struct BakedModel {
 #[derive(Debug, Default)]
 pub struct StateModel {
     pub parts: Vec<Vec<(u32, Arc<BakedModel>)>>,
-    /// A full opaque cube, which hides its neighbors' faces and darkens their corners.
+    /// A full opaque cube, which darkens its neighbors' corners.
     pub occludes: bool,
+    /// `getFaceOcclusionShape` for each `Dir`, as `BlockPhysics::face_occlusion` gives
+    /// them: what of its neighbours' faces it hides. None when it can't occlude.
+    pub faces: Option<Arc<[[u64; 4]; 6]>>,
 }
 
 pub struct BlockModels {
@@ -206,6 +214,8 @@ impl BlockModels {
         }
         sprites.extend(crate::chest::SPRITES.iter().map(|s| s.to_string()));
         let items = crate::item::load(res, registry)?;
+        let physics = mc_physics::BlockPhysics::vanilla(registry)?;
+        let mut shared_faces: HashMap<[[u64; 4]; 6], Arc<[[u64; 4]; 6]>> = HashMap::new();
         sprites.extend(items.sprites.iter().cloned());
         sprites.extend(crate::hud::sprites());
         sprites.extend(crate::sky::sprites());
@@ -246,14 +256,25 @@ impl BlockModels {
                 let occludes = matches!(file, BlockState::Variants(_))
                     && parts.len() == 1
                     && parts[0].iter().all(|(_, m)| is_full_opaque_cube(m));
+                let faces = physics.face_occlusion(state).map(|f| {
+                    shared_faces
+                        .entry(*f)
+                        .or_insert_with(|| Arc::new(*f))
+                        .clone()
+                });
                 let entity = crate::chest::model(&block.name, &values, &atlas)
                     .or_else(|| crate::entity_model::model(&block.name, &values, &atlas));
                 states[state as usize] = match entity {
                     Some(model) => StateModel {
                         parts: vec![vec![(1, Arc::new(model))]],
                         occludes: false,
+                        faces,
                     },
-                    None => StateModel { parts, occludes },
+                    None => StateModel {
+                        parts,
+                        occludes,
+                        faces,
+                    },
                 };
             }
         }

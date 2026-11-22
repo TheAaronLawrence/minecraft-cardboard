@@ -229,6 +229,9 @@ pub struct Walker {
     sent_selected: u8,
     /// The block looked at, from the last frame.
     hit: Option<BlockHit>,
+    /// The living entity looked at instead, from the last frame: its id, and whether it's
+    /// alive (`Minecraft.crosshairPickEntity`).
+    hit_entity: Option<(i32, bool)>,
     /// The block being mined, its face, and how much of it is broken (0 to 1).
     destroying: Option<(IVec3, u8, f32)>,
     destroy_delay: u32,
@@ -454,6 +457,7 @@ impl Walker {
             destroy_delay: 0,
             right_click_delay: 0,
             miss_time: 0,
+            hit_entity: None,
             sequence: 0,
             inventory: crate::inventory::Inventory::new(registry),
             others_mining: HashMap::new(),
@@ -1111,6 +1115,27 @@ impl Walker {
             vitals,
             death: self.death_screen(),
             chat: Default::default(),
+            attack_indicator: self.attack_indicator(),
+        }
+    }
+
+    /// `Hud.extractCrosshair`'s attack indicator: full once recharged while aiming at a
+    /// living entity with a weapon slower than 4 attacks a second, a bar while recharging.
+    fn attack_indicator(&self) -> Option<mc_render::hud::AttackIndicator> {
+        use mc_render::hud::AttackIndicator;
+        if self.game_mode == 3 {
+            return None;
+        }
+        let strength = self.hands.attack_strength();
+        if strength >= 1.0
+            && self.hit_entity.is_some_and(|(_, alive)| alive)
+            && self.hands.attack_delay() > 5.0
+        {
+            Some(AttackIndicator::Full)
+        } else if strength < 1.0 {
+            Some(AttackIndicator::Charging(strength))
+        } else {
+            None
         }
     }
 
@@ -1361,10 +1386,32 @@ impl Walker {
         let camera_eye = self.camera_eye[0] + (self.camera_eye[1] - self.camera_eye[0]) * pt;
         // Aiming uses the pose's own eye height, as `Entity.pick` does.
         let eye = feet + DVec3::Y * self.player.eye_height();
-        // `Player.blockInteractionRange`: 4.5, and half a block more in creative.
-        let reach = if self.instabuild { 5.0 } else { 4.5 };
+        // `LocalPlayer.pick`: `blockInteractionRange` is 4.5 and `entityInteractionRange` 3,
+        // each with creative's longer reach. The block in the way limits how far an
+        // entity can be hit, and each is dropped beyond its own range (`filterHitResult`).
+        let (block_reach, entity_reach) = if self.instabuild {
+            (5.0, 5.0)
+        } else {
+            (4.5, 3.0)
+        };
+        let reach: f64 = f64::max(block_reach, entity_reach);
         let look = mc_physics::view_vector(yaw, pitch);
-        self.hit = mc_physics::pick(&self.collision, &self.blocks, eye, eye + look * reach);
+        let block = mc_physics::pick(&self.collision, &self.blocks, eye, eye + look * reach);
+        let block_sq = block.map_or(reach * reach, |h| h.location.distance_squared(eye));
+        let entity = self
+            .entities
+            .pick(eye, eye + look * block_sq.sqrt(), block_sq)
+            .filter(|(_, p, _)| p.distance_squared(eye) < block_sq);
+        (self.hit, self.hit_entity) = match entity {
+            Some((id, p, alive)) if p.distance_squared(eye) < entity_reach * entity_reach => {
+                (None, Some((id, alive)))
+            }
+            Some(_) => (None, None),
+            None => (
+                block.filter(|h| h.location.distance_squared(eye) < block_reach * block_reach),
+                None,
+            ),
+        };
         Some((feet + DVec3::Y * camera_eye as f64).as_vec3())
     }
 
@@ -1432,15 +1479,27 @@ impl Walker {
         self.outbox.send("player_action", &body)
     }
 
-    /// `Minecraft.startAttack`: a click on a block starts mining it; on nothing (or air), a
-    /// miss. Either way the arm swings, which the server shows others when it gets a
-    /// `punch`.
+    /// `Minecraft.startAttack`: a click on an entity attacks it; on a block starts mining
+    /// it; on nothing (or air), a miss. Either way the arm swings, which the server shows
+    /// others when it gets a `punch`.
     fn start_attack(&mut self, hit: Option<BlockHit>) -> anyhow::Result<()> {
         if self.miss_time > 0 {
             return Ok(());
         }
-        match hit {
-            Some(h) if !self.is_air(h.pos) => self.start_destroy(h.pos, h.face)?,
+        match (self.hit_entity, hit) {
+            // `MultiPlayerGameMode.attack`: the server deals the damage and knockback;
+            // the client's `Player.attack` only restarts the attack's recharge.
+            (Some((id, _)), _) if self.game_mode != 3 => {
+                self.send_selected_slot()?;
+                let mut body = Vec::new();
+                body.put_varint(id);
+                self.outbox.send("attack", &body)?;
+                self.hands.reset_swap();
+                if self.instabuild {
+                    self.destroy_delay = 5;
+                }
+            }
+            (_, Some(h)) if !self.is_air(h.pos) => self.start_destroy(h.pos, h.face)?,
             _ => {
                 if !self.instabuild {
                     self.miss_time = 10;

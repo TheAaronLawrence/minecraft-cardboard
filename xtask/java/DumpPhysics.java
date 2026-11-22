@@ -5,7 +5,8 @@
 // time and whether it drops only when mined with the right tool, and every state's fluid and
 // which of its faces are sturdy, for swimming, and whether rain stops on it, and how every
 // state affects light: its dampening and emission, and the faces of its occlusion shape as
-// the light engine sees them (`LightEngine.getOcclusionShape`). `cargo xtask gen-reports`
+// the light engine sees them (`LightEngine.getOcclusionShape`) and as faces are culled against
+// them (`BlockState.getFaceOcclusionShape`, `Block.shouldRenderFace`). `cargo xtask gen-reports`
 // runs it on the unpacked server with `java DumpPhysics.java OUT.json`, which needs a JDK.
 //
 // Shapes are taken at the origin with an empty collision context, as for a block nothing is
@@ -48,6 +49,7 @@ public class DumpPhysics {
         StringBuilder sturdy = new StringBuilder();
         StringBuilder light = new StringBuilder();
         StringBuilder occlusion = new StringBuilder();
+        StringBuilder renderOcclusion = new StringBuilder();
         Map<String, Integer> occlusionIds = new HashMap<>();
         List<String> occlusionFaces = new ArrayList<>();
         for (int id = 0; id < Block.BLOCK_STATE_REGISTRY.size(); id++) {
@@ -59,6 +61,7 @@ public class DumpPhysics {
                 sturdy.append(',');
                 light.append(',');
                 occlusion.append(',');
+                renderOcclusion.append(',');
             }
             VoxelShape collision = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
             states.append(shapeId(collision, shapeIds, shapes, edges));
@@ -84,19 +87,22 @@ public class DumpPhysics {
             light.append(state.getLightDampening() | state.getLightEmission() << 4
                 | (state.useShapeForLightOcclusion() ? 256 : 0));
             // 0 for `LightEngine.isEmptyShape`, else 1 + an index into `occlusion_faces`.
-            int occlusionId = 0;
-            if (state.canOcclude() && state.useShapeForLightOcclusion()) {
+            // `render_occlusion` is the same for every state that `canOcclude`, which is all
+            // `getFaceOcclusionShape` gives faces for.
+            int renderId = 0;
+            if (state.canOcclude()) {
                 StringBuilder key = new StringBuilder("[");
                 for (Direction direction : Direction.values()) {
                     if (direction.ordinal() > 0) key.append(',');
                     key.append('"').append(faceMask(state.getFaceOcclusionShape(direction), direction.getAxis())).append('"');
                 }
-                occlusionId = occlusionIds.computeIfAbsent(key.append(']').toString(), k -> {
+                renderId = occlusionIds.computeIfAbsent(key.append(']').toString(), k -> {
                     occlusionFaces.add(k);
                     return occlusionFaces.size();
                 });
             }
-            occlusion.append(occlusionId);
+            occlusion.append(state.useShapeForLightOcclusion() ? renderId : 0);
+            renderOcclusion.append(renderId);
         }
 
         StringBuilder blocks = new StringBuilder();
@@ -138,6 +144,7 @@ public class DumpPhysics {
             out.println("  \"sturdy\": [" + sturdy + "],");
             out.println("  \"light\": [" + light + "],");
             out.println("  \"occlusion\": [" + occlusion + "],");
+            out.println("  \"render_occlusion\": [" + renderOcclusion + "],");
             out.println("  \"occlusion_faces\": [\n    " + String.join(",\n    ", occlusionFaces) + "\n  ],");
             out.println("  \"blocks\": {\n    " + blocks + "\n  },");
             out.println("  \"mining\": {\n    " + mining + "\n  }");

@@ -137,37 +137,18 @@ fn clip_shape(shape: &[Aabb], from: DVec3, to: DVec3, pos: IVec3) -> Option<Bloc
         });
     }
     // `AABB.clip`: the nearest face crossing over all the boxes.
-    let mut nearest = 1.0;
-    let mut face = None;
+    let mut nearest: Option<(f64, u8)> = None;
     for b in shape {
-        let b = b.offset(origin);
-        // Per axis: the face the ray enters through, and the two other axes.
-        for (axis, a, c, faces) in [(0, 1, 2, [4, 5]), (1, 0, 2, [0, 1]), (2, 0, 1, [2, 3])] {
-            let (plane, hit_face) = if ray[axis] > 1.0e-7 {
-                (b.min[axis], faces[0])
-            } else if ray[axis] < -1.0e-7 {
-                (b.max[axis], faces[1])
-            } else {
-                continue;
-            };
-            let t = (plane - from[axis]) / ray[axis];
-            let (pa, pc) = (from[a] + t * ray[a], from[c] + t * ray[c]);
-            if 0.0 < t
-                && t < nearest
-                && b.min[a] - 1.0e-7 < pa
-                && pa < b.max[a] + 1.0e-7
-                && b.min[c] - 1.0e-7 < pc
-                && pc < b.max[c] + 1.0e-7
-            {
-                nearest = t;
-                face = Some(hit_face);
-            }
+        if let Some((t, face)) = b.offset(origin).clip(from, to)
+            && nearest.is_none_or(|(n, _)| t < n)
+        {
+            nearest = Some((t, face));
         }
     }
-    face.map(|face| BlockHit {
+    nearest.map(|(t, face)| BlockHit {
         pos,
         face,
-        location: from + ray * nearest,
+        location: from + ray * t,
         inside: false,
     })
 }

@@ -116,6 +116,14 @@ pub fn sprites(res: &Resources) -> Vec<String> {
     out.extend(crate::entity::SPRITES.map(str::to_owned));
     out.extend(crate::particle::POOF.map(str::to_owned));
     out.extend(
+        [
+            crate::particle::CRIT,
+            crate::particle::ENCHANTED_HIT,
+            crate::particle::DAMAGE,
+        ]
+        .map(str::to_owned),
+    );
+    out.extend(
         ["", "_exposed", "_weathered", "_oxidized"]
             .map(|age| format!("minecraft:entity/copper_golem/copper_golem{age}")),
     );

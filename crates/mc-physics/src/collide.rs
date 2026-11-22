@@ -42,6 +42,42 @@ impl Aabb {
         )
     }
 
+    /// `AABB.contains`.
+    pub fn contains(&self, p: DVec3) -> bool {
+        (0..3).all(|i| self.min[i] <= p[i] && p[i] < self.max[i])
+    }
+
+    /// `AABB.clip`'s search: how far along the ray from `from` to `to` (0 to 1) it first
+    /// crosses into the box, and the face it crosses, as `Direction.get3DDataValue`.
+    pub fn clip(&self, from: DVec3, to: DVec3) -> Option<(f64, u8)> {
+        let ray = to - from;
+        let mut nearest = 1.0;
+        let mut face = None;
+        // Per axis: the face the ray enters through, and the two other axes.
+        for (axis, a, c, faces) in [(0, 1, 2, [4, 5]), (1, 0, 2, [0, 1]), (2, 0, 1, [2, 3])] {
+            let (plane, hit_face) = if ray[axis] > EPS {
+                (self.min[axis], faces[0])
+            } else if ray[axis] < -EPS {
+                (self.max[axis], faces[1])
+            } else {
+                continue;
+            };
+            let t = (plane - from[axis]) / ray[axis];
+            let (pa, pc) = (from[a] + t * ray[a], from[c] + t * ray[c]);
+            if 0.0 < t
+                && t < nearest
+                && self.min[a] - EPS < pa
+                && pa < self.max[a] + EPS
+                && self.min[c] - EPS < pc
+                && pc < self.max[c] + EPS
+            {
+                nearest = t;
+                face = Some(hit_face);
+            }
+        }
+        face.map(|face| (nearest, face))
+    }
+
     fn intersects(&self, o: &Aabb) -> bool {
         (0..3).all(|i| self.min[i] < o.max[i] && self.max[i] > o.min[i])
     }

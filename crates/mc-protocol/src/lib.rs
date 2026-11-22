@@ -224,6 +224,25 @@ pub enum Event {
         kind: u8,
         duration: i32,
     },
+    /// Sparks burst from an entity hit critically (`ClientboundAnimatePacket`'s
+    /// `CRITICAL_HIT`), or blue ones from an enchanted weapon's extra damage
+    /// (`MAGIC_CRITICAL_HIT`).
+    Crit {
+        id: i32,
+        magic: bool,
+    },
+    /// Particles the server sets off (`ClientboundLevelParticlesPacket`): only types without
+    /// options, by name. Each of `count` goes a random distance up to `dist` from `pos`
+    /// and moves at up to `speed`, Gaussian unless `alternative` (1, or 2 to scale the
+    /// speed too); none means one moving at `speed × dist`.
+    Particles {
+        name: String,
+        pos: [f64; 3],
+        dist: [f32; 3],
+        speed: [f32; 3],
+        count: i32,
+        alternative: u8,
+    },
     /// Some of an entity's synced data (`SynchedEntityData`), by index.
     EntityData {
         id: i32,
@@ -795,6 +814,42 @@ fn play(
                     message: message_text(r.nbt()?),
                 })
                 .is_ok()
+            }
+            "animate" => {
+                let id = r.varint()?;
+                match r.take(1)?[0] {
+                    1 => tx.send(Event::Crit { id, magic: false }).is_ok(),
+                    2 => tx.send(Event::Crit { id, magic: true }).is_ok(),
+                    _ => true,
+                }
+            }
+            "level_particles" => {
+                // The options come between the type and the rest, so only types that have
+                // none (`SimpleParticleType`) can be read.
+                let kind = r.varint()? as u32;
+                match registry.particle_type(kind).filter(|n| {
+                    matches!(
+                        *n,
+                        "minecraft:crit" | "minecraft:enchanted_hit" | "minecraft:damage_indicator"
+                    )
+                }) {
+                    Some(name) => {
+                        let (_override_limiter, _always_show) = (r.bool()?, r.bool()?);
+                        let pos = [r.f64()?, r.f64()?, r.f64()?];
+                        let dist = [r.f32()?, r.f32()?, r.f32()?];
+                        let speed = [r.f32()?, r.f32()?, r.f32()?];
+                        tx.send(Event::Particles {
+                            name: name.to_owned(),
+                            pos,
+                            dist,
+                            speed,
+                            count: r.varint()?,
+                            alternative: r.varint()? as u8,
+                        })
+                        .is_ok()
+                    }
+                    None => true,
+                }
             }
             "swing_animation" => tx
                 .send(Event::Swing {

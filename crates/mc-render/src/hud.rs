@@ -28,6 +28,13 @@ const XP_BACKGROUND: &str = "hud/experience_bar_background";
 const XP_PROGRESS: &str = "hud/experience_bar_progress";
 const FOOD: [&str; 3] = ["hud/food_empty", "hud/food_half", "hud/food_full"];
 const AIR: [&str; 3] = ["hud/air", "hud/air_bursting", "hud/air_empty"];
+/// `Hud`'s attack indicator under the crosshair: full, then the charging bar's background
+/// and progress.
+const ATTACK_INDICATOR: [&str; 3] = [
+    "hud/crosshair_attack_indicator_full",
+    "hud/crosshair_attack_indicator_background",
+    "hud/crosshair_attack_indicator_progress",
+];
 /// `Entity.getMaxAirSupply` for a player: 15 seconds.
 const MAX_AIR: i32 = 300;
 
@@ -61,6 +68,7 @@ fn named_sprites() -> Vec<String> {
         .into_iter()
         .chain(FOOD)
         .chain(AIR)
+        .chain(ATTACK_INDICATOR)
         .chain(BUTTON)
         .chain(menu::TEXT_FIELD)
         .chain(menu::TABS)
@@ -304,6 +312,16 @@ pub struct Hotbar {
     /// The death screen, when the player has died.
     pub death: Option<DeathScreen>,
     pub chat: chat::Chat,
+    pub attack_indicator: Option<AttackIndicator>,
+}
+
+/// The attack indicator under the crosshair (`AttackIndicatorStatus.CROSSHAIR`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AttackIndicator {
+    /// Recharged, aiming at a living entity, with a weapon slow enough to be worth it.
+    Full,
+    /// Recharging: how far, 0 to 1.
+    Charging(f32),
 }
 
 /// A screen drawn instead of the HUD.
@@ -427,6 +445,9 @@ pub struct GuiMesh {
     /// each item stays inside its 16 × 16 slot, as vanilla draws items into a cell of their
     /// own first. Quads outside every run aren't clipped.
     pub clips: Vec<(std::ops::Range<u32>, [f32; 4])>,
+    /// Quads that invert what's behind them, as the crosshair does
+    /// (`RenderPipelines.CROSSHAIR`), drawn under the rest.
+    pub inverted: Vec<Vertex>,
 }
 
 impl GuiMesh {
@@ -665,6 +686,24 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
             bottom - 16.0 - 3.0,
         );
         mesh.slot_item(art, name, *count, x, y, 0.0, TEXT);
+    }
+    // `Hud.extractCrosshair`: the indicator a little below the crosshair.
+    if let Some(indicator) = hotbar.attack_indicator {
+        let (x, y) = ((width / 2) as f32 - 8.0, (height / 2) as f32 - 7.0 + 16.0);
+        let named = |i: usize| art.named[ATTACK_INDICATOR[i]];
+        let mut inverted = GuiMesh::default();
+        match indicator {
+            AttackIndicator::Full => inverted.blit(x, y, BACK, 16.0, 16.0, named(0), white),
+            AttackIndicator::Charging(strength) => {
+                inverted.blit(x, y, BACK, 16.0, 4.0, named(1), white);
+                // `blitSprite`'s part: the left `progress` of the 17 pixels' worth.
+                let progress = (strength * 17.0) as i32 as f32;
+                let [u0, v0, u1, v1] = named(2);
+                let rect = [u0, v0, u0 + (u1 - u0) * progress / 16.0, v1];
+                inverted.blit(x, y, BACK + 0.01, progress, 4.0, rect, white);
+            }
+        }
+        mesh.inverted = inverted.vertices;
     }
     if let Some(vitals) = &hotbar.vitals {
         mesh.vitals(art, vitals, width as i32, height as i32);
