@@ -1,5 +1,7 @@
-//! Biome colours for grass, leaves, leaf litter and water, and the water fog biomes set.
+//! Biome colours for grass, leaves, leaf litter and water, the water fog biomes set, and
+//! where they rain or snow.
 
+use crate::noise::SimplexNoise;
 use anyhow::{Context, Result};
 use mc_assets::Resources;
 use std::collections::HashMap;
@@ -98,6 +100,19 @@ struct BiomeColors {
     /// The `minecraft:visual/water_fog_color` and `water_fog_end_distance` attributes.
     water_fog_color: Option<[f32; 3]>,
     water_fog_end: Option<FloatModifier>,
+    /// `Biome.ClimateSettings`: whether it rains or snows at all, its temperature, and
+    /// whether its temperature has the `frozen` modifier (frozen oceans' ice patches).
+    has_precipitation: bool,
+    temperature: f32,
+    frozen: bool,
+}
+
+/// `Biome.Precipitation`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precipitation {
+    None,
+    Rain,
+    Snow,
 }
 
 /// An environment attribute's float value: replacing the value below it, or one of
@@ -146,6 +161,11 @@ impl FloatModifier {
 pub struct Biomes {
     colors: HashMap<String, BiomeColors>,
     fallback: BiomeColors,
+    /// `Biome.TEMPERATURE_NOISE`, `BIOME_INFO_NOISE`, and `FROZEN_TEMPERATURE_NOISE`'s three
+    /// layers.
+    temperature_noise: SimplexNoise,
+    info_noise: SimplexNoise,
+    frozen_noise: [SimplexNoise; 3],
 }
 
 impl Biomes {
@@ -200,6 +220,9 @@ impl Biomes {
                     water,
                     water_fog_color,
                     water_fog_end,
+                    has_precipitation: json["has_precipitation"].as_bool().unwrap_or(true),
+                    temperature,
+                    frozen: json["temperature_modifier"].as_str() == Some("frozen"),
                 },
             );
         }
@@ -210,8 +233,65 @@ impl Biomes {
             water: rgb(0x3F76E4),
             water_fog_color: None,
             water_fog_end: None,
+            has_precipitation: true,
+            temperature: 0.8,
+            frozen: false,
         };
-        Ok(Self { colors, fallback })
+        let mut frozen = crate::bake::JavaRandom::new(3456);
+        Ok(Self {
+            colors,
+            fallback,
+            temperature_noise: SimplexNoise::new(1234),
+            info_noise: SimplexNoise::new(2345),
+            frozen_noise: std::array::from_fn(|_| SimplexNoise::from_random(&mut frozen)),
+        })
+    }
+
+    /// `Biome.getPrecipitationAt`: none where it doesn't rain, snow where it's colder than
+    /// 0.15 (`coldEnoughToSnow`), rain elsewhere.
+    pub fn precipitation(&self, biome: &str, [x, y, z]: [i32; 3], sea_level: i32) -> Precipitation {
+        let b = self.colors.get(biome).unwrap_or(&self.fallback);
+        if !b.has_precipitation {
+            return Precipitation::None;
+        }
+        // `TemperatureModifier.FROZEN`: patches of a frozen ocean are warm enough to rain.
+        let mut temperature = b.temperature;
+        if b.frozen {
+            let large = [(1.0, 0.142_857_15), (0.5, 0.285_714_3), (0.25, 0.571_428_6)]
+                .iter()
+                .zip(&self.frozen_noise)
+                .map(|(&(frequency, amplitude), n): (&(f64, f32), _)| {
+                    amplitude * n.get(x as f64 * 0.05 * frequency, z as f64 * 0.05 * frequency)
+                })
+                .sum::<f32>() as f64
+                * 7.0;
+            let edge = f64::from(self.info_noise.get(x as f64 * 0.2, z as f64 * 0.2));
+            if large + edge < 0.3 && self.info_noise.get(x as f64 * 0.09, z as f64 * 0.09) < 0.8 {
+                temperature = 0.2;
+            }
+        }
+        // `getHeightAdjustedTemperature`: colder above 17 blocks over the sea.
+        let snow_level = sea_level + 17;
+        if y > snow_level {
+            let v = self
+                .temperature_noise
+                .get(f64::from(x as f32 / 8.0), f64::from(z as f32 / 8.0))
+                * 8.0;
+            temperature -= (v + (y - snow_level) as f32) * 0.05 / 40.0;
+        }
+        if temperature < 0.15 {
+            Precipitation::Snow
+        } else {
+            Precipitation::Rain
+        }
+    }
+
+    /// Whether the biome has rain or snow at all (`Biome.hasPrecipitation`).
+    pub fn has_precipitation(&self, biome: &str) -> bool {
+        self.colors
+            .get(biome)
+            .unwrap_or(&self.fallback)
+            .has_precipitation
     }
 
     /// The biome's water fog colour and end distance, from the dimension's `color` and `end`

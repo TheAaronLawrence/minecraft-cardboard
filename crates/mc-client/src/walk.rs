@@ -57,6 +57,67 @@ impl mc_physics::World for Collision {
     }
 }
 
+/// Where rain and snow fall, for `weather::columns`.
+impl mc_render::weather::Weather for Walker {
+    /// `Heightmap.Types.MOTION_BLOCKING`: above the highest block that blocks motion or
+    /// holds a fluid; a chunk that hasn't arrived has nothing in it.
+    fn height(&self, x: i32, z: i32) -> i32 {
+        let Some(sections) = self
+            .collision
+            .chunks
+            .get(&(x.div_euclid(16), z.div_euclid(16)))
+        else {
+            return i32::MIN;
+        };
+        let mut sorted: Vec<_> = sections.iter().collect();
+        sorted.sort_unstable_by_key(|(y, _)| std::cmp::Reverse(*y));
+        let (lx, lz) = (x.rem_euclid(16), z.rem_euclid(16));
+        for (section_y, blocks) in sorted {
+            for ly in (0..16).rev() {
+                let state = match blocks {
+                    Blocks::Uniform(id) => *id,
+                    Blocks::Mixed(ids) => ids[((ly * 16 + lz) * 16 + lx) as usize],
+                };
+                if self.blocks.motion_blocking(state) {
+                    return section_y * 16 + ly + 1;
+                }
+                if matches!(blocks, Blocks::Uniform(_)) {
+                    break;
+                }
+            }
+        }
+        self.sky.environment.as_ref().map_or(0, |e| e.min_y)
+    }
+
+    /// `ClientLevel.getPrecipitationAt`: none where the chunk hasn't arrived, otherwise as
+    /// the biome there falls.
+    fn precipitation(&self, [x, y, z]: [i32; 3]) -> mc_render::tint::Precipitation {
+        if !self
+            .collision
+            .chunks
+            .contains_key(&(x.div_euclid(16), z.div_euclid(16)))
+        {
+            return mc_render::tint::Precipitation::None;
+        }
+        let biome = self.biome_at_quart([x >> 2, y >> 2, z >> 2]);
+        self.biome_data
+            .precipitation(biome, [x, y, z], self.sky.sea_level)
+    }
+
+    fn light(&self, pos: [i32; 3]) -> [u8; 2] {
+        let [sky, block] = self.light.at(pos);
+        [
+            sky,
+            block.max(self.blocks.light_emission(mc_physics::World::state(
+                &self.collision,
+                pos[0],
+                pos[1],
+                pos[2],
+            ))),
+        ]
+    }
+}
+
 /// A section's sky and block light, each 4 bits a block, or `None` when the server hasn't
 /// sent that layer.
 pub type SectionLight = [Option<Box<[u8; 2048]>>; 2];
@@ -217,6 +278,59 @@ pub struct Walker {
     air: i32,
     /// Items that place a block (`BlockItem`s, named as their block is).
     block_items: std::collections::HashSet<String>,
+    /// The time of day and what the sky looks like.
+    sky: Sky,
+}
+
+/// The world's time and the sky it gives, as `ClientLevel` keeps its game time and
+/// `ClientClockManager` its world clocks, ticked with the world, and as the camera's
+/// `EnvironmentAttributeProbe` samples the environment each tick to blend between frames.
+struct Sky {
+    /// The dimension's environment, from the login; none until then.
+    environment: Option<mc_render::environment::Environment>,
+    /// A superflat world, whose horizon is its floor.
+    flat: bool,
+    game_time: i64,
+    /// Each world clock's total ticks, part of a tick, and rate.
+    clocks: HashMap<String, (i64, f32, f32)>,
+    /// The attributes at the last tick and this one.
+    visuals: Option<[mc_render::environment::Visuals; 2]>,
+    /// `LightmapRenderStateExtractor.blockLightFlicker`.
+    flicker: f32,
+    random: mc_render::bake::JavaRandom,
+    /// `Level.rainLevel` and `thunderLevel`, which the server sets.
+    rain: f32,
+    thunder: f32,
+    /// `ClientLevel.skyFlashTime`: ticks left of a lightning bolt's flash.
+    flash: u32,
+    /// `AtmosphericFogEnvironment.rainFogMultiplier` at the last tick and this one.
+    rain_fog: [f32; 2],
+    /// The level's sea level, where snow starts to fall higher up.
+    sea_level: i32,
+    /// `Hud.vignetteBrightness`: how dark the vignette is, easing toward the darkness at
+    /// the eye.
+    vignette: f32,
+}
+
+impl Sky {
+    /// `Level.getThunderLevel`: thunder only rumbles as hard as it rains.
+    fn thunder_level(&self) -> f32 {
+        self.thunder * self.rain
+    }
+}
+
+impl Sky {
+    /// `ClientClockManager.tick`: each clock runs at its rate.
+    fn tick_clocks(&mut self, game_time: i64) {
+        let delta = game_time - self.game_time;
+        self.game_time = game_time;
+        for (total, partial, rate) in self.clocks.values_mut() {
+            let ticks = *partial as f64 + delta as f64 * *rate as f64;
+            let full = ticks.floor();
+            *partial = (ticks - full) as f32;
+            *total += full as i64;
+        }
+    }
 }
 
 /// The open death screen: its message, ticks since it (or its confirmation) opened, and
@@ -299,6 +413,7 @@ impl Walker {
         registry: &mc_registry::Registry,
         biomes: std::sync::Arc<mc_render::tint::Biomes>,
         uuid: u128,
+        vignette: f32,
     ) -> anyhow::Result<Self> {
         let state = |name: &str| registry.block(name).map(|b| b.default_state);
         let air = state("minecraft:air").expect("air");
@@ -369,6 +484,25 @@ impl Walker {
             death: None,
             respawning: false,
             uuid,
+            sky: Sky {
+                environment: None,
+                flat: false,
+                game_time: 0,
+                clocks: HashMap::new(),
+                visuals: None,
+                flicker: 0.0,
+                random: mc_render::bake::JavaRandom::new(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos() as i64),
+                ),
+                rain: 0.0,
+                thunder: 0.0,
+                flash: 0,
+                rain_fog: [0.0; 2],
+                sea_level: 63,
+                vignette,
+            },
             hands: Default::default(),
             view_bob: Default::default(),
             on_fire: false,
@@ -425,7 +559,28 @@ impl Walker {
     /// Gaussian sample of the biomes around it, blended as `SpatialAttributeInterpolator`
     /// does, each biome applied to the defaults.
     fn water_fog(&self, eye: DVec3, color: [f32; 3], end: f32) -> ([f32; 3], f32) {
-        // `GaussianSampler.sample`, at quart resolution.
+        let mut result: Option<([f32; 3], f32)> = None;
+        let mut accumulated = 0.0;
+        for (biome, w) in self.biome_weights(eye) {
+            let (c, e) = self.biome_data.water_fog(biome, color, end);
+            accumulated += w;
+            result = Some(match result {
+                None => (c, e),
+                Some((rc, re)) => {
+                    let t = (w / accumulated) as f32;
+                    (
+                        std::array::from_fn(|i| rc[i] + (c[i] - rc[i]) * t),
+                        re + (e - re) * t,
+                    )
+                }
+            });
+        }
+        result.unwrap_or((color, end))
+    }
+
+    /// `GaussianSampler.sample` of the biomes around `eye`, at quart resolution: each
+    /// biome's weight, in the order they're first met.
+    fn biome_weights(&self, eye: DVec3) -> Vec<(&str, f64)> {
         const KERNEL: [f64; 7] = [0.0, 1.0, 4.0, 6.0, 4.0, 1.0, 0.0];
         let p = eye * 0.25 - DVec3::splat(0.5);
         let base = p.floor();
@@ -450,23 +605,77 @@ impl Walker {
                 }
             }
         }
-        let mut result: Option<([f32; 3], f32)> = None;
-        let mut accumulated = 0.0;
-        for (biome, w) in weights {
-            let (c, e) = self.biome_data.water_fog(biome, color, end);
-            accumulated += w;
-            result = Some(match result {
-                None => (c, e),
-                Some((rc, re)) => {
-                    let t = (w / accumulated) as f32;
-                    (
-                        std::array::from_fn(|i| rc[i] + (c[i] - rc[i]) * t),
-                        re + (e - re) * t,
-                    )
-                }
-            });
-        }
-        result.unwrap_or((color, end))
+        weights
+    }
+
+    /// `EnvironmentAttributeProbe.tick`: the attributes at the camera now, for the world
+    /// clocks' times.
+    fn sample_sky(&self) -> Option<mc_render::environment::Visuals> {
+        let environment = self.sky.environment.as_ref()?;
+        let eye = self.player.pos + DVec3::Y * self.camera_eye[1] as f64;
+        let weights = self.biome_weights(eye);
+        let clocks = &self.sky.clocks;
+        let visuals = environment
+            .sample(&weights, |clock| clocks.get(clock).map_or(0, |c| c.0))
+            .weather(self.sky.rain, self.sky.thunder_level());
+        Some(if self.sky.flash > 0 {
+            visuals.flash()
+        } else {
+            visuals
+        })
+    }
+
+    /// `Hud.vignetteBrightness` now, for the next world to start from.
+    pub fn vignette(&self) -> f32 {
+        self.sky.vignette
+    }
+
+    /// The sky this frame, with the eye at `eye`; none before the server says which
+    /// dimension the player is in.
+    pub fn sky(&self, eye: Vec3) -> Option<mc_render::sky::SkyState> {
+        let environment = self.sky.environment.as_ref()?;
+        let [old, new] = self.sky.visuals?;
+        let partial = self.since_tick / TICK;
+        // `ClientLevelData.getHorizonHeight`.
+        let horizon = if self.sky.flat {
+            environment.min_y as f32
+        } else {
+            63.0
+        };
+        Some(mc_render::sky::SkyState {
+            visuals: old.lerp(&new, partial),
+            skybox: environment.skybox,
+            dark_disc: eye.y < horizon,
+            // `ClientLevelData.voidDarknessOnsetRange`: over 32 blocks above the floor, or
+            // 1 in a superflat world.
+            void_darkness: {
+                let range = if self.sky.flat { 1.0 } else { 32.0 };
+                ((range + environment.min_y as f32 - eye.y) / range).clamp(0.0, 1.0)
+            },
+            block_factor: self.sky.flicker + 1.4,
+            game_time: self.sky.game_time,
+            partial_tick: partial,
+            rain: self.sky.rain,
+            thunder: self.sky.thunder_level(),
+            vignette: self.sky.vignette.clamp(0.0, 1.0),
+            rain_fog: {
+                let [old, new] = self.sky.rain_fog;
+                old + (new - old) * partial
+            },
+        })
+    }
+
+    /// The rain and snow around the eye this frame (`WeatherEffectRenderer`).
+    pub fn weather(&self, eye: Vec3) -> mc_render::weather::Columns {
+        let partial = self.since_tick / TICK;
+        mc_render::weather::columns(
+            self,
+            eye.as_dvec3(),
+            self.sky.game_time,
+            partial,
+            self.sky.rain,
+            mc_render::weather::RADIUS,
+        )
     }
 
     /// The server's light for these sections of a chunk; `whole` replaces all it had.
@@ -531,9 +740,37 @@ impl Walker {
                 hardcore,
                 game_mode,
                 show_death_screen,
+                dimension,
+                flat,
+                sea_level,
             } => {
                 (self.entity_id, self.hardcore, self.game_mode) = (entity_id, hardcore, game_mode);
                 self.show_death_screen = show_death_screen;
+                let res = mc_assets::Resources::new(mc_assets::default_root());
+                self.sky.environment =
+                    match mc_render::environment::Environment::load(&res, &dimension) {
+                        Ok(environment) => Some(environment),
+                        Err(e) => {
+                            eprintln!("loading {dimension}'s environment: {e:#}");
+                            None
+                        }
+                    };
+                (self.sky.flat, self.sky.visuals) = (flat, None);
+                self.sky.sea_level = sea_level;
+                // A new `ClientLevel`, clear until the server says otherwise.
+                (self.sky.rain, self.sky.thunder, self.sky.flash) = (0.0, 0.0, 0);
+            }
+            // `ClientPacketListener.handleGameEvent`'s weather, which `Level.setRainLevel`
+            // and `setThunderLevel` clamp.
+            mc_protocol::Event::RainLevel(level) => self.sky.rain = level.clamp(0.0, 1.0),
+            mc_protocol::Event::ThunderLevel(level) => self.sky.thunder = level.clamp(0.0, 1.0),
+            // `ClientPacketListener.handleSetTime`.
+            mc_protocol::Event::Time { game_time, clocks } => {
+                self.sky.tick_clocks(game_time);
+                for (name, clock) in clocks {
+                    let state = (clock.total_ticks, clock.partial_tick, clock.rate);
+                    self.sky.clocks.insert(name, state);
+                }
             }
             mc_protocol::Event::ShowDeathScreen(show) => self.show_death_screen = show,
             mc_protocol::Event::Score(score) => self.score = score,
@@ -622,6 +859,11 @@ impl Walker {
         self.entities.render(self.since_tick / TICK, |p| {
             self.light.at(p.floor().as_ivec3().to_array())
         })
+    }
+
+    /// The lightning bolts to draw this frame.
+    pub fn lightning(&self) -> Vec<mc_render::mesh::Vertex> {
+        self.entities.lightning()
     }
 
     /// The particles to draw this frame, between the last tick and the next.
@@ -1015,6 +1257,52 @@ impl Walker {
             if let Some(death) = &mut self.death {
                 death.ticks += 1;
             }
+            // `ClientLevel.tickTime`, the lightmap's flicker, and the attributes the sky
+            // blends between.
+            let game_time = self.sky.game_time + 1;
+            self.sky.tick_clocks(game_time);
+            let r = &mut self.sky.random;
+            let (a, b, c, d) = (
+                r.next_float(),
+                r.next_float(),
+                r.next_float(),
+                r.next_float(),
+            );
+            self.sky.flicker = (self.sky.flicker + (a - b) * c * d * 0.1) * 0.9;
+            self.sky.flash = self.sky.flash.saturating_sub(1);
+            // `Hud.updateVignetteBrightness`: the dark where the eye is, as the level's raw
+            // brightness (the sky light less the night's `skyDarken`, or the block light)
+            // seems after the dimension's ambient light.
+            if let (Some(environment), Some([_, now])) = (&self.sky.environment, self.sky.visuals) {
+                let eye = self.player.pos + DVec3::Y * self.camera_eye[1] as f64;
+                let [sky, block] = self.light.at(eye.floor().as_ivec3().to_array());
+                let darken = (15.0 - now.sky_light_level) as i32;
+                let raw = (i32::from(sky) - darken).max(i32::from(block)) as f32 / 15.0;
+                let curved = raw / (4.0 - 3.0 * raw);
+                let level = curved + (1.0 - curved) * environment.ambient_light;
+                let target = (1.0 - level).clamp(0.0, 1.0);
+                self.sky.vignette += (target - self.sky.vignette) * 0.01;
+            }
+            // `AtmosphericFogEnvironment.updateRainFogState`, a tick at a time: rain pulls
+            // the fog in where the sky shows, half as far where it doesn't rain.
+            {
+                let eye = self.player.pos + DVec3::Y * self.camera_eye[1] as f64;
+                let block = eye.floor().as_ivec3();
+                let sky_light = f32::from(self.light.at(block.to_array())[0]);
+                let biome = self.biome_at_quart((block >> 2i32).to_array());
+                let rains = if self.biome_data.has_precipitation(biome) {
+                    1.0
+                } else {
+                    0.5
+                };
+                let target = self.sky.rain * ((sky_light - 8.0) / 7.0).clamp(0.0, 1.0) * rains;
+                let [_, fog] = self.sky.rain_fog;
+                self.sky.rain_fog = [fog, fog + (target - fog) * 0.2];
+            }
+            if let Some(now) = self.sample_sky() {
+                let old = self.sky.visuals.map_or(now, |[_, new]| new);
+                self.sky.visuals = Some([old, now]);
+            }
             // `Camera.tick`, before the entities move.
             let eye = self.player.eye_height() as f32;
             self.camera_eye = [
@@ -1022,7 +1310,9 @@ impl Walker {
                 self.camera_eye[1] + (eye - self.camera_eye[1]) * 0.5,
             ];
             self.previous = self.player.pos;
-            self.entities.tick(&self.collision, &self.blocks);
+            if self.entities.tick(&self.collision, &self.blocks) {
+                self.sky.flash = 2;
+            }
             let dead = self.dead();
             self.view_bob.tick(
                 self.player.velocity,

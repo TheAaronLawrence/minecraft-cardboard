@@ -93,21 +93,34 @@ struct Uniforms {
     fog_env: [f32; 4],
     /// The underwater overlay's offsets and brightness, and tan(half the hand's fov).
     water: [f32; 4],
+    /// The lightmap's inputs (`LightmapRenderState`): the sky light's colour and factor,
+    /// the ambient colour and the block light factor, and the block light's tint.
+    light_sky: [f32; 4],
+    light_ambient: [f32; 4],
+    light_tint: [f32; 4],
+    /// The clouds' colour, and where the cell under the eye starts, eye-relative, with
+    /// the clouds' fog end (`CloudInfo` and `FogCloudsEnd`).
+    cloud_color: [f32; 4],
+    cloud_offset: [f32; 4],
+    /// 1 to draw the dark disc, 1 when the sky is the overworld's.
+    sky_flags: [f32; 4],
 }
 
-/// Vanilla's plains sky and fog colours at noon.
-const SKY: u32 = 0x78A7FF;
-const FOG: u32 = 0xC0D8FF;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-fn color(c: u32) -> [f32; 4] {
-    [
-        (c >> 16 & 0xFF) as f32 / 255.0,
-        (c >> 8 & 0xFF) as f32 / 255.0,
-        (c & 0xFF) as f32 / 255.0,
-        1.0,
-    ]
-}
+/// `BlendFunction.OVERLAY`: the source, by its alpha, added to what's there.
+const OVERLAY: wgpu::BlendState = wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::SrcAlpha,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+};
 
 /// Vanilla's automatic GUI scale: the largest that leaves the screen at least 320 × 240
 /// GUI pixels (`Window.calculateScale` with the setting at 0).
@@ -133,6 +146,19 @@ pub struct Renderer {
     atlas: wgpu::Texture,
     atlas_size: [u32; 2],
     sky: wgpu::RenderPipeline,
+    dark_disc: wgpu::RenderPipeline,
+    sunrise: wgpu::RenderPipeline,
+    celestial: wgpu::RenderPipeline,
+    stars_pipeline: wgpu::RenderPipeline,
+    clouds_pipeline: wgpu::RenderPipeline,
+    /// What the sky looks like, and the clouds.
+    sky_state: crate::sky::SkyState,
+    stars: Vec<[Vec3; 4]>,
+    /// The sun's and moons' rects in the atlas, by sprite id.
+    celestial_sprites: std::collections::HashMap<String, [f32; 4]>,
+    clouds: crate::sky::Clouds,
+    /// The cloud faces drawn, with the cell and side of the layer they were built for.
+    cloud_faces: Option<(crate::sky::CloudKey, Option<(wgpu::Buffer, u32)>)>,
     opaque: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
     entity: wgpu::RenderPipeline,
@@ -165,6 +191,16 @@ pub struct Renderer {
     in_fluid: Option<InFluid>,
     underwater: wgpu::RenderPipeline,
     underwater_bind_group: wgpu::BindGroup,
+    /// `RenderPipelines.WEATHER`, and the rain's and snow's textures, each bound in the
+    /// portal's sky slot.
+    weather: wgpu::RenderPipeline,
+    weather_bind_groups: [wgpu::BindGroup; 2],
+    weather_vertices: [Option<(wgpu::Buffer, u32)>; 2],
+    /// `RenderPipelines.VIGNETTE`, darkening the view by `misc/vignette.png`.
+    vignette: wgpu::RenderPipeline,
+    vignette_bind_group: wgpu::BindGroup,
+    lightning: wgpu::RenderPipeline,
+    lightning_vertices: Option<(wgpu::Buffer, u32)>,
     bind_group: wgpu::BindGroup,
     /// The same bindings, with the uniforms the hand is drawn with.
     hand_bind_group: wgpu::BindGroup,
@@ -395,6 +431,52 @@ impl Renderer {
                 },
             ],
         });
+        let weather_bind_groups = [&portal_textures.rain, &portal_textures.snow].map(|img| {
+            let view = portal_texture("weather", img);
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("weather"),
+                layout: &portal_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&repeat),
+                    },
+                ],
+            })
+        });
+        // `blur` in its `.mcmeta`: filtered, stretched over the screen.
+        let vignette_view = portal_texture("vignette", &portal_textures.vignette);
+        let blur = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let vignette_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vignette"),
+            layout: &portal_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&vignette_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&vignette_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&blur),
+                },
+            ],
+        });
         let portal_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("portal"),
@@ -413,9 +495,10 @@ impl Renderer {
                         sky: bool,
                         cull: bool| {
             let portal = fragment == "fs_portal";
+            let textured = portal || fragment == "fs_weather";
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(fragment),
-                layout: Some(if portal {
+                layout: Some(if textured {
                     &portal_pipeline_layout
                 } else {
                     &pipeline_layout
@@ -465,6 +548,91 @@ impl Renderer {
             })
         };
         let sky = pipeline("fs_sky", None, false, true, false);
+        // The sky's pieces after its disc: the sunrise fan (`RenderPipelines.SUNRISE_SUNSET`,
+        // blended), the sun and moon (`CELESTIAL`) and stars (`STARS`), added; then the dark
+        // disc (`SKY`, under the horizon), all behind whatever the world draws.
+        let sky_layer = |fragment: &str, blend: wgpu::BlendState, buffers: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(fragment),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(if buffers { "vs" } else { "vs_sky" }),
+                    buffers: if buffers {
+                        std::slice::from_ref(&vertex_layout)
+                    } else {
+                        &[]
+                    },
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let sunrise = sky_layer("fs_sunrise", wgpu::BlendState::ALPHA_BLENDING, true);
+        let celestial = sky_layer("fs_celestial", OVERLAY, true);
+        let stars_pipeline = sky_layer("fs_stars", OVERLAY, true);
+        let dark_disc = sky_layer("fs_dark_disc", wgpu::BlendState::REPLACE, false);
+        // `RenderPipelines.CLOUDS`: each face a quad of six vertices from one instance's
+        // packed face, blended, writing depth, culled.
+        let cloud_layout = wgpu::VertexBufferLayout {
+            array_stride: 4,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &wgpu::vertex_attr_array![0 => Uint32],
+        };
+        let clouds_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("clouds"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_cloud"),
+                buffers: &[Some(cloud_layout)],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_cloud"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: Some(wgpu::Face::Back),
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let opaque = pipeline("fs_opaque", None, true, false, true);
         let cutout = pipeline("fs_cutout", None, true, false, true);
         // `RenderPipelines.ENTITY_CUTOUT`: entities show their boxes' back faces too, which
@@ -478,6 +646,33 @@ impl Renderer {
             true,
         );
         let portal = pipeline("fs_portal", None, true, false, true);
+        // `BlendFunction.LIGHTNING`: added to what's behind, as much as its alpha.
+        let lightning = pipeline(
+            "fs_lightning",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            }),
+            true,
+            false,
+            true,
+        );
+        // `WEATHER_SNIPPET`: translucent, both sides, tested against depth without writing it.
+        let weather = pipeline(
+            "fs_weather",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            false,
+            false,
+            false,
+        );
         let line_layout = Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -566,6 +761,26 @@ impl Renderer {
             wgpu::BlendState::ALPHA_BLENDING,
             wgpu::CompareFunction::Always,
         );
+        // Its blend: what's behind times one minus the vignette's colour.
+        let vignette = overlay(
+            &portal_pipeline_layout,
+            "vs_sky",
+            "fs_vignette",
+            &[],
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::Zero,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+            },
+            wgpu::CompareFunction::Always,
+        );
         // The HUD has a depth buffer of its own, so items' faces hide each other.
         let gui = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("gui"),
@@ -652,6 +867,21 @@ impl Renderer {
             device,
             queue,
             sky,
+            dark_disc,
+            sunrise,
+            celestial,
+            stars_pipeline,
+            clouds_pipeline,
+            sky_state: Default::default(),
+            stars: crate::sky::stars(),
+            celestial_sprites: crate::sky::sprites()
+                .map(|id| {
+                    let rect = atlas.sprite(&id).rect;
+                    (id, rect)
+                })
+                .collect(),
+            clouds: crate::sky::Clouds::new(&models.portal_textures.clouds),
+            cloud_faces: None,
             opaque,
             cutout,
             entity,
@@ -676,6 +906,13 @@ impl Renderer {
             in_fluid: None,
             underwater,
             underwater_bind_group,
+            weather,
+            weather_bind_groups,
+            weather_vertices: [None, None],
+            vignette,
+            vignette_bind_group,
+            lightning,
+            lightning_vertices: None,
             bind_group,
             hand_bind_group,
             hand_uniforms,
@@ -737,6 +974,11 @@ impl Renderer {
         self.outline_vertices = Some((buffer, edges.len() as u32 * 6));
     }
 
+    /// The time of day and what the sky and clouds look like.
+    pub fn set_sky(&mut self, state: crate::sky::SkyState) {
+        self.sky_state = state;
+    }
+
     /// The hotbar to draw over the world, or none.
     pub fn set_hotbar(&mut self, hotbar: Option<crate::hud::Hotbar>) {
         self.hotbar = hotbar;
@@ -748,6 +990,14 @@ impl Renderer {
     }
 
     /// Draws these crack quads (from `hud::cracks`) over blocks being mined.
+    /// Draws these rain and snow columns (from `weather::columns`) after the clouds.
+    pub fn set_weather(&mut self, columns: &crate::weather::Columns) {
+        self.weather_vertices = [
+            self.quads_buffer("rain", &columns.rain),
+            self.quads_buffer("snow", &columns.snow),
+        ];
+    }
+
     pub fn set_cracks(&mut self, vertices: &[Vertex]) {
         self.crack_vertices = self.quads_buffer("cracks", vertices);
     }
@@ -758,6 +1008,7 @@ impl Renderer {
         self.eye_vertices = self.quads_buffer("entity eyes", &meshes.eyes);
         self.see_through_vertices = self.quads_buffer("name tags behind", &meshes.see_through);
         self.tag_vertices = self.quads_buffer("name tags", &meshes.tags);
+        self.lightning_vertices = self.quads_buffer("lightning", &meshes.lightning);
     }
 
     /// Draws these quads (from `entity::first_person`), the player's own hands, over the
@@ -894,19 +1145,67 @@ impl Renderer {
             ..*camera
         };
         let hand_fov = 70.0 * fov_scale;
-        let view_proj = camera.view_proj(width as f32 / height as f32, view.distance * 2.0);
+        let state = self.sky_state;
+        let v = &state.visuals;
+        // `GameRenderer`'s depth far: four times the render distance, or the cloud range
+        // (vanilla's default, 128 chunks).
+        let far = (view.distance * 4.0).max(2048.0);
+        let view_proj = camera.view_proj(width as f32 / height as f32, far);
         // Vanilla's terrain fog: it ends at the render distance and starts a tenth before.
         let fog_end = view.distance;
         let fog_start = fog_end - (fog_end / 10.0).clamp(4.0, 64.0);
-        // `AtmosphericFogEnvironment.getBaseColor`: the nearer the render distance, the more
-        // the fog takes on the sky's colour, so short distances don't look washed out.
         let chunks = view.distance / 16.0;
-        let toward_sky = 1.0 - (0.25 + 0.75 * chunks / 32.0).clamp(0.25, 1.0).powf(0.25);
-        let (fog, sky) = (color(FOG), color(SKY));
-        let mut fog_color = std::array::from_fn(|i| fog[i] + (sky[i] - fog[i]) * toward_sky);
-        // Out of fluids the environment's fog ends past anything drawn.
-        let (mut fog_env, mut sky_end, mut water) =
-            ([1e30, 2e30, 0.0, 0.0], view.distance, [0.0; 4]);
+        // `AtmosphericFogEnvironment.getBaseColor`: looking toward the sunrise or sunset
+        // takes on its colour, and the nearer the sky's fog ends, the more the fog takes on
+        // the sky's colour, so short distances don't look washed out.
+        let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
+            std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+        };
+        let mut fog = v.fog_color;
+        if chunks >= 4.0 {
+            let sun_x = if v.sun_angle.to_radians().sin() > 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            let toward_sun = camera.forward().x * sun_x;
+            let sunrise = v.sunrise_color;
+            if toward_sun > 0.0 && sunrise[3] > 0.0 {
+                let rgb = [sunrise[0], sunrise[1], sunrise[2]];
+                fog = lerp3(fog, rgb, toward_sun * sunrise[3]);
+            }
+        }
+        // `applyWeatherDarken`: the sky's colour in the fog darkens, blue least, in rain
+        // and again in thunder.
+        let rain_dark = [
+            1.0 - state.rain * 0.5,
+            1.0 - state.rain * 0.5,
+            1.0 - state.rain * 0.4,
+        ];
+        let fog_sky: [f32; 3] =
+            std::array::from_fn(|i| v.sky_color[i] * rain_dark[i] * (1.0 - state.thunder * 0.5));
+        let sky_fog_chunks = (v.sky_fog_end / 16.0).min(chunks);
+        let toward_sky = 1.0
+            - (0.25 + 0.75 * sky_fog_chunks / 32.0)
+                .clamp(0.25, 1.0)
+                .powf(0.25);
+        let fog = lerp3(fog, fog_sky, toward_sky);
+        // `FogRenderer.computeFogColor`: below the world the fog fades to black.
+        let fog = fog.map(|c| c * (1.0 - state.void_darkness).powi(2));
+        let mut fog_color = [fog[0], fog[1], fog[2], 1.0];
+        let sky = v.sky_color;
+        // `AtmosphericFogEnvironment.setupFog`.
+        let (mut fog_env, mut sky_end, mut water) = (
+            // Rain pulls the fog in, though not nearer than 96 blocks.
+            [
+                v.fog_start - 160.0 * state.rain_fog,
+                v.fog_end.min(96.0).max(v.fog_end - 256.0 * state.rain_fog),
+                0.0,
+                0.0,
+            ],
+            view.distance.min(v.sky_fog_end),
+            [0.0; 4],
+        );
         if let Some(f) = fluid {
             fog_color = [f.fog_color[0], f.fog_color[1], f.fog_color[2], 1.0];
             fog_env = [f.fog_start, f.fog_end, 0.0, 0.0];
@@ -915,6 +1214,56 @@ impl Renderer {
                 water = [u, v, brightness, (hand_fov / 2.0f32).to_radians().tan()];
             }
         }
+        // `CloudRenderer.prepare`: the faces around the cell under the eye, rebuilt when
+        // the eye moves to another cell or to another side of the layer.
+        let draw_clouds =
+            v.cloud_color[3] > 0.0 && state.skybox == crate::environment::Skybox::Overworld;
+        let eye64 = camera.eye.as_dvec3().to_array();
+        let (cloud_key, cloud_offset) =
+            self.clouds
+                .place(eye64, v.cloud_height, state.game_time, state.partial_tick);
+        if draw_clouds
+            && self
+                .cloud_faces
+                .as_ref()
+                .is_none_or(|(key, _)| *key != cloud_key)
+        {
+            let faces = self.clouds.faces(cloud_key, crate::sky::CLOUD_RADIUS);
+            let buffer = (!faces.is_empty()).then(|| {
+                let buffer = self
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("cloud faces"),
+                        contents: bytemuck::cast_slice(&faces),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                (buffer, faces.len() as u32)
+            });
+            self.cloud_faces = Some((cloud_key, buffer));
+        }
+        // The sky's sunrise fan, sun, moon and stars, placed around the eye.
+        let sky_mesh = {
+            let sprites = &self.celestial_sprites;
+            let sprite = |id: &str| sprites.get(id).copied().unwrap_or([0.0; 4]);
+            crate::sky::mesh(&state, &sprite, &self.stars)
+        };
+        let sky_lists = [&sky_mesh.sunrise, &sky_mesh.celestial, &sky_mesh.stars];
+        let sky_vertices: Vec<Vertex> = sky_lists
+            .iter()
+            .flat_map(|list| list.iter())
+            .map(|vertex| Vertex {
+                pos: (Vec3::from(vertex.pos) + camera.eye).to_array(),
+                ..*vertex
+            })
+            .collect();
+        let sky_buffer = (!sky_vertices.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("sky"),
+                    contents: bytemuck::cast_slice(&sky_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
         let uniforms = Uniforms {
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: view_proj.inverse().to_cols_array_2d(),
@@ -934,6 +1283,39 @@ impl Renderer {
             ],
             fog_env,
             water,
+            light_sky: [
+                v.sky_light_color[0],
+                v.sky_light_color[1],
+                v.sky_light_color[2],
+                v.sky_light_factor,
+            ],
+            light_ambient: [
+                v.ambient_color[0],
+                v.ambient_color[1],
+                v.ambient_color[2],
+                state.block_factor,
+            ],
+            light_tint: [
+                v.block_light_tint[0],
+                v.block_light_tint[1],
+                v.block_light_tint[2],
+                state.vignette,
+            ],
+            cloud_color: v.cloud_color,
+            cloud_offset: [
+                cloud_offset.x,
+                cloud_offset.y,
+                cloud_offset.z,
+                v.cloud_fog_end.min(2048.0),
+            ],
+            sky_flags: [
+                f32::from(u8::from(state.dark_disc)),
+                f32::from(u8::from(
+                    state.skybox == crate::environment::Skybox::Overworld,
+                )),
+                0.0,
+                0.0,
+            ],
         };
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -989,7 +1371,13 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        // Vanilla clears to the fog's colour.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: fog_color[0] as f64,
+                            g: fog_color[1] as f64,
+                            b: fog_color[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1006,6 +1394,25 @@ impl Renderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_pipeline(&self.sky);
             pass.draw(0..3, 0..1);
+            if let Some(buffer) = &sky_buffer {
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                let mut start = 0;
+                for (pipeline, list) in [&self.sunrise, &self.celestial, &self.stars_pipeline]
+                    .into_iter()
+                    .zip(sky_lists)
+                {
+                    let end = start + list.len() as u32;
+                    if end > start {
+                        pass.set_pipeline(pipeline);
+                        pass.draw(start..end, 0..1);
+                    }
+                    start = end;
+                }
+            }
+            if state.dark_disc {
+                pass.set_pipeline(&self.dark_disc);
+                pass.draw(0..3, 0..1);
+            }
             if let Some((indices, _)) = &self.indices {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                 // Translucent chunks blend over what's behind them, so far ones go first.
@@ -1063,6 +1470,26 @@ impl Renderer {
                                 pass.draw_indexed(0..*count, 0, 0..1);
                             }
                         }
+                    }
+                }
+                if let Some((buffer, count)) = &self.lightning_vertices {
+                    pass.set_pipeline(&self.lightning);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+                if draw_clouds && let Some((_, Some((buffer, count)))) = &self.cloud_faces {
+                    pass.set_pipeline(&self.clouds_pipeline);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..6, 0..*count);
+                }
+                // `WeatherEffectRenderer.render`: rain, then snow.
+                for (vertices, group) in self.weather_vertices.iter().zip(&self.weather_bind_groups)
+                {
+                    if let Some((buffer, count)) = vertices {
+                        pass.set_pipeline(&self.weather);
+                        pass.set_bind_group(1, group, &[]);
+                        pass.set_vertex_buffer(0, buffer.slice(..));
+                        pass.draw_indexed(0..*count, 0, 0..1);
                     }
                 }
                 if let Some((buffer, count)) = &self.crack_vertices {
@@ -1127,7 +1554,9 @@ impl Renderer {
             }
             draw(&mut pass, &self.see_through, &self.fire_overlay_vertices);
         }
-        if gui_buffer.is_some() {
+        // `Hud.extractCameraOverlays`: the vignette first, under the rest of the HUD.
+        let vignette = view.hud && state.vignette > 0.0;
+        if gui_buffer.is_some() || vignette {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hud"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1150,6 +1579,11 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_bind_group(0, &self.bind_group, &[]);
+            if vignette {
+                pass.set_pipeline(&self.vignette);
+                pass.set_bind_group(1, &self.vignette_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
             if let (Some((buffer, count)), Some((indices, _))) = (&gui_buffer, &self.indices) {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.set_pipeline(&self.gui);

@@ -7,7 +7,7 @@ struct Uniforms {
     fog_color: vec4<f32>,
     // w: the sky's fog end (`FogSkyEnd`), in blocks.
     sky_color: vec4<f32>,
-    // fog start, fog end, sky brightness (1 at noon), brightness option (vanilla default 0.5)
+    // fog start, fog end, unused, brightness option (vanilla default 0.5)
     params: vec4<f32>,
     // x: vanilla's `GameTime`, the day's progress, (ticks % 24000) / 24000.
     time: vec4<f32>,
@@ -19,6 +19,17 @@ struct Uniforms {
     // The underwater overlay: its texture's offsets, brightness, and the tangent of half
     // the hand's field of view.
     water: vec4<f32>,
+    // The lightmap's inputs: the sky light's colour and factor, the ambient colour and the
+    // block light factor, and the block light's tint, with the vignette's darkness in w.
+    light_sky: vec4<f32>,
+    light_ambient: vec4<f32>,
+    light_tint: vec4<f32>,
+    // `CloudInfo`: the clouds' colour, and the offset of the cell under the eye with the
+    // clouds' fog end (`FogCloudsEnd`) in w.
+    cloud_color: vec4<f32>,
+    cloud_offset: vec4<f32>,
+    // x: draw the dark disc; y: the sky is the overworld's.
+    sky_flags: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -48,28 +59,31 @@ struct VertexOut {
 const FLAG_RED: u32 = 1u;
 const FLAG_UNLIT: u32 = 2u;
 
-// LightTexture: a light level's brightness before the sky and block colours are mixed.
+// `lightmap.fsh`: a light level's brightness, 0 to 1.
 fn brightness(level: f32) -> f32 {
-    let f = level / 15.0;
-    return f / (4.0 - 3.0 * f);
+    return level / (4.0 - 3.0 * level);
 }
 
-fn not_gamma(c: vec3<f32>) -> vec3<f32> {
-    let inv = vec3<f32>(1.0) - c;
-    return vec3<f32>(1.0) - inv * inv * inv * inv;
+fn not_gamma(color: vec3<f32>) -> vec3<f32> {
+    let m = max(max(color.x, color.y), color.z);
+    let inv = 1.0 - m;
+    return color * ((1.0 - inv * inv * inv * inv) / m);
 }
 
-// Vanilla's lightmap for a sky and block light level, at noon in the overworld.
+// `lightmap.fsh`'s colour for a sky and block light level, without night vision, the
+// boss overlay's darkening or the darkness effect.
 fn lightmap(sky_level: f32, block_level: f32) -> vec3<f32> {
-    let b = brightness(floor(block_level));
-    let s = brightness(floor(sky_level)) * u.params.z;
-    var color = vec3<f32>(b, b * ((b * 0.6 + 0.4) * 0.6 + 0.4), b * (b * b * 0.6 + 0.4));
-    color = color + vec3<f32>(s);
-    color = mix(color, vec3<f32>(0.75), 0.04);
+    let block = floor(block_level) / 15.0;
+    let sky = floor(sky_level) / 15.0;
+    var color = u.light_ambient.rgb + u.light_sky.rgb * brightness(sky) * u.light_sky.w;
+    let parabolic = (2.0 * block - 1.0) * (2.0 * block - 1.0);
+    let block_color = mix(u.light_tint.rgb, vec3<f32>(1.0), 0.9 * parabolic);
+    color += block_color * brightness(block) * u.light_ambient.w;
     color = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
-    color = mix(color, not_gamma(color), u.params.w);
-    color = mix(color, vec3<f32>(0.75), 0.04);
-    return clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+    if max(max(color.x, color.y), color.z) > 0.0 {
+        color = mix(color, not_gamma(color), u.params.w);
+    }
+    return color;
 }
 
 @vertex
@@ -151,7 +165,7 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let far = u.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - u.eye.xyz);
     var color = u.fog_color.rgb;
-    if dir.y > 0.0 {
+    if dir.y > 0.0 && u.sky_flags.y > 0.5 {
         let r = 16.0 * length(dir.xz) / dir.y;
         if r < 512.0 {
             let distance = mix(16.0, length(vec2<f32>(512.0, 16.0)), r / 512.0);
@@ -159,6 +173,86 @@ fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
         }
     }
     return vec4<f32>(color, 1.0);
+}
+
+// `SkyRenderer.renderDarkDisc`: under the horizon, a black disc 4 blocks below the eye,
+// its fog by the distance its vertices interpolate as the sky disc's do.
+@fragment
+fn fs_dark_disc(in: SkyOut) -> @location(0) vec4<f32> {
+    let far = u.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let dir = normalize(far.xyz / far.w - u.eye.xyz);
+    if dir.y >= 0.0 {
+        discard;
+    }
+    let r = 4.0 * length(dir.xz) / -dir.y;
+    if r >= 512.0 {
+        discard;
+    }
+    let distance = mix(16.0, length(vec2<f32>(512.0, 16.0)), r / 512.0);
+    let fog = clamp(distance / u.sky_color.w, 0.0, 1.0);
+    return vec4<f32>(u.fog_color.rgb * fog, 1.0);
+}
+
+// The sunrise fan (`position_color`), the sun and moon (`position_tex`), and the stars,
+// with no light or fog.
+@fragment
+fn fs_sunrise(in: VertexOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
+@fragment
+fn fs_celestial(in: VertexOut) -> @location(0) vec4<f32> {
+    return textureSample(atlas, atlas_sampler, in.uv) * in.color;
+}
+
+@fragment
+fn fs_stars(in: VertexOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+
+// Clouds: `clouds.vsh`, each instance a face packed as x and z (cells from the eye's, plus
+// 512), the `Direction` and whether it faces in, drawn as two triangles.
+struct CloudOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) distance: f32,
+};
+
+const CLOUD_X: u32 = 0xF03CC3u;
+const CLOUD_Y: u32 = 0x6666F0u;
+const CLOUD_Z: u32 = 0xC3F066u;
+const CLOUD_CELL: vec3<f32> = vec3<f32>(12.0, 4.0, 12.0);
+const CLOUD_SHADE = array<f32, 6>(0.7, 1.0, 0.8, 0.8, 0.9, 0.9);
+const QUAD = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u);
+
+@vertex
+fn vs_cloud(@builtin(vertex_index) i: u32, @location(0) face: u32) -> CloudOut {
+    let x = f32(i32(face & 1023u) - 512);
+    let z = f32(i32((face >> 10u) & 1023u) - 512);
+    let direction = (face >> 20u) & 7u;
+    let inside = ((face >> 23u) & 1u) == 1u;
+    var corner = QUAD[i];
+    if inside {
+        corner = 3u - corner;
+    }
+    let index = direction * 4u + corner;
+    let vertex = vec3<f32>(
+        f32((CLOUD_X >> index) & 1u),
+        f32((CLOUD_Y >> index) & 1u),
+        f32((CLOUD_Z >> index) & 1u),
+    );
+    let pos = vertex * CLOUD_CELL + vec3<f32>(x, 0.0, z) * CLOUD_CELL + u.cloud_offset.xyz;
+    var out: CloudOut;
+    out.clip = u.view_proj * vec4<f32>(pos + u.eye.xyz, 1.0);
+    out.color = vec4<f32>(vec3<f32>(CLOUD_SHADE[direction]), 1.0) * u.cloud_color;
+    out.distance = length(pos);
+    return out;
+}
+
+@fragment
+fn fs_cloud(in: CloudOut) -> @location(0) vec4<f32> {
+    let fog = clamp(in.distance / u.cloud_offset.w, 0.0, 1.0);
+    return vec4<f32>(in.color.rgb, in.color.a * (1.0 - fog));
 }
 
 // End portals and gateways: vanilla's `rendertype_end_portal` shader. The sky texture and
@@ -252,6 +346,34 @@ fn fs_portal(in: PortalOut) -> @location(0) vec4<f32> {
     }
     let fog = smoothstep(u.params.x, u.params.y, in.distance);
     return vec4<f32>(mix(color, u.fog_color.rgb, fog), 1.0);
+}
+
+// `rendertype_lightning.fsh`: the vertex colour, fading out into the fog.
+@fragment
+fn fs_lightning(in: VertexOut) -> @location(0) vec4<f32> {
+    return in.color * (1.0 - fog_value(in.distance, in.spherical));
+}
+
+// The vignette (`Hud.extractVignette`): `misc/vignette.png` stretched over the screen, its
+// colour times the darkness, which the blend takes away from what's behind.
+@fragment
+fn fs_vignette(in: SkyOut) -> @location(0) vec4<f32> {
+    let uv = vec2<f32>(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5);
+    let texel = textureSample(portal_sky, portal_sampler, uv);
+    return vec4<f32>(texel.rgb * u.light_tint.w, texel.a);
+}
+
+// Rain and snow (`particle.fsh`): the texture in the portal's sky slot, repeating, times
+// the vertex colour and the lightmap, nearly clear texels dropped, then fogged.
+@fragment
+fn fs_weather(in: VertexOut) -> @location(0) vec4<f32> {
+    let color = textureSample(portal_sky, portal_sampler, in.uv) * in.color
+        * vec4<f32>(in.light, 1.0);
+    if color.a < 0.1 {
+        discard;
+    }
+    let fog = fog_value(in.distance, in.spherical);
+    return vec4<f32>(mix(color.rgb, u.fog_color.rgb, fog), color.a);
 }
 
 // The underwater overlay (`ScreenEffectRenderer.submitWater`): `misc/underwater.png`

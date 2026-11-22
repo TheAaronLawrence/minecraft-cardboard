@@ -3,10 +3,10 @@
 // edges as `forAllEdges` gives them for drawing outlines), each block's friction,
 // speed factor and jump factor where they differ from the defaults, and every block's destroy
 // time and whether it drops only when mined with the right tool, and every state's fluid and
-// which of its faces are sturdy, for swimming, and how every state affects light: its
-// dampening and emission, and the faces of its occlusion shape as the light engine sees them
-// (`LightEngine.getOcclusionShape`). `cargo xtask gen-reports` runs it on the
-// unpacked server with `java DumpPhysics.java OUT.json`, which needs a JDK.
+// which of its faces are sturdy, for swimming, and whether rain stops on it, and how every
+// state affects light: its dampening and emission, and the faces of its occlusion shape as
+// the light engine sees them (`LightEngine.getOcclusionShape`). `cargo xtask gen-reports`
+// runs it on the unpacked server with `java DumpPhysics.java OUT.json`, which needs a JDK.
 //
 // Shapes are taken at the origin with an empty collision context, as for a block nothing is
 // standing on; the few that depend on the entity (scaffolding, powder snow) or the position
@@ -30,6 +30,7 @@ import net.minecraft.world.level.material.FlowingFluid;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
@@ -69,8 +70,10 @@ public class DumpPhysics {
             fluids.append(type == 0 ? 0
                 : type | (fluid.isSource() ? 4 : 0) | (fluid.getValue(FlowingFluid.FALLING) ? 8 : 0) | fluid.getAmount() << 4);
             // A bit per `Direction` (down, up, north, south, west, east) whose face is sturdy,
-            // and 64 for ice, which `FlowingFluid.isSolidFace` doesn't count.
+            // 64 for ice, which `FlowingFluid.isSolidFace` doesn't count, and 128 for states
+            // the `MOTION_BLOCKING` heightmap counts, where rain and snow stop.
             int faces = state.getBlock() instanceof IceBlock ? 64 : 0;
+            if (Heightmap.Types.MOTION_BLOCKING.isOpaque().test(state)) faces |= 128;
             for (Direction direction : Direction.values()) {
                 if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, direction)) {
                     faces |= 1 << direction.ordinal();

@@ -259,6 +259,9 @@ pub struct Meshes {
     pub see_through: Vec<Vertex>,
     /// Name tags' text, to draw opaque over `see_through` where nothing hides it.
     pub tags: Vec<Vertex>,
+    /// Lightning bolts (from `weather::lightning`), added to what's behind them
+    /// (`RenderPipelines.LIGHTNING`).
+    pub lightning: Vec<Vertex>,
 }
 
 /// Quads for these entities as seen from `camera`, with their name tags unless the HUD is

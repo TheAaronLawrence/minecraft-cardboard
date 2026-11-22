@@ -349,6 +349,18 @@ pub struct Entities {
     seed: u64,
     /// The poofs of smoke dying mobs leave.
     particles: crate::particles::Particles,
+    /// Lightning bolts, which `LightningBolt.tick` runs on the client too.
+    bolts: HashMap<i32, Bolt>,
+    random: mc_render::bake::JavaRandom,
+}
+
+/// A lightning bolt: where it struck, the ticks it has left to show, the times it'll
+/// flash again, and the seed its shape grows from.
+struct Bolt {
+    pos: DVec3,
+    life: i32,
+    flashes: i32,
+    seed: i64,
 }
 
 impl Entities {
@@ -369,6 +381,12 @@ impl Entities {
             tracked: HashMap::new(),
             seed: 0x5DEECE66D,
             particles: Default::default(),
+            bolts: HashMap::new(),
+            random: mc_render::bake::JavaRandom::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as i64),
+            ),
         }
     }
 
@@ -408,6 +426,20 @@ impl Entities {
                 data: _,
             } => {
                 let name = self.types.get(kind as usize).map(String::as_str);
+                // `new LightningBolt`: two ticks to show, one to three flashes.
+                if name == Some("minecraft:lightning_bolt") {
+                    let seed = self.random.next_long();
+                    let flashes = self.random.next_int(3) + 1;
+                    let pos = DVec3::from(pos);
+                    let bolt = Bolt {
+                        pos,
+                        life: 2,
+                        flashes,
+                        seed,
+                    };
+                    self.bolts.insert(id, bolt);
+                    return None;
+                }
                 let sort = match name.and_then(|n| n.strip_prefix("minecraft:")) {
                     Some("player") => Sort::Player,
                     Some("item") => Sort::Item,
@@ -475,6 +507,7 @@ impl Entities {
             Event::RemoveEntities(ids) => {
                 for id in ids {
                     self.tracked.remove(&id);
+                    self.bolts.remove(&id);
                 }
             }
             // `ClientPacketListener.handleMoveEntity`.
@@ -605,12 +638,44 @@ impl Entities {
         None
     }
 
-    /// One game tick for every entity, against the world's blocks.
-    pub fn tick(&mut self, world: &impl mc_physics::World, blocks: &mc_physics::BlockPhysics) {
+    /// One game tick for every entity, against the world's blocks. Returns whether a
+    /// lightning bolt lights the sky (`setSkyFlashTime(2)`).
+    pub fn tick(
+        &mut self,
+        world: &impl mc_physics::World,
+        blocks: &mc_physics::BlockPhysics,
+    ) -> bool {
         for e in self.tracked.values_mut() {
             e.tick(world, blocks);
         }
         self.particles.tick(world, blocks);
+        // `LightningBolt.tick`: a bolt shows for its life, then may flash again after up
+        // to ten ticks with a new shape, and goes once its flashes run out.
+        let random = &mut self.random;
+        let mut flash = false;
+        self.bolts.retain(|_, bolt| {
+            bolt.life -= 1;
+            if bolt.life < 0 {
+                if bolt.flashes == 0 {
+                    return false;
+                } else if bolt.life < -random.next_int(10) {
+                    bolt.flashes -= 1;
+                    bolt.life = 1;
+                    bolt.seed = random.next_long();
+                }
+            }
+            flash |= bolt.life >= 0;
+            true
+        });
+        flash
+    }
+
+    /// The lightning bolts to draw (`LightningBoltRenderer`), while each shows.
+    pub fn lightning(&self) -> Vec<mc_render::mesh::Vertex> {
+        self.bolts
+            .values()
+            .flat_map(|bolt| mc_render::weather::lightning(bolt.pos, bolt.seed))
+            .collect()
     }
 
     /// The particles to draw, `partial` of the way to the next tick, lit by `light`.
@@ -1096,6 +1161,8 @@ mod tests {
             armor: HashMap::new(),
             seed: 1,
             particles: Default::default(),
+            bolts: HashMap::new(),
+            random: mc_render::bake::JavaRandom::new(1),
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1184,6 +1251,8 @@ mod tests {
             armor: HashMap::new(),
             seed: 1,
             particles: Default::default(),
+            bolts: HashMap::new(),
+            random: mc_render::bake::JavaRandom::new(1),
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1230,6 +1299,8 @@ mod tests {
             armor: HashMap::new(),
             seed: 1,
             particles: Default::default(),
+            bolts: HashMap::new(),
+            random: mc_render::bake::JavaRandom::new(1),
         };
         e.event(Event::AddEntity {
             id: 1,

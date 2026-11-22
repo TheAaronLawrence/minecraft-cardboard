@@ -63,6 +63,7 @@ fn named_sprites() -> Vec<String> {
         .chain(AIR)
         .chain(BUTTON)
         .chain(menu::TEXT_FIELD)
+        .chain(menu::TABS)
         .chain(pause::ICONS)
         .chain(inventory::SPRITES)
         .map(str::to_owned)
@@ -242,6 +243,10 @@ fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
                 "container.",
                 "item.",
                 "block.",
+                "selectWorld.",
+                "gameMode.",
+                "createWorld.",
+                "generator.",
             ]
             .iter()
             .any(|p| k.starts_with(p))
@@ -851,6 +856,19 @@ impl GuiMesh {
     /// `Button.extractContents`: the nine-sliced sprite, then the label centred on it, grey
     /// when inactive (`AbstractWidget.WithInactiveMessage`).
     fn button(&mut self, art: &HudArt, b: &Button, active: bool, mouse: Option<[f32; 2]>) {
+        let label = art.lang.get(b.label).map_or(b.label, String::as_str);
+        self.labelled_button(art, b, label, active, mouse);
+    }
+
+    /// A button showing `label` as it is, such as a `CycleButton`'s "Game Mode: Survival".
+    fn labelled_button(
+        &mut self,
+        art: &HudArt,
+        b: &Button,
+        label: &str,
+        active: bool,
+        mouse: Option<[f32; 2]>,
+    ) {
         let hovered = mouse.is_some_and(|m| b.contains(m));
         let sprite = match (active, hovered) {
             (true, false) => BUTTON[0],
@@ -887,7 +905,6 @@ impl GuiMesh {
         }
         column(x + w - 3, 197, 3);
         // `ActiveTextCollector.defaultScrollingHelper` for a label that fits.
-        let label = art.lang.get(b.label).map_or(b.label, String::as_str);
         let text_width = Self::text_width(art, label) as i32;
         let left = x + w / 2 - text_width / 2;
         let top = (y + y + h - 9) / 2 + 1;

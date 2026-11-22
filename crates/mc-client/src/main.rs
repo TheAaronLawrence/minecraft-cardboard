@@ -15,9 +15,10 @@
 //! items. T opens the chat and / opens it to type a command; Enter sends. Dying
 //! opens the death screen, whose buttons respawn or leave.
 //!
-//! Without `--world` or `--server`, the window opens on the title screen: Singleplayer opens
-//! the test world, and Multiplayer asks for a server's address (remembered in `options.txt`
-//! beside the exe). In a world, Esc (or the window losing focus) opens the pause screen,
+//! Without `--world` or `--server`, the window opens on the title screen: Singleplayer lists
+//! the worlds in `saves/` beside the exe and creates new ones, each played on Mojang's
+//! server run on this machine (see `local`), and Multiplayer asks for a server's address
+//! (remembered in `options.txt` beside the exe). In a world, Esc (or the window losing focus) opens the pause screen,
 //! whose Disconnect, or Save and Quit to Title, comes back to the menus, as losing the
 //! connection does.
 
@@ -31,6 +32,7 @@ mod entities;
 mod hands;
 mod inventory;
 mod light;
+mod local;
 mod particles;
 mod skins;
 mod stream;
@@ -311,8 +313,12 @@ fn run() -> Result<()> {
                 menu_models,
                 streamer: None,
                 walker: None,
+                vignette: 1.0,
                 menu: None,
                 loading: None,
+                local_server: None,
+                singleplayer: false,
+                last_row_click: None,
                 view: View { hud: true, ..view },
                 buttons: Default::default(),
                 outlined: None,
@@ -334,6 +340,9 @@ fn run() -> Result<()> {
                 app.menu = Some(menu::Menu::default());
             }
             event_loop.run_app(&mut app)?;
+            // Quitting in a world stops its server, which saves it before the game ends.
+            drop(app);
+            local::wait_for_stopped();
             Ok(())
         }
     }
@@ -431,6 +440,40 @@ impl Args {
     }
 }
 
+/// What loading a world in the background reports.
+enum Loading {
+    /// What it's doing, shown on the loading screen.
+    Status(String),
+    /// The world, with its server when it's a singleplayer world.
+    Done(Box<Result<(Scene, Option<local::LocalServer>)>>),
+}
+
+/// `WorldSelectionList.WorldListEntry`'s line under the name: the folder, and when the
+/// world was last played (in UTC, as `yyyy-MM-dd HH:mm`).
+fn folder_and_date(world: &local::World) -> String {
+    let secs = world
+        .last_played
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    // Howard Hinnant's `civil_from_days`.
+    let z = secs.div_euclid(86400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + (month <= 2) as i64;
+    let time = secs.rem_euclid(86400);
+    format!(
+        "{} ({year:04}-{month:02}-{day:02} {:02}:{:02})",
+        world.folder(),
+        time / 3600,
+        time / 60 % 60
+    )
+}
+
 struct WindowState {
     window: Arc<winit::window::Window>,
     surface: wgpu::Surface<'static>,
@@ -450,10 +493,19 @@ struct App {
     streamer: Option<stream::Streamer>,
     /// On a server the player walks with vanilla's physics; on a save the camera flies.
     walker: Option<walk::Walker>,
+    /// `Hud.vignetteBrightness`, kept from one world to the next as vanilla's `Hud` lives
+    /// for the whole game: dark at launch, then wherever the last world left it.
+    vignette: f32,
     /// The menu screen showing, when not playing.
     menu: Option<menu::Menu>,
     /// A world loading or a server being joined, in the background.
-    loading: Option<std::sync::mpsc::Receiver<Result<Scene>>>,
+    loading: Option<std::sync::mpsc::Receiver<Loading>>,
+    /// The singleplayer world's server, while it's in play or being joined.
+    local_server: Option<local::LocalServer>,
+    /// The world being started or played is a singleplayer world.
+    singleplayer: bool,
+    /// Select World's last click on a row, for a double click to play it.
+    last_row_click: Option<(usize, Instant)>,
     /// When the menu's text box was last focused or edited, which restarts its blink.
     focused_at: Instant,
     /// The pause screen is open over the world.
@@ -567,19 +619,80 @@ impl App {
             "connect.joining"
         };
         args.server = server;
-        self.args = args.clone();
+        (self.args, self.singleplayer) = (args.clone(), false);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(load_scene(&args));
+            let _ = tx.send(Loading::Done(Box::new(
+                load_scene(&args).map(|scene| (scene, None)),
+            )));
         });
         self.loading = Some(rx);
         let menu = self.menu.get_or_insert_with(Default::default);
-        menu.screen = menu::Screen::Connecting(key);
+        menu.screen = menu::Screen::Connecting(key.into());
+    }
+
+    /// Starts the singleplayer world in `dir`: its server (downloading Mojang's Java and
+    /// server first if need be), then joins it, showing what's happening meanwhile.
+    fn play_local(&mut self, dir: PathBuf) {
+        let mut args = self.start.clone();
+        args.world_given = false;
+        (self.args, self.singleplayer) = (args.clone(), true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The loading screen closing (Cancel) drops the receiver, which stops this.
+            let status = |message: String| {
+                tx.send(Loading::Status(message))
+                    .map_err(|_| anyhow::anyhow!("cancelled"))
+            };
+            let result = (|| {
+                let server = local::start(&dir, &args.name, &status)?;
+                status("Joining world".into())?;
+                args.server = Some(format!("127.0.0.1:{}", server.port));
+                Ok((load_scene(&args)?, Some(server)))
+            })();
+            let _ = tx.send(Loading::Done(Box::new(result)));
+        });
+        self.loading = Some(rx);
+        let menu = self.menu.get_or_insert_with(Default::default);
+        menu.screen = menu::Screen::Connecting("Checking Minecraft's files".into());
+    }
+
+    /// Select World's list, read again from `saves/`.
+    fn world_rows(worlds: &[local::World]) -> Vec<menu::WorldRow> {
+        worlds
+            .iter()
+            .map(|w| menu::WorldRow {
+                name: w.settings.name.clone(),
+                folder_and_date: folder_and_date(w),
+                mode: menu::GameMode::from_name(&w.settings.game_mode),
+                commands: w.settings.commands,
+                version: w.version.clone(),
+            })
+            .collect()
+    }
+
+    /// Singleplayer: Select World, or, with no worlds yet, Create New World, as
+    /// `CreateWorldScreen.openFresh` opens it then.
+    fn open_worlds(&mut self) {
+        let rows = Self::world_rows(&local::worlds());
+        let Some(m) = &mut self.menu else { return };
+        m.screen = if rows.is_empty() {
+            m.new_world = Default::default();
+            self.focused_at = Instant::now();
+            menu::Screen::CreateWorld
+        } else {
+            menu::Screen::SelectWorld
+        };
+        (m.worlds, m.selected) = (rows, None);
     }
 
     /// The world finished loading: draw it with a renderer for its models.
-    fn enter_world(&mut self, scene: Scene) -> Result<()> {
+    fn enter_world(&mut self, scene: Scene, server: Option<local::LocalServer>) -> Result<()> {
+        self.local_server = server;
         let state = self.state.as_mut().context("no window")?;
+        if let Some(walker) = &self.walker {
+            self.vignette = walker.vignette();
+        }
         self.walker = match scene.outbox.clone() {
             // An offline-mode server, which is all `connect` joins, gives the player the
             // offline UUID for their name.
@@ -588,6 +701,7 @@ impl App {
                 &scene.registry,
                 scene.biomes.clone(),
                 mc_protocol::offline_uuid(&self.args.name),
+                self.vignette,
             )?),
             None => None,
         };
@@ -611,8 +725,11 @@ impl App {
     fn leave_world(&mut self, screen: menu::Screen) {
         if let Some(walker) = &self.walker {
             walker.leave();
+            self.vignette = walker.vignette();
         }
         (self.walker, self.streamer, self.loading) = (None, None, None);
+        // Stops the world's server, which saves the world.
+        self.local_server = None;
         self.args.camera.bob = glam::Mat4::IDENTITY;
         if let Some(state) = &mut self.state {
             state.release();
@@ -633,11 +750,19 @@ impl App {
         });
     }
 
-    /// Where a menu goes back to: Direct Connection from joining a server, the title
-    /// screen from everything else.
+    /// Where a menu goes back to: Direct Connection from joining a server, Select World
+    /// from creating or starting a singleplayer world (the title screen when there are no
+    /// worlds), and the title screen from everything else.
     fn back_screen(&self) -> menu::Screen {
+        let worlds = || match local::worlds().is_empty() {
+            true => menu::Screen::Title,
+            false => menu::Screen::SelectWorld,
+        };
         match self.menu.as_ref().map(|m| &m.screen) {
-            Some(menu::Screen::DirectConnect) | None => menu::Screen::Title,
+            Some(menu::Screen::DirectConnect | menu::Screen::SelectWorld | menu::Screen::Title)
+            | None => menu::Screen::Title,
+            Some(menu::Screen::CreateWorld) => worlds(),
+            Some(_) if self.singleplayer => worlds(),
             Some(_) if self.args.server.is_some() => menu::Screen::DirectConnect,
             Some(_) => menu::Screen::Title,
         }
@@ -651,7 +776,42 @@ impl App {
         let back = self.back_screen();
         let Some(m) = &mut self.menu else { return };
         match action {
-            menu::Action::Singleplayer => self.play(None),
+            menu::Action::Singleplayer => self.open_worlds(),
+            menu::Action::OpenCreateWorld => {
+                (m.screen, m.new_world) = (menu::Screen::CreateWorld, Default::default());
+                self.focused_at = Instant::now();
+            }
+            menu::Action::PlaySelected => {
+                let worlds = local::worlds();
+                if let Some(world) = m.selected.and_then(|i| worlds.get(i)) {
+                    self.play_local(world.dir.clone());
+                }
+            }
+            menu::Action::Create => {
+                let new = &m.new_world;
+                let settings = local::NewWorld {
+                    name: new.name.value.clone(),
+                    game_mode: new.mode.name().into(),
+                    difficulty: new.difficulty().into(),
+                    commands: new.commands(),
+                    seed: new.seed.value.clone(),
+                    structures: new.structures,
+                };
+                match local::create(&settings) {
+                    Ok(dir) => self.play_local(dir),
+                    Err(e) => {
+                        m.screen = menu::Screen::Disconnected {
+                            title: "selectWorld.create",
+                            reason: format!("{e:#}"),
+                        }
+                    }
+                }
+            }
+            menu::Action::CycleGameMode
+            | menu::Action::CycleDifficulty
+            | menu::Action::ToggleCommands
+            | menu::Action::ToggleStructures => m.cycle(action),
+            menu::Action::Unavailable => {}
             menu::Action::Multiplayer => {
                 m.screen = menu::Screen::DirectConnect;
                 m.address = menu::Field::new(&last_server());
@@ -667,10 +827,14 @@ impl App {
                 }
             }
             menu::Action::Back => {
-                self.loading = None;
+                // Cancelling a world's start stops its server too.
+                (self.loading, self.local_server) = (None, None);
                 let screen = back;
                 if screen == menu::Screen::DirectConnect {
                     m.address = menu::Field::new(&last_server());
+                }
+                if screen == menu::Screen::SelectWorld {
+                    (m.worlds, m.selected) = (Self::world_rows(&local::worlds()), None);
                 }
                 m.screen = screen;
             }
@@ -684,13 +848,46 @@ impl App {
         };
         let Some(m) = &mut self.menu else { return };
         let art = &self.menu_models.hud;
-        if m.screen == menu::Screen::DirectConnect {
-            let rect = menu::address_rect(width);
+        let inside = |rect: [i32; 4]| {
             let [x, y, w, h] = rect.map(|c| c as f32);
-            if mouse[0] >= x && mouse[1] >= y && mouse[0] < x + w && mouse[1] < y + h {
-                m.address.cursor = menu::clicked_position(art, &m.address, rect, mouse[0]);
-                self.focused_at = Instant::now();
+            mouse[0] >= x && mouse[1] >= y && mouse[0] < x + w && mouse[1] < y + h
+        };
+        match m.screen {
+            menu::Screen::DirectConnect => {
+                let rect = menu::address_rect(width);
+                if inside(rect) {
+                    m.address.cursor = menu::clicked_position(art, &m.address, rect, mouse[0]);
+                    self.focused_at = Instant::now();
+                }
             }
+            // A click on a tab shows it; on the tab's box, moves its cursor there.
+            menu::Screen::CreateWorld => {
+                let new = &mut m.new_world;
+                if let Some(tab) = menu::tab_rects(width).iter().position(|&r| inside(r)) {
+                    new.tab = tab;
+                    self.focused_at = Instant::now();
+                } else if let Some(rect) = menu::new_world_box(new.tab, width, height)
+                    && inside(rect)
+                    && let Some(field) = new.focused()
+                {
+                    field.cursor = menu::clicked_position(art, field, rect, mouse[0]);
+                    self.focused_at = Instant::now();
+                }
+            }
+            // A click selects a world; a second within a quarter of a second plays it.
+            menu::Screen::SelectWorld => {
+                if let Some(row) = menu::world_at(m, width, height, mouse) {
+                    m.selected = Some(row);
+                    let double = self
+                        .last_row_click
+                        .is_some_and(|(r, at)| r == row && at.elapsed().as_millis() < 250);
+                    self.last_row_click = Some((row, Instant::now()));
+                    if double {
+                        return self.menu_action(menu::Action::PlaySelected, event_loop);
+                    }
+                }
+            }
+            _ => {}
         }
         let action = menu::buttons(m, art, width, height)
             .into_iter()
@@ -710,12 +907,47 @@ impl App {
     ) {
         use winit::keyboard::{Key, NamedKey};
         let Some(m) = &mut self.menu else { return };
-        if m.screen != menu::Screen::DirectConnect {
-            return;
-        }
-        let field = &mut m.address;
+        let (field, enter, max) = match m.screen {
+            menu::Screen::DirectConnect => (&mut m.address, menu::Action::Join, 128),
+            // Ctrl+Tab shows the next tab (Shift for the one before), as
+            // `TabNavigationBar.keyPressed` does; the name and seed take up to `EditBox`'s
+            // 32 characters.
+            menu::Screen::CreateWorld => {
+                let new = &mut m.new_world;
+                let key = &event.logical_key;
+                if *key == Key::Named(NamedKey::Tab) && self.modifiers.control_key() {
+                    let step = if self.modifiers.shift_key() { 2 } else { 1 };
+                    new.tab = (new.tab + step) % 3;
+                    self.focused_at = Instant::now();
+                    return;
+                }
+                match (new.focused(), key) {
+                    (Some(field), _) => (field, menu::Action::Create, 32),
+                    (None, Key::Named(NamedKey::Enter)) => {
+                        return self.menu_action(menu::Action::Create, event_loop);
+                    }
+                    (None, Key::Named(NamedKey::Escape)) => {
+                        return self.menu_action(menu::Action::Back, event_loop);
+                    }
+                    (None, _) => return,
+                }
+            }
+            menu::Screen::SelectWorld => {
+                match &event.logical_key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.menu_action(menu::Action::PlaySelected, event_loop)
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.menu_action(menu::Action::Back, event_loop)
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            _ => return,
+        };
         match &event.logical_key {
-            Key::Named(NamedKey::Enter) => return self.menu_action(menu::Action::Join, event_loop),
+            Key::Named(NamedKey::Enter) => return self.menu_action(enter, event_loop),
             Key::Named(NamedKey::Escape) => {
                 return self.menu_action(menu::Action::Back, event_loop);
             }
@@ -725,7 +957,7 @@ impl App {
             Key::Named(NamedKey::ArrowRight) => field.step(1),
             Key::Named(NamedKey::Home) => field.home(),
             Key::Named(NamedKey::End) => field.end(),
-            _ => field.insert(event.text.as_deref().unwrap_or(""), 128),
+            _ => field.insert(event.text.as_deref().unwrap_or(""), max),
         }
         self.focused_at = Instant::now();
     }
@@ -764,7 +996,7 @@ impl App {
             return;
         };
         let pause = mc_render::hud::pause::Pause {
-            local: self.walker.is_none(),
+            local: self.walker.is_none() || self.singleplayer,
             mouse: None,
         };
         let action = mc_render::hud::pause::buttons(&pause, width, height)
@@ -1115,24 +1347,33 @@ impl winit::application::ApplicationHandler for App {
                 self.last_frame = now;
                 // 20 game ticks a second.
                 self.view.ticks += dt * 20.0;
-                if let Some(loading) = &self.loading {
+                while let Some(loading) = &self.loading {
                     match loading.try_recv() {
-                        Ok(Ok(scene)) => {
-                            self.loading = None;
-                            if let Err(e) = self.enter_world(scene) {
-                                eprintln!("entering the world: {e:#}");
+                        Ok(Loading::Status(status)) => {
+                            if let Some(m) = &mut self.menu {
+                                m.screen = menu::Screen::Connecting(status);
                             }
+                            continue;
                         }
-                        Ok(Err(e)) => {
-                            eprintln!("couldn't join: {e:#}");
-                            self.leave_world(menu::Screen::Disconnected {
-                                title: "connect.failed",
-                                reason: format!("{e:#}"),
-                            });
-                        }
+                        Ok(Loading::Done(result)) => match *result {
+                            Ok((scene, server)) => {
+                                self.loading = None;
+                                if let Err(e) = self.enter_world(scene, server) {
+                                    eprintln!("entering the world: {e:#}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("couldn't join: {e:#}");
+                                self.leave_world(menu::Screen::Disconnected {
+                                    title: "connect.failed",
+                                    reason: format!("{e:#}"),
+                                });
+                            }
+                        },
                         Err(std::sync::mpsc::TryRecvError::Empty) => {}
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => self.loading = None,
                     }
+                    break;
                 }
                 let updates: Vec<_> = self
                     .streamer
@@ -1247,6 +1488,7 @@ impl winit::application::ApplicationHandler for App {
                                 camera,
                                 &walker.particles(),
                             ));
+                            meshes.lightning = walker.lightning();
                             renderer.set_entities(&meshes);
                             // F1 hides the hands with the HUD.
                             let hand = walker
@@ -1270,6 +1512,8 @@ impl winit::application::ApplicationHandler for App {
                                 camera.yaw,
                                 camera.pitch,
                             ));
+                            renderer.set_sky(walker.sky(camera.eye).unwrap_or_default());
+                            renderer.set_weather(&walker.weather(camera.eye));
                             let cracks = walker.cracks();
                             if cracks != self.shown_cracks {
                                 let vertices: Vec<_> = cracks
@@ -1304,7 +1548,7 @@ impl winit::application::ApplicationHandler for App {
                     })),
                     None if self.paused => Some(mc_render::hud::Screen::Pause(
                         mc_render::hud::pause::Pause {
-                            local: self.walker.is_none(),
+                            local: self.walker.is_none() || self.singleplayer,
                             mouse,
                         },
                     )),

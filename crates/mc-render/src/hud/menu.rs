@@ -2,7 +2,9 @@
 //! screen with no world behind it: the title screen (`TitleScreen`, with "Cardboard" under
 //! the logo where vanilla has its edition), Direct Connection (`DirectJoinServerScreen`),
 //! `ConnectScreen` while joining, and `DisconnectedScreen` when joining fails or the
-//! connection is lost. Also the text box (`EditBox`) they and the launcher type into.
+//! connection is lost; for singleplayer, Select World (`SelectWorldScreen`) and Create New
+//! World (`CreateWorldScreen`). Also the text box (`EditBox`) they and the launcher type
+//! into.
 
 use super::{Button, GuiMesh, HudArt};
 
@@ -10,8 +12,34 @@ const PANORAMA: &str = "minecraft:gui/title/background/panorama_0";
 const MENU_BACKGROUND: &str = "minecraft:gui/menu_background";
 pub(crate) const LOGO: &str = "minecraft:gui/title/minecraft";
 
+const HEADER_SEPARATOR: &str = "minecraft:gui/header_separator";
+const FOOTER_SEPARATOR: &str = "minecraft:gui/footer_separator";
+const TAB_HEADER_BACKGROUND: &str = "minecraft:gui/tab_header_background";
+
 /// The textures the menus draw whole, by their full ids.
-pub(crate) const TEXTURES: [&str; 3] = [PANORAMA, MENU_BACKGROUND, LOGO];
+pub(crate) const TEXTURES: [&str; 6] = [
+    PANORAMA,
+    MENU_BACKGROUND,
+    LOGO,
+    HEADER_SEPARATOR,
+    FOOTER_SEPARATOR,
+    TAB_HEADER_BACKGROUND,
+];
+
+/// `MenuTabBar.MenuTabButton.SPRITES`: selected or not, each plain then highlighted.
+pub(crate) const TABS: [&str; 4] = [
+    "widget/tab",
+    "widget/tab_highlighted",
+    "widget/tab_selected",
+    "widget/tab_selected_highlighted",
+];
+
+/// Create New World's tabs' titles.
+const TAB_TITLES: [&str; 3] = [
+    "createWorld.tab.game.title",
+    "createWorld.tab.world.title",
+    "createWorld.tab.more.title",
+];
 
 /// `EditBox.SPRITES`: unfocused and focused.
 pub(crate) const TEXT_FIELD: [&str; 2] = ["widget/text_field", "widget/text_field_highlighted"];
@@ -25,6 +53,12 @@ pub(crate) const LABEL: f32 = 200.0;
 const FIELD_TEXT: [f32; 3] = [224.0 / 255.0; 3];
 const GREY: [f32; 3] = [160.0 / 255.0; 3];
 const WHITE: [f32; 3] = [1.0; 3];
+/// The world list's second and third lines (0x808080).
+const LIST_GREY: [f32; 3] = [128.0 / 255.0; 3];
+/// `EditBox.DEFAULT_HINT_STYLE`, dark grey (0x555555).
+const HINT: [f32; 3] = [85.0 / 255.0; 3];
+/// Hardcore Mode in the world list (0xFF0000).
+const RED: [f32; 3] = [1.0, 0.0, 0.0];
 
 /// A text box's text and where its cursor is, in characters, edited as `EditBox` edits.
 #[derive(Clone, Default, PartialEq, Debug)]
@@ -104,8 +138,10 @@ pub enum Screen {
     #[default]
     Title,
     DirectConnect,
-    /// `ConnectScreen` (or a world loading): its message's translation key.
-    Connecting(&'static str),
+    SelectWorld,
+    CreateWorld,
+    /// `ConnectScreen` (or a world loading): its message, or the translation key of it.
+    Connecting(String),
     /// `DisconnectedScreen`: its title's translation key and the reason.
     Disconnected {
         title: &'static str,
@@ -123,6 +159,117 @@ pub struct Menu {
     pub cursor_on: bool,
     /// Where the mouse is, in GUI pixels, to highlight what's under it.
     pub mouse: Option<[f32; 2]>,
+    /// Select World's list, most recently played first, and which is selected.
+    pub worlds: Vec<WorldRow>,
+    pub selected: Option<usize>,
+    /// What Create New World will create.
+    pub new_world: NewWorld,
+}
+
+/// A world in Select World's list, as `WorldSelectionList.WorldListEntry` shows it.
+#[derive(Clone, Default, PartialEq, Debug)]
+pub struct WorldRow {
+    pub name: String,
+    /// Its folder and, in brackets, when it was last played.
+    pub folder_and_date: String,
+    pub mode: GameMode,
+    pub commands: bool,
+    pub version: String,
+}
+
+/// `WorldCreationUiState.SelectedGameMode`, in the order its button cycles through.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum GameMode {
+    #[default]
+    Survival,
+    Hardcore,
+    Creative,
+}
+
+impl GameMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Survival => "survival",
+            Self::Hardcore => "hardcore",
+            Self::Creative => "creative",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "hardcore" => Self::Hardcore,
+            "creative" => Self::Creative,
+            _ => Self::Survival,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Survival => Self::Hardcore,
+            Self::Hardcore => Self::Creative,
+            Self::Creative => Self::Survival,
+        }
+    }
+}
+
+/// `Difficulty`, by its name.
+pub const DIFFICULTIES: [&str; 4] = ["peaceful", "easy", "normal", "hard"];
+
+/// Create New World's choices, `WorldCreationUiState`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct NewWorld {
+    pub name: Field,
+    /// Blank for a random seed.
+    pub seed: Field,
+    /// The tab showing: Game (with the name), World (with the seed) or More.
+    pub tab: usize,
+    pub mode: GameMode,
+    pub structures: bool,
+    /// Into `DIFFICULTIES`.
+    difficulty: usize,
+    /// Chosen with the button; until then, on in Creative only.
+    allow_commands: Option<bool>,
+}
+
+impl Default for NewWorld {
+    fn default() -> Self {
+        Self {
+            name: Field::new("New World"),
+            seed: Field::default(),
+            tab: 0,
+            mode: GameMode::Survival,
+            structures: true,
+            difficulty: 2,
+            allow_commands: None,
+        }
+    }
+}
+
+impl NewWorld {
+    /// `WorldCreationUiState.getDifficulty`: Hardcore is always Hard.
+    pub fn difficulty(&self) -> &'static str {
+        match self.mode {
+            GameMode::Hardcore => "hard",
+            _ => DIFFICULTIES[self.difficulty],
+        }
+    }
+
+    /// `WorldCreationUiState.isAllowCommands`.
+    pub fn commands(&self) -> bool {
+        match self.mode {
+            GameMode::Hardcore => false,
+            mode => self.allow_commands.unwrap_or(mode == GameMode::Creative),
+        }
+    }
+
+    /// The box with the focus: the tab's box, if it has one.
+    pub fn focused(&mut self) -> Option<&mut Field> {
+        match self.tab {
+            0 => Some(&mut self.name),
+            1 => Some(&mut self.seed),
+            _ => None,
+        }
+    }
 }
 
 /// What a menu button does.
@@ -133,9 +280,81 @@ pub enum Action {
     Options,
     Quit,
     Join,
-    /// Cancel, and Back to Server List: Direct Connection goes back to the title screen;
-    /// the others go back to Direct Connection.
+    /// Cancel, Back, and Back to Server List: each screen goes back to the one it came from.
     Back,
+    /// Select World's.
+    PlaySelected,
+    OpenCreateWorld,
+    /// Edit, Delete and Re-Create, which don't work yet.
+    Unavailable,
+    /// Create New World's.
+    Create,
+    CycleGameMode,
+    CycleDifficulty,
+    ToggleCommands,
+    ToggleStructures,
+}
+
+/// `MenuTabBar.arrangeElements`: the tabs share the width less 28 (at most 400), each a
+/// width even, centred on an even x, along the top 24.
+pub fn tab_rects(width: i32) -> [[i32; 4]; 3] {
+    let tabs = width.min(400) - 28;
+    let tab = tabs / 3 / 2 * 2;
+    let left = (width - tabs) / 2 / 2 * 2;
+    std::array::from_fn(|i| [left + i as i32 * tab, 0, tab, 24])
+}
+
+/// The top left of tab `tab`'s grid, `w` × `h`: centred across, and a sixth of the way down
+/// the space between the tab bar (24 high) and the footer (33), as `GridLayoutTab` places
+/// it.
+fn tab_grid(width: i32, height: i32, w: i32, h: i32) -> (i32, i32) {
+    let area = height - 33 - 24;
+    ((width - w) / 2, 24 + ((area - h) as f32 / 6.0) as i32)
+}
+
+/// The tab's text box: `GameTab`'s name (208 wide in its 210-wide grid, under its label),
+/// or `WorldTab`'s seed (308 in 310, under World Type and its label).
+pub fn new_world_box(tab: usize, width: i32, height: i32) -> Option<[i32; 4]> {
+    match tab {
+        0 => {
+            let (x, y) = tab_grid(width, height, 210, GAME_GRID);
+            Some([x + 1, y + 13, 208, 20])
+        }
+        1 => {
+            let (x, y) = tab_grid(width, height, 310, WORLD_GRID);
+            Some([x + 1, y + 28 + 13, 308, 20])
+        }
+        _ => None,
+    }
+}
+
+/// `GameTab`'s grid: the name with its label (9 + 4 + 20), then Game Mode, Difficulty and
+/// Allow Commands, 8 apart.
+const GAME_GRID: i32 = 33 + 3 * 28;
+/// `WorldTab`'s: World Type and Customize, the seed with its label, then the switches for
+/// structures and the bonus chest, rows of 24.
+const WORLD_GRID: i32 = 20 + 8 + 33 + 8 + 48;
+/// `MoreTab`'s three buttons.
+const MORE_GRID: i32 = 3 * 28 - 8;
+
+/// Select World's list: below the 49-high header, rows 36 high and 270 wide, above the
+/// 60-high footer.
+const LIST_TOP: i32 = 49;
+const ROW: i32 = 36;
+
+/// The world row under GUI point `mouse`, if any.
+pub fn world_at(menu: &Menu, width: i32, height: i32, [x, y]: [f32; 2]) -> Option<usize> {
+    let left = (width / 2 - 135) as f32;
+    if x < left || x >= left + 270.0 || y < (LIST_TOP + 4) as f32 {
+        return None;
+    }
+    let row = ((y as i32 - LIST_TOP - 4) / ROW) as usize;
+    (row < visible_rows(height).min(menu.worlds.len())).then_some(row)
+}
+
+/// How many rows fit between the header and the footer.
+fn visible_rows(height: i32) -> usize {
+    ((height - LIST_TOP - 60 - 4) / ROW).max(0) as usize
 }
 
 /// Direct Connection's box, 200 wide at y 116.
@@ -208,6 +427,125 @@ pub fn buttons(menu: &Menu, art: &HudArt, width: i32, height: i32) -> Vec<(Actio
                 ),
             ]
         }
+        // `SelectWorldScreen.createFooterButtons`: a grid four 71-wide columns 8 apart, its
+        // rows 4 apart, centred in the 60-high footer.
+        Screen::SelectWorld => {
+            let (x, y) = (width / 2 - 154, height - 52);
+            let selected = menu.selected.is_some();
+            vec![
+                (
+                    Action::PlaySelected,
+                    button(x, y, 150, "selectWorld.select"),
+                    selected,
+                ),
+                (
+                    Action::OpenCreateWorld,
+                    button(x + 158, y, 150, "selectWorld.create"),
+                    true,
+                ),
+                (
+                    Action::Unavailable,
+                    button(x, y + 24, 71, "selectWorld.edit"),
+                    false,
+                ),
+                (
+                    Action::Unavailable,
+                    button(x + 79, y + 24, 71, "selectWorld.delete"),
+                    false,
+                ),
+                (
+                    Action::Unavailable,
+                    button(x + 158, y + 24, 71, "selectWorld.recreate"),
+                    false,
+                ),
+                (Action::Back, button(x + 237, y + 24, 71, "gui.back"), true),
+            ]
+        }
+        // The tab's buttons, then the footer's two, 150 wide and 8 apart.
+        Screen::CreateWorld => {
+            let hardcore = menu.new_world.mode == GameMode::Hardcore;
+            let mut buttons = match menu.new_world.tab {
+                // `GameTab`: 210 wide below the name.
+                0 => {
+                    let (x, y) = tab_grid(width, height, 210, GAME_GRID);
+                    let y = y + 33 + 8;
+                    vec![
+                        (
+                            Action::CycleGameMode,
+                            button(x, y, 210, "selectWorld.gameMode"),
+                            true,
+                        ),
+                        (
+                            Action::CycleDifficulty,
+                            button(x, y + 28, 210, "options.difficulty"),
+                            !hardcore,
+                        ),
+                        (
+                            Action::ToggleCommands,
+                            button(x, y + 56, 210, "selectWorld.allowCommands.new"),
+                            !hardcore,
+                        ),
+                    ]
+                }
+                // `WorldTab`: World Type and Customize, 150 wide and 10 apart, then
+                // `SwitchGrid`'s 44-wide switches at the right of its rows.
+                1 => {
+                    let (x, y) = tab_grid(width, height, 310, WORLD_GRID);
+                    let switches = y + 20 + 8 + 33 + 8;
+                    vec![
+                        (
+                            Action::Unavailable,
+                            button(x, y, 150, "selectWorld.mapType"),
+                            false,
+                        ),
+                        (
+                            Action::Unavailable,
+                            button(x + 160, y, 150, "selectWorld.customizeType"),
+                            false,
+                        ),
+                        (
+                            Action::ToggleStructures,
+                            button(x + 266, switches + 4, 44, "selectWorld.mapFeatures"),
+                            true,
+                        ),
+                        (
+                            Action::Unavailable,
+                            button(x + 266, switches + 28, 44, "selectWorld.bonusItems"),
+                            false,
+                        ),
+                    ]
+                }
+                // `MoreTab`: what the game can't change yet.
+                _ => {
+                    let (x, y) = tab_grid(width, height, 210, MORE_GRID);
+                    [
+                        "selectWorld.gameRules",
+                        "selectWorld.experiments",
+                        "selectWorld.dataPacks",
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, label)| {
+                        let b = button(x, y + i as i32 * 28, 210, label);
+                        (Action::Unavailable, b, false)
+                    })
+                    .collect()
+                }
+            };
+            buttons.extend([
+                (
+                    Action::Create,
+                    button(width / 2 - 154, height - 27, 150, "selectWorld.create"),
+                    true,
+                ),
+                (
+                    Action::Back,
+                    button(width / 2 + 4, height - 27, 150, "gui.cancel"),
+                    true,
+                ),
+            ]);
+            buttons
+        }
         // `ConnectScreen.init`.
         Screen::Connecting(_) => {
             vec![(
@@ -254,7 +592,15 @@ fn disconnected_layout(art: &HudArt, reason: &str, width: i32, height: i32) -> D
 pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
     let (w, h) = (width as i32, height as i32);
     let mut mesh = GuiMesh::default();
-    mesh.background(art, w, h);
+    if m.screen == Screen::CreateWorld {
+        // `CreateWorldScreen.extractMenuBackground`: the tab header's background above the
+        // menu background.
+        mesh.background_from(art, w, h, 24);
+        let header = art.named[TAB_HEADER_BACKGROUND];
+        mesh.tiled([0, 0, w, 24], [16, 16], header, BACKGROUND + 1.0);
+    } else {
+        mesh.background(art, w, h);
+    }
     let lang = |key: &str| art.lang.get(key).cloned().unwrap_or_else(|| key.to_owned());
     let centred = |mesh: &mut GuiMesh, text: &str, y: i32, rgb: [f32; 3]| {
         let x = w / 2 - GuiMesh::text_width(art, text) as i32 / 2;
@@ -273,6 +619,75 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
             mesh.shadowed(art, &label, (w / 2 - 99) as f32, 100.0, LABEL, 1.0, GREY);
             mesh.edit_box(art, &m.address, address_rect(w), true, m.cursor_on);
         }
+        Screen::SelectWorld => {
+            centred(&mut mesh, &lang("selectWorld.title"), 8, WHITE);
+            let left = w / 2 - 135;
+            for (i, world) in m.worlds.iter().take(visible_rows(h)).enumerate() {
+                let top = LIST_TOP + 4 + i as i32 * ROW;
+                // `AbstractSelectionList.renderSelection`: a white outline, black inside.
+                if m.selected == Some(i) {
+                    mesh.rect(art, [left, top, 270, ROW], WIDGET, [255; 4]);
+                    let inside = [left + 1, top + 1, 268, ROW - 2];
+                    mesh.rect(art, inside, WIDGET + 1.0, [0, 0, 0, 255]);
+                }
+                // The text beside where the world's icon goes.
+                let x = (left + 2 + 32 + 3) as f32;
+                let y = top + 2;
+                let text = |mesh: &mut GuiMesh, t: &str, x: f32, dy: i32, rgb| {
+                    mesh.shadowed(art, t, x, (y + dy) as f32, LABEL, 1.0, rgb);
+                };
+                text(&mut mesh, &world.name, x, 1, WHITE);
+                text(&mut mesh, &world.folder_and_date, x, 12, LIST_GREY);
+                // `LevelSummary.createInfo`.
+                let (mode, rgb) = match world.mode {
+                    GameMode::Hardcore => (lang("gameMode.hardcore"), RED),
+                    mode => (lang(&format!("gameMode.{}", mode.name())), LIST_GREY),
+                };
+                text(&mut mesh, &mode, x, 23, rgb);
+                let mut rest = String::new();
+                if world.commands {
+                    rest += &format!(", {}", lang("selectWorld.commands"));
+                }
+                rest += &format!(", {} {}", lang("selectWorld.version"), world.version);
+                let after = x + GuiMesh::text_width(art, &mode);
+                text(&mut mesh, &rest, after, 23, LIST_GREY);
+            }
+        }
+        Screen::CreateWorld => {
+            let new = &m.new_world;
+            mesh.tab_bar(art, w, new.tab, m.mouse);
+            // `CreateWorldScreen.extractRenderState`'s footer separator.
+            let footer = art.named[FOOTER_SEPARATOR];
+            mesh.tiled([0, h - 33 - 2, w, 2], [32, 2], footer, BACKGROUND + 3.0);
+            if let Some(rect) = new_world_box(new.tab, w, h) {
+                let (field, label) = match new.tab {
+                    0 => (&new.name, "selectWorld.enterName"),
+                    _ => (&new.seed, "selectWorld.enterSeed"),
+                };
+                let (x, y) = (rect[0] as f32, (rect[1] - 13) as f32);
+                mesh.shadowed(art, &lang(label), x, y, LABEL, 1.0, WHITE);
+                mesh.edit_box(art, field, rect, true, m.cursor_on);
+                // `EditBox`'s hint, in an empty box.
+                if field.value.is_empty() && new.tab == 1 {
+                    let (x, y) = ((rect[0] + 4) as f32, (rect[1] + 6) as f32);
+                    let hint = lang("selectWorld.seedInfo");
+                    mesh.shadowed(art, &hint, x, y, LABEL, 1.0, HINT);
+                }
+            }
+            // `SwitchGrid`'s labels, left of their switches.
+            if new.tab == 1 {
+                let (x, y) = tab_grid(w, h, 310, WORLD_GRID);
+                let y = y + 20 + 8 + 33 + 8 + 4 + 6;
+                for (i, label) in ["selectWorld.mapFeatures", "selectWorld.bonusItems"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let rgb = if i == 0 { WHITE } else { GREY };
+                    let y = (y + i as i32 * 24) as f32;
+                    mesh.shadowed(art, &lang(label), x as f32, y, LABEL, 1.0, rgb);
+                }
+            }
+        }
         Screen::Connecting(key) => centred(&mut mesh, &lang(key), h / 2 - 50, WHITE),
         Screen::Disconnected { title, reason } => {
             let layout = disconnected_layout(art, reason, w, h);
@@ -282,8 +697,35 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
             }
         }
     }
-    for (_, button, active) in buttons(m, art, w, h) {
-        mesh.button(art, &button, active, m.mouse);
+    for (action, button, active) in buttons(m, art, w, h) {
+        // `CycleButton`s show their value: "Game Mode: Survival".
+        let new = &m.new_world;
+        let on_off = |on| lang(if on { "options.on" } else { "options.off" });
+        let value = match action {
+            Action::CycleGameMode => lang(&format!("selectWorld.gameMode.{}", new.mode.name())),
+            Action::CycleDifficulty => lang(&format!("options.difficulty.{}", new.difficulty())),
+            Action::ToggleCommands => on_off(new.commands()),
+            Action::Unavailable if button.label == "selectWorld.mapType" => {
+                lang("generator.minecraft.normal")
+            }
+            // Switches show only their value.
+            Action::ToggleStructures => {
+                mesh.labelled_button(art, &button, &on_off(new.structures), active, m.mouse);
+                continue;
+            }
+            Action::Unavailable if button.label == "selectWorld.bonusItems" => {
+                mesh.labelled_button(art, &button, &on_off(false), active, m.mouse);
+                continue;
+            }
+            _ => {
+                mesh.button(art, &button, active, m.mouse);
+                continue;
+            }
+        };
+        let label = lang("options.generic_value")
+            .replacen("%s", &lang(button.label), 1)
+            .replacen("%s", &value, 1);
+        mesh.labelled_button(art, &button, &label, active, m.mouse);
     }
     mesh
 }
@@ -330,6 +772,11 @@ impl GuiMesh {
     /// `Screen.extractPanorama`, whose six faces are each one colour in 26.3's resources,
     /// then `extractMenuBackground`: the menu background tiled at 32 GUI pixels a tile.
     pub(crate) fn background(&mut self, art: &HudArt, w: i32, h: i32) {
+        self.background_from(art, w, h, 0);
+    }
+
+    /// The background with the menu background's tiles starting at `top`.
+    fn background_from(&mut self, art: &HudArt, w: i32, h: i32, top: i32) {
         let [u0, v0, u1, v1] = art.named[PANORAMA];
         let (u, v) = ((u0 + u1) / 2.0, (v0 + v1) / 2.0);
         self.blit(
@@ -342,18 +789,69 @@ impl GuiMesh {
             [1.0; 4],
         );
         let tile = art.named[MENU_BACKGROUND];
-        for y in (0..h).step_by(32) {
-            for x in (0..w).step_by(32) {
-                self.blit(
-                    x as f32,
-                    y as f32,
-                    BACKGROUND + 1.0,
-                    32.0,
-                    32.0,
-                    tile,
-                    [1.0; 4],
+        self.tiled([0, top, w, h - top], [32, 32], tile, BACKGROUND + 1.0);
+    }
+
+    /// A texture `size` GUI pixels big repeated across the rectangle (x, y, w, h) from its
+    /// top left, the last ones cut short, as a blit with UVs past the texture's edge repeats.
+    fn tiled(&mut self, [x, y, w, h]: [i32; 4], size: [i32; 2], rect: [f32; 4], z: f32) {
+        let [u0, v0, u1, v1] = rect;
+        for ty in (0..h).step_by(size[1] as usize) {
+            for tx in (0..w).step_by(size[0] as usize) {
+                let (cw, ch) = ((w - tx).min(size[0]), (h - ty).min(size[1]));
+                let u = u0 + (u1 - u0) * cw as f32 / size[0] as f32;
+                let v = v0 + (v1 - v0) * ch as f32 / size[1] as f32;
+                let (px, py) = ((x + tx) as f32, (y + ty) as f32);
+                self.blit(px, py, z, cw as f32, ch as f32, [u0, v0, u, v], [1.0; 4]);
+            }
+        }
+    }
+
+    /// `MenuTabBar.extractWidgetRenderState`: the header separator either side of the tabs,
+    /// then each tab: its sprite nine-sliced (130 × 24, 2 at the sides), the menu background
+    /// inside the selected one with a line under its title, and the title, 3 lower on the
+    /// others.
+    fn tab_bar(&mut self, art: &HudArt, w: i32, selected: usize, mouse: Option<[f32; 2]>) {
+        let tabs = tab_rects(w);
+        let separator = art.named[HEADER_SEPARATOR];
+        let first = tabs[0][0];
+        let last = tabs[2][0] + tabs[2][2];
+        self.tiled([0, 22, first, 2], [32, 2], separator, WIDGET);
+        self.tiled([last, 22, w - last, 2], [32, 2], separator, WIDGET);
+        for (i, [x, y, tw, th]) in tabs.into_iter().enumerate() {
+            let hovered = mouse.is_some_and(|[mx, my]| {
+                mx >= x as f32 && my >= y as f32 && mx < (x + tw) as f32 && my < (y + th) as f32
+            });
+            let is = i == selected;
+            let [u0, v0, u1, v1] = art.named[TABS[is as usize * 2 + hovered as usize]];
+            let u = |px: i32| u0 + (u1 - u0) * px as f32 / 130.0;
+            let mut column = |left: i32, from: i32, width: i32| {
+                let rect = [u(from), v0, u(from + width), v1];
+                let (l, t) = (left as f32, y as f32);
+                self.blit(l, t, WIDGET, width as f32, th as f32, rect, [1.0; 4]);
+            };
+            column(x, 0, 2);
+            column(x + 2, 2, tw - 4);
+            column(x + tw - 2, 128, 2);
+            let title = art
+                .lang
+                .get(TAB_TITLES[i])
+                .map_or(TAB_TITLES[i], String::as_str);
+            let width = GuiMesh::text_width(art, title) as i32;
+            if is {
+                let tile = art.named[MENU_BACKGROUND];
+                self.tiled([x + 2, y + 2, tw - 4, th - 2], [32, 32], tile, WIDGET + 1.0);
+                let line = width.min(tw - 4);
+                self.rect(
+                    art,
+                    [x + (tw - line) / 2, y + th - 2, line, 1],
+                    WIDGET + 2.0,
+                    [255; 4],
                 );
             }
+            let top = if is { y } else { y + 3 };
+            let (tx, ty) = (x + tw / 2 - width / 2, (top + y + th - 9) / 2 + 1);
+            self.shadowed(art, title, tx as f32, ty as f32, LABEL, 1.0, WHITE);
         }
     }
 
@@ -464,9 +962,55 @@ impl GuiMesh {
     }
 }
 
+impl Menu {
+    /// Create New World's buttons that change a choice.
+    pub fn cycle(&mut self, action: Action) {
+        let new = &mut self.new_world;
+        match action {
+            Action::CycleGameMode => new.mode = new.mode.next(),
+            Action::CycleDifficulty => new.difficulty = (new.difficulty + 1) % DIFFICULTIES.len(),
+            Action::ToggleCommands => new.allow_commands = Some(!new.commands()),
+            Action::ToggleStructures => new.structures = !new.structures,
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Field, valid_address};
+    use super::{Action, Field, GameMode, Menu, valid_address};
+
+    /// Commands follow Creative until chosen, and Hardcore is Hard without commands
+    /// whatever was chosen, as `WorldCreationUiState` decides.
+    #[test]
+    fn new_world_choices() {
+        let mut m = Menu::default();
+        assert_eq!(
+            (m.new_world.difficulty(), m.new_world.commands()),
+            ("normal", false)
+        );
+        m.cycle(Action::CycleGameMode);
+        assert_eq!(m.new_world.mode, GameMode::Hardcore);
+        assert_eq!(
+            (m.new_world.difficulty(), m.new_world.commands()),
+            ("hard", false)
+        );
+        m.cycle(Action::CycleGameMode);
+        assert_eq!(
+            (m.new_world.difficulty(), m.new_world.commands()),
+            ("normal", true)
+        );
+        m.cycle(Action::ToggleCommands);
+        m.cycle(Action::CycleDifficulty);
+        m.cycle(Action::ToggleStructures);
+        assert!(!m.new_world.structures);
+        m.cycle(Action::CycleGameMode);
+        assert_eq!(m.new_world.mode, GameMode::Survival);
+        assert_eq!(
+            (m.new_world.difficulty(), m.new_world.commands()),
+            ("hard", false)
+        );
+    }
 
     /// Typing, deleting and moving edit at the cursor, and typing stops at the limit and
     /// drops characters chat doesn't allow.

@@ -20,18 +20,45 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
 /// What the server tells the game, in the order it arrives.
+/// A world clock as the server sends it (`ClockNetworkState`): its ticks so far, the
+/// fraction of a tick past them, and how many ticks it advances a game tick (0 when
+/// paused, as with `/gamerule advance_time false`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClockState {
+    pub total_ticks: i64,
+    pub partial_tick: f32,
+    pub rate: f32,
+}
+
 pub enum Event {
     /// The player has joined the world as this entity, in this game mode (`GameType`'s id:
     /// survival 0, creative 1, adventure 2, spectator 3), on a hardcore server or not, and
     /// whether dying shows the death screen (the `immediate_respawn` game rule is off).
+    /// `dimension` names its dimension type, such as `minecraft:overworld`; `flat` is a
+    /// superflat world, whose horizon is at the bottom of the world.
     Login {
         entity_id: i32,
         hardcore: bool,
         game_mode: u8,
         show_death_screen: bool,
+        dimension: String,
+        flat: bool,
+        /// `Level.getSeaLevel`, which snow's height depends on.
+        sea_level: i32,
+    },
+    /// The server's time (`ClientboundSetTimePacket`): the game time in ticks, and the world
+    /// clocks it updates, by name, such as `minecraft:overworld`.
+    Time {
+        game_time: i64,
+        clocks: Vec<(String, ClockState)>,
     },
     /// The player's game mode changed (`GameType`'s id) by command.
     GameMode(u8),
+    /// The rain's or thunder's level changed (`ClientboundGameEventPacket`'s
+    /// `START_RAINING`, `STOP_RAINING`, `RAIN_LEVEL_CHANGE` and `THUNDER_LEVEL_CHANGE`),
+    /// 0 to 1.
+    RainLevel(f32),
+    ThunderLevel(f32),
     /// The player respawned, in this game mode.
     Respawn {
         game_mode: u8,
@@ -702,11 +729,15 @@ fn play(
                     .context("the login's dimension type isn't in the registry data")?;
                 dimension = Some(chunk::Dimension::new(name, data.as_ref())?);
                 own_id = entity_id;
+                let (game_mode, flat, sea_level) = spawn_game_mode(&mut r)?;
                 tx.send(Event::Login {
                     entity_id,
                     hardcore,
-                    game_mode: spawn_game_mode(&mut r)?,
+                    game_mode,
                     show_death_screen,
+                    dimension: name.clone(),
+                    flat,
+                    sea_level,
                 })
                 .is_ok()
             }
@@ -717,9 +748,26 @@ fn play(
                 // The server waits for the client to load again before the player can move.
                 loaded = false;
                 tx.send(Event::Respawn {
-                    game_mode: spawn_game_mode(&mut r)?,
+                    game_mode: spawn_game_mode(&mut r)?.0,
                 })
                 .is_ok()
+            }
+            "set_time" => {
+                // The game time, then a map of `WorldClock` registry ids to their states.
+                let game_time = r.i64()?;
+                let mut clocks = Vec::new();
+                for _ in 0..r.count()? {
+                    let id = r.count()?;
+                    let state = ClockState {
+                        total_ticks: r.varlong()?,
+                        partial_tick: r.f32()?,
+                        rate: r.f32()?,
+                    };
+                    if let Some((name, _)) = config.entries("minecraft:world_clock").get(id) {
+                        clocks.push((name.clone(), state));
+                    }
+                }
+                tx.send(Event::Time { game_time, clocks }).is_ok()
             }
             "game_event" => {
                 // `ClientboundGameEventPacket.CHANGE_GAME_MODE`, its parameter rounded as
@@ -731,6 +779,12 @@ fn play(
                         .send(Event::GameMode((param + 0.5).floor() as u8))
                         .is_ok(),
                     11 => tx.send(Event::ShowDeathScreen(param == 0.0)).is_ok(),
+                    // `handleGameEvent`: starting to rain sets the level to 0, stopping to
+                    // 1, and level changes follow each tick.
+                    1 => tx.send(Event::RainLevel(0.0)).is_ok(),
+                    2 => tx.send(Event::RainLevel(1.0)).is_ok(),
+                    7 => tx.send(Event::RainLevel(param)).is_ok(),
+                    8 => tx.send(Event::ThunderLevel(param)).is_ok(),
                     _ => true,
                 }
             }
@@ -1393,10 +1447,23 @@ fn player_info_update(r: &mut Reader) -> Result<Vec<Profile>> {
 
 /// The game mode from a `CommonPlayerSpawnInfo`, read from just after its dimension type:
 /// the dimension's name and the hashed seed come first.
-fn spawn_game_mode(r: &mut Reader) -> Result<u8> {
+/// `CommonPlayerSpawnInfo` after its dimension type: the game mode, and whether the world
+/// is superflat (`isFlat`).
+fn spawn_game_mode(r: &mut Reader) -> Result<(u8, bool, i32)> {
     r.string()?;
     r.i64()?;
-    Ok(r.varint()? as u8)
+    let game_mode = r.varint()? as u8;
+    r.varint()?; // the previous game mode
+    r.bool()?; // a debug world
+    let flat = r.bool()?;
+    // The last death location (its dimension and packed position), the portal cooldown,
+    // then the sea level.
+    if r.bool()? {
+        r.string()?;
+        r.i64()?;
+    }
+    r.varint()?;
+    Ok((game_mode, flat, r.varint()?))
 }
 
 /// An `ItemStack.OPTIONAL_STREAM_CODEC` stack: its item and count, or `None` for an empty

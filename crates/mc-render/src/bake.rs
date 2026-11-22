@@ -130,6 +130,13 @@ pub struct PortalTextures {
     pub stars: image::RgbaImage,
     /// `ScreenEffectRenderer.UNDERWATER_LOCATION`.
     pub underwater: image::RgbaImage,
+    /// `CloudRenderer.TEXTURE_LOCATION`, whose opaque pixels are clouds.
+    pub clouds: image::RgbaImage,
+    /// `WeatherEffectRenderer.RAIN_LOCATION` and `SNOW_LOCATION`.
+    pub rain: image::RgbaImage,
+    pub snow: image::RgbaImage,
+    /// `Hud.VIGNETTE_LOCATION`.
+    pub vignette: image::RgbaImage,
 }
 
 impl PortalTextures {
@@ -144,6 +151,10 @@ impl PortalTextures {
             sky: load("minecraft:environment/end_sky")?,
             stars: load("minecraft:entity/end_portal/end_portal")?,
             underwater: load("minecraft:misc/underwater")?,
+            clouds: load("minecraft:environment/clouds")?,
+            rain: load("minecraft:environment/rain")?,
+            snow: load("minecraft:environment/snow")?,
+            vignette: load("minecraft:misc/vignette")?,
         })
     }
 }
@@ -197,6 +208,7 @@ impl BlockModels {
         let items = crate::item::load(res, registry)?;
         sprites.extend(items.sprites.iter().cloned());
         sprites.extend(crate::hud::sprites());
+        sprites.extend(crate::sky::sprites());
         sprites.extend(crate::entity_model::sprites(res));
         let (equipment, equipment_sprites) = crate::entity::equipment_assets(res)?;
         sprites.extend(equipment_sprites);
@@ -273,6 +285,10 @@ impl BlockModels {
                 sky: blank(),
                 stars: blank(),
                 underwater: blank(),
+                clouds: blank(),
+                rain: blank(),
+                snow: blank(),
+                vignette: blank(),
             },
             equipment: HashMap::new(),
         })
@@ -586,6 +602,17 @@ impl JavaRandom {
                 return value;
             }
         }
+    }
+
+    /// `BitRandomSource.nextFloat`.
+    pub fn next_float(&mut self) -> f32 {
+        self.next(24) as f32 * 5.960_464_5e-8
+    }
+
+    /// `BitRandomSource.nextDouble`, whose scale is a float, so it has a float's precision.
+    pub fn next_double(&mut self) -> f64 {
+        let combined = (i64::from(self.next(26)) << 27) + i64::from(self.next(27));
+        f64::from(combined as f32 * 1.110_223e-16_f32)
     }
 
     pub fn next_long(&mut self) -> i64 {

@@ -68,7 +68,8 @@ pub struct BlockPhysics {
     /// States in the `#minecraft:climbable` tag.
     climbable: Vec<bool>,
     /// Per state id: its fluid, packed as `fluid::Fluid::unpack` reads it, and a bit per
-    /// direction whose face is sturdy (`BlockState.isFaceSturdy`), plus 64 for ice.
+    /// direction whose face is sturdy (`BlockState.isFaceSturdy`), plus 64 for ice and 128
+    /// for the states the `MOTION_BLOCKING` heightmap counts.
     fluids: Vec<u8>,
     sturdy: Vec<u8>,
     /// States in `#minecraft:blocks_fluid_flow`.
@@ -325,6 +326,14 @@ impl BlockPhysics {
     }
 
     /// `Block.getFriction`: how slippery the block is, 0.6 for most.
+    /// `Heightmap.Types.MOTION_BLOCKING`'s test: the state blocks motion or holds a fluid,
+    /// so rain and snow stop on it.
+    pub fn motion_blocking(&self, state: u32) -> bool {
+        self.sturdy
+            .get(state as usize)
+            .is_some_and(|s| s & 128 != 0)
+    }
+
     pub fn friction(&self, state: u32) -> f32 {
         self.friction.get(state as usize).copied().unwrap_or(0.6)
     }
