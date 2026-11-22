@@ -38,6 +38,19 @@ pub struct Mesh {
     /// End portal and gateway faces, for the portal shader; the third light byte holds
     /// the number of star layers.
     pub portal: Vec<Vertex>,
+    /// Each 16-block section, bottom to top, for culling: its quads in each layer above,
+    /// in order, and which of its faces see each other. Only `Mesher::mesh_chunk` fills it.
+    pub sections: Vec<MeshSection>,
+}
+
+/// A section's part of a chunk's mesh.
+#[derive(Debug, Clone)]
+pub struct MeshSection {
+    /// Section y: block y divided by 16.
+    pub y: i32,
+    /// Its quads in the opaque, cutout, translucent and portal layers: first and past last.
+    pub quads: [[u32; 2]; 4],
+    pub visibility: crate::cull::Visibility,
 }
 
 impl Mesh {
@@ -61,14 +74,21 @@ impl Mesh {
         }
     }
 
-    /// Orders translucent quads far to near from `eye`, so blending looks right.
+    /// Orders translucent quads far to near from `eye`, so blending looks right; within
+    /// each section, as sections draw on their own.
     pub fn sort_translucent(&mut self, eye: Vec3) {
-        let mut quads: Vec<[Vertex; 4]> = self.translucent.as_chunks::<4>().0.to_vec();
         let distance = |q: &[Vertex; 4]| {
             (q.iter().map(|v| Vec3::from(v.pos)).sum::<Vec3>() / 4.0).distance_squared(eye)
         };
-        quads.sort_by(|a, b| distance(b).total_cmp(&distance(a)));
-        self.translucent = quads.into_iter().flatten().collect();
+        let quads = self.translucent.as_chunks_mut::<4>().0;
+        let ranges: Vec<[u32; 2]> = if self.sections.is_empty() {
+            vec![[0, quads.len() as u32]]
+        } else {
+            self.sections.iter().map(|s| s.quads[2]).collect()
+        };
+        for [start, end] in ranges {
+            quads[start as usize..end as usize].sort_by(|a, b| distance(b).total_cmp(&distance(a)));
+        }
     }
 }
 
@@ -364,17 +384,31 @@ impl<'a> Mesher<'a> {
             return None;
         }
         let mut mesh = Mesh::default();
+        let lengths = |m: &Mesh| {
+            [&m.opaque, &m.cutout, &m.translucent, &m.portal].map(|l| l.len() as u32 / 4)
+        };
         for section in &chunk.sections {
+            let start = lengths(&mesh);
             if matches!(section.blocks, mc_world::Blocks::Uniform(s) if self.infos[s as usize].air)
             {
+                mesh.sections.push(MeshSection {
+                    y: section.y,
+                    quads: start.map(|q| [q, q]),
+                    visibility: crate::cull::Visibility::ALL,
+                });
                 continue;
             }
+            // `SectionCompiler.compile`: blocks that are `isSolidRender` close the section.
+            let mut graph = crate::cull::VisGraph::default();
             for ly in 0..16 {
                 for lz in 0..16 {
                     for lx in 0..16 {
                         let state = section.block(lx, ly, lz);
                         if self.infos[state as usize].air {
                             continue;
+                        }
+                        if self.solid_render(state) {
+                            graph.set_opaque(lx, ly, lz);
                         }
                         let (x, y, z) = (
                             cx * 16 + lx as i32,
@@ -385,6 +419,12 @@ impl<'a> Mesher<'a> {
                     }
                 }
             }
+            let end = lengths(&mesh);
+            mesh.sections.push(MeshSection {
+                y: section.y,
+                quads: std::array::from_fn(|i| [start[i], end[i]]),
+                visibility: graph.resolve(),
+            });
         }
         Some(mesh)
     }

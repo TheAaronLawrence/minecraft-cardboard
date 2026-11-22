@@ -1148,6 +1148,14 @@ impl Walker {
     /// `WaterFogEnvironment` or `LavaFogEnvironment`, and `LevelExtractor`'s underwater
     /// overlay while the player's eye is in water. The darkening near the bottom of the
     /// world isn't applied yet.
+    /// `Camera.extractRenderState`'s `smartCull`: off for a spectator whose eye is inside a
+    /// block that's `isSolidRender`, who would otherwise see nothing past it.
+    pub fn smart_cull(&self, eye: Vec3) -> bool {
+        use mc_physics::World;
+        let [x, y, z] = eye.floor().as_ivec3().to_array();
+        !(self.game_mode == 3 && self.blocks.solid_render(self.collision.state(x, y, z)))
+    }
+
     pub fn in_fluid(&self, eye: Vec3, yaw: f32, pitch: f32) -> Option<mc_render::gpu::InFluid> {
         use mc_physics::fluid::FluidKind;
         let kind = mc_physics::fluid::camera_fluid(&self.collision, &self.blocks, eye.as_dvec3())?;

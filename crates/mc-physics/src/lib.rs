@@ -340,6 +340,12 @@ impl BlockPhysics {
         }
     }
 
+    /// `BlockState.isSolidRender`: its occlusion shape fills the whole block.
+    pub fn solid_render(&self, state: u32) -> bool {
+        self.face_occlusion(state)
+            .is_some_and(|faces| faces.iter().all(|f| *f == [u64::MAX; 4]))
+    }
+
     /// `Block.getFriction`: how slippery the block is, 0.6 for most.
     /// `Heightmap.Types.MOTION_BLOCKING`'s test: the state blocks motion or holds a fluid,
     /// so rain and snow stop on it.

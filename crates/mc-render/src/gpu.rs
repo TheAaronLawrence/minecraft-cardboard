@@ -147,8 +147,20 @@ pub fn gui_scale(width: u32, height: u32) -> u32 {
     scale
 }
 
-/// A chunk's vertex buffer and index count per layer, if it has any quads in it.
-type ChunkBuffers = [Option<(wgpu::Buffer, u32)>; 4];
+/// A chunk's vertex buffer per layer, if it has any quads in it, and its sections.
+struct ChunkBuffers {
+    layers: [Option<wgpu::Buffer>; 4],
+    sections: Vec<crate::mesh::MeshSection>,
+}
+
+/// The sections the occlusion graph last found, with what it was found from: the
+/// camera's 8-block cell, whether it culled smartly, the chunks' generation and the render
+/// distance in chunks. None
+/// for the sections means every section, as when the camera's chunk isn't loaded.
+struct SectionGraph {
+    key: (glam::IVec3, bool, u64, i32),
+    visible: Option<std::collections::HashSet<glam::IVec3>>,
+}
 
 pub struct Renderer {
     pub device: wgpu::Device,
@@ -223,6 +235,11 @@ pub struct Renderer {
     indices: Option<(wgpu::Buffer, u32)>,
     /// Each chunk's opaque, cutout, translucent and portal vertices, with index counts.
     chunks: std::collections::HashMap<(i32, i32), ChunkBuffers>,
+    /// Counts chunk uploads and removals, so the section graph knows to update.
+    chunk_generation: u64,
+    section_graph: Option<SectionGraph>,
+    /// `CameraRenderState.smartCull`: off while a spectator's eye is inside a solid block.
+    smart_cull: bool,
     depth: Option<(wgpu::TextureView, u32, u32)>,
 }
 
@@ -944,6 +961,9 @@ impl Renderer {
             uniforms,
             indices: None,
             chunks: Default::default(),
+            chunk_generation: 0,
+            section_graph: None,
+            smart_cull: true,
             depth: None,
         }
     }
@@ -953,19 +973,19 @@ impl Renderer {
         let lists = [&mesh.opaque, &mesh.cutout, &mesh.translucent, &mesh.portal];
         let quads = lists.iter().map(|l| l.len() / 4).max().unwrap_or(0) as u32;
         self.ensure_indices(quads);
-        let buffers = lists.map(|vertices| {
+        let layers = lists.map(|vertices| {
             (!vertices.is_empty()).then(|| {
-                let buffer = self
-                    .device
+                self.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: None,
                         contents: bytemuck::cast_slice(vertices),
                         usage: wgpu::BufferUsages::VERTEX,
-                    });
-                (buffer, (vertices.len() / 4 * 6) as u32)
+                    })
             })
         });
-        self.chunks.insert(key, buffers);
+        let sections = mesh.sections.clone();
+        self.chunks.insert(key, ChunkBuffers { layers, sections });
+        self.chunk_generation += 1;
     }
 
     /// Outlines these edges (world coordinates, from one end to the other), as vanilla
@@ -1126,6 +1146,92 @@ impl Renderer {
 
     pub fn remove_chunk(&mut self, key: (i32, i32)) {
         self.chunks.remove(&key);
+        self.chunk_generation += 1;
+    }
+
+    /// `Camera.extractRenderState`'s `smartCull`: false while a spectator's eye is inside a
+    /// block that's `isSolidRender`, where the occlusion graph would see nothing.
+    pub fn set_smart_cull(&mut self, on: bool) {
+        self.smart_cull = on;
+    }
+
+    /// Each visible section of each chunk, nearest first: the chunk, and the section's
+    /// index in it. `SectionOcclusionGraph` finds the sections the camera can see into, then
+    /// `addSectionsInFrustum` keeps the ones in view of `camera`, at its unmodified field of
+    /// view (`createProjectionMatrixForCulling`) and without the view bob.
+    fn visible_sections(
+        &mut self,
+        camera: &Camera,
+        aspect: f32,
+        distance: i32,
+    ) -> Vec<((i32, i32), usize)> {
+        let eye_section = (camera.eye / 16.0).floor().as_ivec3();
+        let cell = (camera.eye / 8.0).floor().as_ivec3();
+        let key = (cell, self.smart_cull, self.chunk_generation, distance);
+        if self.section_graph.as_ref().is_none_or(|g| g.key != key) {
+            let chunks = &self.chunks;
+            let ys = chunks
+                .values()
+                .flat_map(|c| c.sections.iter().map(|s| s.y))
+                .fold((i32::MAX, i32::MIN), |(lo, hi), y| (lo.min(y), hi.max(y)));
+            let visibility = |s: glam::IVec3| {
+                let chunk = chunks.get(&(s.x, s.z))?;
+                Some(
+                    chunk
+                        .sections
+                        .iter()
+                        .find(|m| m.y == s.y)
+                        .map_or(crate::cull::Visibility::ALL, |m| m.visibility),
+                )
+            };
+            let visible = if chunks.is_empty() {
+                None
+            } else {
+                crate::cull::visible_sections(
+                    camera.eye,
+                    ys,
+                    distance,
+                    self.smart_cull,
+                    &visibility,
+                )
+            };
+            self.section_graph = Some(SectionGraph { key, visible });
+        }
+        let graph = self.section_graph.as_ref().expect("made above");
+        let projection = glam::camera::rh::proj::directx::perspective(
+            camera.fov.to_radians(),
+            aspect,
+            0.05,
+            1.0,
+        );
+        let frustum = crate::cull::Frustum::new(
+            projection * Mat4::from_quat(camera.rotation().inverse()),
+            camera.eye,
+            camera.forward(),
+        );
+        let mut out = Vec::new();
+        for (&(cx, cz), chunk) in &self.chunks {
+            for (i, section) in chunk.sections.iter().enumerate() {
+                let at = glam::IVec3::new(cx, section.y, cz);
+                if section.quads.iter().all(|[a, b]| a == b)
+                    || graph.visible.as_ref().is_some_and(|v| !v.contains(&at))
+                {
+                    continue;
+                }
+                let min = at.as_vec3() * 16.0;
+                if frustum.intersects(min, min + 16.0) {
+                    out.push(((cx, cz), i));
+                }
+            }
+        }
+        let distance = |&((cx, cz), i): &((i32, i32), usize)| {
+            let y = self.chunks[&(cx, cz)].sections[i].y;
+            (glam::IVec3::new(cx, y, cz) - eye_section)
+                .as_vec3()
+                .length_squared()
+        };
+        out.sort_by(|a, b| distance(a).total_cmp(&distance(b)));
+        out
     }
 
     pub fn chunk_count(&self) -> usize {
@@ -1162,6 +1268,11 @@ impl Renderer {
             });
             self.depth = Some((depth.create_view(&Default::default()), width, height));
         }
+        let sections = self.visible_sections(
+            camera,
+            width as f32 / height as f32,
+            (view.distance / 16.0) as i32,
+        );
         let fluid = self.in_fluid;
         let fov_scale = if fluid.is_some() { 0.85714287 } else { 1.0 };
         let camera = &Camera {
@@ -1445,13 +1556,6 @@ impl Renderer {
             }
             if let Some((indices, _)) = &self.indices {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                // Translucent chunks blend over what's behind them, so far ones go first.
-                let mut keys: Vec<(i32, i32)> = self.chunks.keys().copied().collect();
-                let distance = |&(cx, cz): &(i32, i32)| {
-                    let center = Vec3::new(cx as f32 * 16.0 + 8.0, 0.0, cz as f32 * 16.0 + 8.0);
-                    (center - camera.eye * Vec3::new(1.0, 0.0, 1.0)).length_squared()
-                };
-                keys.sort_by(|a, b| distance(b).total_cmp(&distance(a)));
                 // Portals are opaque, so they draw before the translucent layer.
                 let order = [
                     (&self.opaque, 0),
@@ -1462,10 +1566,19 @@ impl Renderer {
                 pass.set_bind_group(1, &self.portal_bind_group, &[]);
                 for (pipeline, slot) in order {
                     pass.set_pipeline(pipeline);
-                    for key in &keys {
-                        if let Some((buffer, count)) = &self.chunks[key][slot] {
+                    // Visible sections, nearest first; translucent ones blend over what's
+                    // behind them, so far ones go first.
+                    let ordered: Box<dyn Iterator<Item = &((i32, i32), usize)>> = if slot == 2 {
+                        Box::new(sections.iter().rev())
+                    } else {
+                        Box::new(sections.iter())
+                    };
+                    for (key, i) in ordered {
+                        let chunk = &self.chunks[key];
+                        let [start, end] = chunk.sections[*i].quads[slot];
+                        if let (Some(buffer), true) = (&chunk.layers[slot], end > start) {
                             pass.set_vertex_buffer(0, buffer.slice(..));
-                            pass.draw_indexed(0..*count, 0, 0..1);
+                            pass.draw_indexed(start * 6..end * 6, 0, 0..1);
                         }
                     }
                     // Entities are cutout too, and go before anything translucent covers

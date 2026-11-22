@@ -1507,6 +1507,7 @@ impl winit::application::ApplicationHandler for App {
                                 mc_render::entity::fire_overlay(&self.models.atlas, camera)
                             });
                             renderer.set_fire_overlay(&fire.unwrap_or_default());
+                            renderer.set_smart_cull(walker.smart_cull(camera.eye));
                             renderer.set_in_fluid(walker.in_fluid(
                                 camera.eye,
                                 camera.yaw,
