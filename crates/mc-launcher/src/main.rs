@@ -37,6 +37,7 @@ macro_rules! embedded {
 const ART: &[(&str, &[u8])] = embedded![
     "assets/minecraft/font/include/default.json",
     "assets/minecraft/textures/font/ascii.png",
+    "assets/minecraft/textures/font/nonlatin_european.png",
     "assets/minecraft/textures/gui/menu_background.png",
     "assets/minecraft/textures/gui/title/background/panorama_0.png",
     "assets/minecraft/textures/gui/title/minecraft.png",
