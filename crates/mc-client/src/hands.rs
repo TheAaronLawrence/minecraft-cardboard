@@ -4,7 +4,42 @@
 
 use crate::entities::SwingState;
 use glam::{Mat4, Vec3};
+use mc_render::entity::UseAnim;
+use std::collections::HashMap;
 use std::f32::consts::PI;
+
+/// `Item.getUseAnimation` and `getUseDuration` for `item`, from its components: a
+/// `consumable`'s animation and time, a shield's (`blocks_attacks`) block, and a bow's
+/// draw, which last until let go (72000 ticks). Other items' uses aren't drawn.
+pub fn use_animation(item: &str, using: &mc_registry::ItemUse) -> (UseAnim, i32) {
+    if let Some(c) = &using.consumable {
+        let anim = match c.animation.as_str() {
+            "eat" => UseAnim::Eat,
+            "drink" => UseAnim::Drink,
+            "block" => UseAnim::Block,
+            "bow" => UseAnim::Bow,
+            _ => UseAnim::None,
+        };
+        (anim, c.ticks())
+    } else if using.blocks_attacks {
+        (UseAnim::Block, 72000)
+    } else if item == "minecraft:bow" {
+        (UseAnim::Bow, 72000)
+    } else {
+        (UseAnim::None, 0)
+    }
+}
+
+/// Every item's use animation and duration, by name, for those that have one.
+pub fn use_animations(registry: &mc_registry::Registry) -> HashMap<String, (UseAnim, i32)> {
+    (0..registry.item_count())
+        .filter_map(|id| {
+            let item = registry.item_name(id)?;
+            let used = use_animation(item, &registry.item_info(item)?.using);
+            (used.0 != UseAnim::None).then(|| (item.to_owned(), used))
+        })
+        .collect()
+}
 
 /// `SwingAnimation.DEFAULT`: a whack (`SwingAnimationType` 1) of 6 ticks, how every item
 /// here swings. Spears' stab isn't drawn yet.
@@ -93,13 +128,14 @@ impl Hands {
     }
 
     /// `FirstPersonHandsAndItems.extractRenderState`, `pt` of the way to the next tick,
-    /// with the view at `yaw` and `pitch` and the player's skin.
+    /// with the view at `yaw` and `pitch`, the player's skin, and the item being used.
     pub fn view(
         &self,
         pt: f32,
         yaw: f32,
         pitch: f32,
         (skin, slim): (String, bool),
+        using: Option<mc_render::entity::Using>,
     ) -> mc_render::entity::FirstPerson {
         let lerp = |[old, now]: [f32; 2]| old + (now - old) * pt;
         mc_render::entity::FirstPerson {
@@ -113,6 +149,7 @@ impl Hands {
                 .current
                 .map(|(hand, kind, _)| (hand as usize, kind, self.swing.animation(pt))),
             sway: [pitch - lerp(self.bob[0]), yaw - lerp(self.bob[1])],
+            using,
         }
     }
 }

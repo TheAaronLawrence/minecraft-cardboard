@@ -257,9 +257,19 @@ pub struct Walker {
     destroying: Option<(IVec3, u8, f32)>,
     destroy_delay: u32,
     right_click_delay: u32,
-    /// `LivingEntity.isUsingItem`, as the server's living flags (data 8) last said: eating,
-    /// drinking, drawing a bow or blocking.
-    using_item: bool,
+    /// The item in use (`LivingEntity.useItem` and `useItemRemaining`, and
+    /// `LocalPlayer.usingItemHand`): eating, drinking, drawing a bow or blocking. It starts
+    /// when this client predicts `Item.use` starts it (`startedUsingItem`), or when the
+    /// server's living flags (data 8) say so.
+    using: Option<Use>,
+    /// Each item's components that using it depends on, by name.
+    item_uses: HashMap<String, mc_registry::ItemUse>,
+    /// What using each item looks like and how long it lasts, by name.
+    use_animations: HashMap<String, (mc_render::entity::UseAnim, i32)>,
+    /// Item icons, whose sprites food's crumbs are cut from.
+    item_icons: std::sync::Arc<HashMap<String, mc_render::item::ItemIcon>>,
+    /// `Camera.oldFovModifier` and `fovModifier`.
+    fov_modifier: [f32; 2],
     miss_time: u32,
     /// Numbers each action the server acknowledges.
     sequence: i32,
@@ -267,6 +277,8 @@ pub struct Walker {
     inventory: crate::inventory::Inventory,
     /// Other players mining blocks, by entity id: the block and crack stage.
     others_mining: HashMap<i32, (IVec3, u8)>,
+    /// Chests' lids that have opened, by where the chest is.
+    chest_lids: HashMap<IVec3, ChestLid>,
     /// Other players, mobs and dropped items.
     entities: crate::entities::Entities,
     /// Downloads players' skins as they join the tab list.
@@ -374,6 +386,42 @@ impl Sky {
     }
 }
 
+/// `ChestLidController`: a chest's lid, which opens or shuts a tenth of the way a tick,
+/// and the chest's block, whose lid it is.
+struct ChestLid {
+    block: u32,
+    should_be_open: bool,
+    openness: f32,
+    o_openness: f32,
+    /// Ticks since it shut, after which it's forgotten: by then its chunk has the lid
+    /// again (`stream::LID_SHUT`).
+    shut_for: u32,
+}
+
+impl ChestLid {
+    /// `ChestLidController.tickLid`.
+    fn tick(&mut self) {
+        self.o_openness = self.openness;
+        self.openness = if self.should_be_open {
+            (self.openness + 0.1).min(1.0)
+        } else {
+            (self.openness - 0.1).max(0.0)
+        };
+        self.shut_for = if self.openness == 0.0 && !self.should_be_open {
+            self.shut_for + 1
+        } else {
+            0
+        };
+    }
+}
+
+/// An item in use: its hand (0 main, 1 off), the item, and the ticks left.
+struct Use {
+    hand: u8,
+    item: String,
+    remaining: i32,
+}
+
 /// The open death screen: its message, ticks since it (or its confirmation) opened,
 /// whether it's asking to confirm leaving, and which button has the focus.
 struct Death {
@@ -456,6 +504,7 @@ impl Walker {
         biomes: std::sync::Arc<mc_render::tint::Biomes>,
         uuid: u128,
         vignette: f32,
+        item_icons: std::sync::Arc<HashMap<String, mc_render::item::ItemIcon>>,
     ) -> anyhow::Result<Self> {
         let state = |name: &str| registry.block(name).map(|b| b.default_state);
         let air = state("minecraft:air").expect("air");
@@ -495,12 +544,22 @@ impl Walker {
             destroying: None,
             destroy_delay: 0,
             right_click_delay: 0,
-            using_item: false,
+            using: None,
+            item_uses: (0..registry.item_count())
+                .filter_map(|id| {
+                    let item = registry.item_name(id)?;
+                    Some((item.to_owned(), registry.item_info(item)?.using.clone()))
+                })
+                .collect(),
+            use_animations: crate::hands::use_animations(registry),
+            item_icons,
+            fov_modifier: [1.0; 2],
             miss_time: 0,
             hit_entity: None,
             sequence: 0,
             inventory: crate::inventory::Inventory::new(registry),
             others_mining: HashMap::new(),
+            chest_lids: HashMap::new(),
             entities: crate::entities::Entities::new(registry),
             attack_indicator_mode: Default::default(),
             skins: crate::skins::Loader::new(),
@@ -744,6 +803,10 @@ impl Walker {
     pub fn blocks(&mut self, changes: &[([i32; 3], u32)]) {
         for &(pos, state) in changes {
             self.collision.set(pos, state);
+            // A chest broken or replaced takes its lid with it.
+            let block = self.state_blocks.get(state as usize).copied();
+            self.chest_lids
+                .retain(|p, lid| *p != IVec3::from(pos) || Some(lid.block) == block);
             // `BlockItem.place`: the block's place sound.
             if let Some((at, block, _)) = self.placing
                 && at.contains(&IVec3::from(pos))
@@ -967,7 +1030,14 @@ impl Walker {
                 match (index, value) {
                     (0, mc_protocol::DataValue::Byte(flags)) => self.on_fire = flags & 1 != 0,
                     (1, mc_protocol::DataValue::Int(air)) => self.air = *air,
-                    (8, mc_protocol::DataValue::Byte(flags)) => self.using_item = flags & 1 != 0,
+                    // `LocalPlayer.onSyncedDataUpdated`: the server starts or stops it.
+                    (8, mc_protocol::DataValue::Byte(flags)) => {
+                        if flags & 1 == 0 {
+                            self.using = None;
+                        } else if self.using.is_none() {
+                            self.start_using(u8::from(flags & 2 != 0));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1056,6 +1126,7 @@ impl Walker {
                 self.on_fire = false;
                 self.air = 300;
                 self.effects.clear();
+                self.using = None;
             }
             mc_protocol::Event::GameMode(mode) => self.game_mode = mode,
             mc_protocol::Event::Effect { effect, active } => {
@@ -1078,6 +1149,10 @@ impl Walker {
                 };
                 let pitch = self.wobble(0.2);
                 self.player_sound(event, 1.0, pitch);
+            }
+            // `Player.handleEntityEvent(9)`: the server finished the item's use.
+            mc_protocol::Event::EntityEvent { id, event: 9 } if id == self.entity_id => {
+                self.complete_using();
             }
             // `LivingEntity.handleEntityEvent(3)`: the player's own death sound.
             mc_protocol::Event::EntityEvent { id, event: 3 } if id == self.entity_id => {
@@ -1158,8 +1233,63 @@ impl Walker {
             mc_protocol::Event::HeldSlot(slot) => {
                 (self.selected, self.sent_selected) = (slot, slot)
             }
-            mc_protocol::Event::Inventory { state_id, slots } => {
-                self.inventory.set(state_id, slots)
+            mc_protocol::Event::Inventory {
+                container,
+                state_id,
+                slots,
+            } => self.inventory.set(container, state_id, slots),
+            mc_protocol::Event::OpenScreen {
+                container,
+                menu,
+                title,
+            } => {
+                use mc_render::hud::inventory::Menu;
+                let menu = match menu {
+                    "minecraft:crafting" => Some(Menu::Crafting),
+                    "minecraft:furnace" => Some(Menu::Furnace),
+                    name => name
+                        .strip_prefix("minecraft:generic_9x")
+                        .and_then(|rows| rows.parse().ok())
+                        .map(Menu::Chest),
+                };
+                match menu {
+                    Some(menu) if !self.dead() => {
+                        self.inventory.open_container(container, menu, title)
+                    }
+                    // A screen this game can't show yet: closed again at once.
+                    _ => {
+                        if let Err(e) = crate::inventory::Inventory::refuse(&self.outbox, container)
+                        {
+                            eprintln!("closing a screen: {e:#}");
+                        }
+                    }
+                }
+            }
+            mc_protocol::Event::ContainerData {
+                container,
+                id,
+                value,
+            } => self.inventory.set_data(container, id, value),
+            // `ChestBlockEntity.triggerEvent(1, viewers)`.
+            mc_protocol::Event::BlockEvent {
+                pos,
+                kind: 1,
+                value,
+                block,
+            } if block.ends_with("chest") => {
+                let state = mc_physics::World::state(&self.collision, pos[0], pos[1], pos[2]);
+                let block = self.state_blocks.get(state as usize).copied().unwrap_or(0);
+                let lid = self.chest_lids.entry(IVec3::from(pos)).or_insert(ChestLid {
+                    block,
+                    should_be_open: false,
+                    openness: 0.0,
+                    o_openness: 0.0,
+                    shut_for: 0,
+                });
+                (lid.block, lid.should_be_open) = (block, value > 0);
+            }
+            mc_protocol::Event::ContainerClosed(container) => {
+                self.inventory.server_close(container)
             }
             mc_protocol::Event::Carried(stack) => self.inventory.carried = stack,
             mc_protocol::Event::Destruction { id, pos, stage } => match stage {
@@ -1179,6 +1309,23 @@ impl Walker {
         self.entities.render(self.since_tick / TICK, |p| {
             self.light.at(p.floor().as_ivec3().to_array())
         })
+    }
+
+    /// The chests whose lids are open or moving: where each is, its state, how far open
+    /// to draw it this frame (`ChestRenderer.submit` eases it, `1 - (1 - open)³`), and the
+    /// light there.
+    pub fn chest_lids(&self) -> Vec<([i32; 3], u32, f32, [u8; 2])> {
+        let partial = self.since_tick / TICK;
+        self.chest_lids
+            .iter()
+            .map(|(pos, lid)| {
+                let [x, y, z] = pos.to_array();
+                let state = mc_physics::World::state(&self.collision, x, y, z);
+                let open = lid.o_openness + (lid.openness - lid.o_openness) * partial;
+                let eased = 1.0 - (1.0 - open).powi(3);
+                (pos.to_array(), state, eased, self.light.at(pos.to_array()))
+            })
+            .collect()
     }
 
     /// The lightning bolts to draw this frame.
@@ -1340,6 +1487,12 @@ impl Walker {
         }
     }
 
+    /// Whether the server closed the open screen since this was last asked, so the game
+    /// takes the mouse back.
+    pub fn take_closed_screen(&mut self) -> bool {
+        self.inventory.take_closed_by_server()
+    }
+
     /// E or Esc, or dying (`AbstractContainerScreen.tick`).
     pub fn close_inventory(&mut self) {
         if let Err(e) = self.inventory.close(&self.outbox) {
@@ -1359,7 +1512,9 @@ impl Walker {
         height: i32,
     ) {
         use mc_render::hud::inventory::{outside, slot_at};
-        let (hovered, outside) = (slot_at(width, height, mouse), outside(width, height, mouse));
+        let menu = self.inventory.menu();
+        let hovered = slot_at(menu, width, height, mouse);
+        let outside = outside(menu, width, height, mouse);
         let creative = self.game_mode == 1;
         let result = if down {
             self.inventory
@@ -1374,8 +1529,11 @@ impl Walker {
     }
 
     pub fn inventory_drag(&mut self, mouse: [f32; 2], width: i32, height: i32) {
+        let menu = self.inventory.menu();
         self.inventory
-            .mouse_moved(mc_render::hud::inventory::slot_at(width, height, mouse));
+            .mouse_moved(mc_render::hud::inventory::slot_at(
+                menu, width, height, mouse,
+            ));
     }
 
     pub fn inventory_key(
@@ -1385,7 +1543,9 @@ impl Walker {
         width: i32,
         height: i32,
     ) {
-        let hovered = mouse.and_then(|m| mc_render::hud::inventory::slot_at(width, height, m));
+        let menu = self.inventory.menu();
+        let hovered =
+            mouse.and_then(|m| mc_render::hud::inventory::slot_at(menu, width, height, m));
         if let Err(e) = self
             .inventory
             .key(&self.outbox, key, hovered, self.game_mode == 1)
@@ -1470,6 +1630,7 @@ impl Walker {
         });
         mc_render::hud::Hotbar {
             slots: std::array::from_fn(|i| self.inventory.slots[36 + i].clone()),
+            offhand: self.inventory.slots[45].clone(),
             selected: self.selected,
             vitals,
             death: self.death_screen(),
@@ -1579,12 +1740,20 @@ impl Walker {
         if self.dead() || self.game_mode == 3 {
             return None;
         }
-        let hands = self.hands.view(
-            self.since_tick / TICK,
-            yaw,
-            pitch,
-            self.entities.skin(self.uuid),
-        );
+        let pt = self.since_tick / TICK;
+        let using = self.using.as_ref().and_then(|u| {
+            let &(anim, duration) = self.use_animations.get(&u.item)?;
+            (u.remaining > 0).then_some(mc_render::entity::Using {
+                hand: u.hand as usize,
+                anim,
+                duration,
+                remaining: u.remaining as f32 - pt + 1.0,
+                ticks: duration - u.remaining,
+            })
+        });
+        let hands = self
+            .hands
+            .view(pt, yaw, pitch, self.entities.skin(self.uuid), using);
         Some((hands, self.light.at(eye.floor().as_ivec3().to_array())))
     }
 
@@ -1661,6 +1830,11 @@ impl Walker {
         let due = (self.since_tick / TICK).floor();
         self.since_tick -= due * TICK;
         for _ in 0..(due as u32).min(10) {
+            // `ChestBlockEntity.lidAnimateTick`.
+            for lid in self.chest_lids.values_mut() {
+                lid.tick();
+            }
+            self.chest_lids.retain(|_, l| l.shut_for < 20);
             // `Hud.tick` and `LivingEntity.baseTick`'s countdown.
             self.health.tick = self.health.tick.wrapping_add(1);
             self.health.damage_cooldown = self.health.damage_cooldown.saturating_sub(1);
@@ -1713,6 +1887,17 @@ impl Walker {
                 let old = self.sky.visuals.map_or(now, |[_, new]| new);
                 self.sky.visuals = Some([old, now]);
             }
+            // `Camera.tickFov`: halfway to `getFieldOfViewModifier` each tick. Only a drawn
+            // bow narrows it here; flying and speed don't widen it yet.
+            let target = match &self.using {
+                Some(u) if u.item == "minecraft:bow" => {
+                    let ticks = self.use_animations.get(&u.item).map_or(0, |a| a.1) - u.remaining;
+                    1.0 - (ticks as f32 / 20.0).min(1.0).powi(2) * 0.15
+                }
+                _ => 1.0,
+            };
+            let [_, now] = self.fov_modifier;
+            self.fov_modifier = [now, (now + (target - now) * 0.5).clamp(0.1, 1.5)];
             // `Camera.tick`, before the entities move.
             let eye = self.player.eye_height() as f32;
             self.camera_eye = [
@@ -1774,6 +1959,7 @@ impl Walker {
             if let Err(e) = self.tick_hands(buttons) {
                 eprintln!("sending block actions: {e:#}");
             }
+            self.tick_using();
             let before = self.player.pos;
             self.player.tick(input, &self.collision, &self.blocks);
             self.movement_sounds();
@@ -1836,13 +2022,13 @@ impl Walker {
         let hit = self.hit;
         let [attacks, uses, picks] = std::mem::take(&mut self.clicks);
         // Clicks while an item is in use are dropped.
-        let [attacks, uses, picks] = match self.using_item {
+        let [attacks, uses, picks] = match self.using.is_some() {
             true => [0; 3],
             false => [attacks, uses, picks],
         };
-        if self.using_item && !b.use_item {
+        if self.using.is_some() && !b.use_item {
             self.player_action(RELEASE_USE_ITEM, IVec3::ZERO, 0, false)?;
-            self.using_item = false;
+            self.using = None;
         }
         for _ in 0..attacks {
             self.start_attack(hit)?;
@@ -1855,13 +2041,13 @@ impl Walker {
             body.put_block_pos(h.pos.to_array()).put_bool(false);
             self.outbox.send("pick_item_from_block", &body)?;
         }
-        if b.use_item && self.right_click_delay == 0 && !self.using_item {
+        if b.use_item && self.right_click_delay == 0 && self.using.is_none() {
             self.start_use(hit)?;
         }
         // A click shorter than a tick mines for that tick too; using an item doesn't mine
         // (`Minecraft.continueAttack`).
         let held = b.attack || attacks > 0;
-        if self.using_item {
+        if self.using.is_some() {
             if !held {
                 self.miss_time = 0;
             }
@@ -2035,34 +2221,27 @@ impl Walker {
         }
     }
 
-    /// `Minecraft.startUseItem` with the main hand: use the held item on the block looked
-    /// at (placing it, if it's a block), or on nothing. Placing a block swings the arm and
-    /// drops the hand (`itemUsed`); other uses' success isn't predicted, so they don't.
+    /// `Minecraft.startUseItem`: for the main hand then the off hand, use the held item on
+    /// the block looked at, placing it if it's a block; unless the block takes the click
+    /// itself (`useWithoutItem`, skipped while sneaking with something in hand), use the
+    /// item on nothing. The first hand that places a block or starts using its item ends
+    /// it, as does a block taking the click. Placing swings the arm, and placing or
+    /// using drops the hand (`itemUsed`); other successes aren't predicted.
     fn start_use(&mut self, hit: Option<BlockHit>) -> anyhow::Result<()> {
         self.right_click_delay = 4;
         if self.destroying.is_some() {
             return Ok(());
         }
-        self.sequence += 1;
-        let mut body = Vec::new();
-        body.put_varint(0); // main hand
-        match hit {
-            Some(h) => {
-                let held = &self.inventory.slots[36 + self.selected as usize];
-                if let Some(&block) = held
-                    .as_ref()
-                    .and_then(|(item, _)| self.block_items.get(item))
-                {
-                    self.hands.swing(0);
-                    self.hands.item_used(0);
-                    // The block lands on the block clicked, if that's replaceable, or
-                    // against its face.
-                    let [dx, dy, dz] = FACE_OFFSETS[h.face as usize];
-                    let next = h.pos + IVec3::new(dx, dy, dz);
-                    self.placing = Some(([h.pos, next], block, 20));
-                }
+        let secondary =
+            self.player.shift_key_down() && (self.held(0).is_some() || self.held(1).is_some());
+        for hand in 0..2u8 {
+            let held = self.held(hand).map(str::to_owned);
+            if let Some(h) = hit {
+                self.sequence += 1;
                 let cursor = h.location - h.pos.as_dvec3();
-                body.put_block_pos(h.pos.to_array())
+                let mut body = Vec::new();
+                body.put_varint(i32::from(hand))
+                    .put_block_pos(h.pos.to_array())
                     .put_varint(h.face as i32)
                     .put_f32(cursor.x as f32)
                     .put_f32(cursor.y as f32)
@@ -2070,15 +2249,176 @@ impl Walker {
                     .put_bool(h.inside)
                     .put_bool(false) // world border hit
                     .put_varint(self.sequence);
-                self.outbox.send("use_item_on", &body)
+                self.outbox.send("use_item_on", &body)?;
+                if let Some(&block) = held.as_ref().and_then(|item| self.block_items.get(item)) {
+                    self.hands.swing(hand);
+                    self.hands.item_used(hand as usize);
+                    // The block lands on the block clicked, if that's replaceable, or
+                    // against its face.
+                    let [dx, dy, dz] = FACE_OFFSETS[h.face as usize];
+                    let next = h.pos + IVec3::new(dx, dy, dz);
+                    self.placing = Some(([h.pos, next], block, 20));
+                    return Ok(());
+                }
+                let state = mc_physics::World::state(&self.collision, h.pos.x, h.pos.y, h.pos.z);
+                if !secondary && self.blocks.interactive(state) {
+                    return Ok(());
+                }
             }
-            None => {
-                body.put_varint(self.sequence)
-                    .put_f32(self.player.yaw)
-                    .put_f32(self.player.pitch);
-                self.outbox.send("use_item", &body)
+            let Some(item) = held else {
+                continue;
+            };
+            // `MultiPlayerGameMode.useItem`.
+            self.sequence += 1;
+            let mut body = Vec::new();
+            body.put_varint(i32::from(hand))
+                .put_varint(self.sequence)
+                .put_f32(self.player.yaw)
+                .put_f32(self.player.pitch);
+            self.outbox.send("use_item", &body)?;
+            if self.starts_using(&item) {
+                self.start_using(hand);
+                self.hands.item_used(hand as usize);
+                return Ok(());
             }
         }
+        Ok(())
+    }
+
+    /// The item in `hand` (0 main, 1 off).
+    fn held(&self, hand: u8) -> Option<&str> {
+        let slot = if hand == 0 {
+            36 + self.selected as usize
+        } else {
+            45
+        };
+        self.inventory.slots[slot]
+            .as_ref()
+            .map(|(item, _)| item.as_str())
+    }
+
+    /// Whether `Item.use` starts using `item`: food the player can eat (when hungry,
+    /// unless it's always edible or they're in creative) and drinks that take time
+    /// (`Consumable.startConsuming`), a shield (`blocks_attacks`), and a bow with arrows to
+    /// shoot, or in creative (`BowItem.use`).
+    fn starts_using(&self, item: &str) -> bool {
+        let creative = self.game_mode == 1;
+        if let Some(using) = self.item_uses.get(item) {
+            if let Some(c) = &using.consumable {
+                let edible = using
+                    .food
+                    .is_none_or(|always| always || creative || self.food < 20);
+                return edible && c.ticks() > 0;
+            }
+            if using.blocks_attacks {
+                return true;
+            }
+        }
+        // `Player.getProjectile`: arrows anywhere in the inventory or hands.
+        let arrows = self.inventory.slots[9..=45].iter().flatten().any(|(i, _)| {
+            matches!(
+                i.as_str(),
+                "minecraft:arrow" | "minecraft:tipped_arrow" | "minecraft:spectral_arrow"
+            )
+        });
+        item == "minecraft:bow" && (creative || arrows)
+    }
+
+    /// `LivingEntity.startUsingItem`: the item in `hand`, for its use duration.
+    fn start_using(&mut self, hand: u8) {
+        let Some(item) = self.held(hand).map(str::to_owned) else {
+            return;
+        };
+        let remaining = self.use_animations.get(&item).map_or(0, |u| u.1);
+        self.using = Some(Use {
+            hand,
+            item,
+            remaining,
+        });
+    }
+
+    /// `LivingEntity.updatingUsingItem`, each tick: while the item stays in the hand, it
+    /// ticks (`Consumable.shouldEmitParticlesAndSounds`: crumbs and a crunch every 4
+    /// ticks, once past the first 7/32 of the time) and counts down, which the server
+    /// finishes; another item stops it. Using it slows the player as its `use_effects` say.
+    fn tick_using(&mut self) {
+        if let Some(u) = &self.using {
+            if self.held(u.hand) == Some(u.item.as_str()) {
+                let (item, remaining) = (u.item.clone(), u.remaining);
+                let consumable = self
+                    .item_uses
+                    .get(&item)
+                    .and_then(|i| i.consumable.as_ref());
+                if let Some(ticks) = consumable.map(mc_registry::Consumable::ticks) {
+                    let wait = (ticks as f32 * 0.21875) as i32;
+                    if ticks - remaining > wait && remaining % 4 == 0 {
+                        self.consume_effects(&item, 5);
+                    }
+                }
+                if let Some(u) = &mut self.using {
+                    u.remaining -= 1;
+                }
+            } else {
+                self.using = None;
+            }
+        }
+        self.player.using_item = self.using.as_ref().map(|u| {
+            let effects = self
+                .item_uses
+                .get(&u.item)
+                .map(|i| i.use_effects.clone())
+                .unwrap_or_default();
+            (effects.speed_multiplier, effects.can_sprint)
+        });
+    }
+
+    /// `LivingEntity.completeUsingItem` on the client: the item, if still held, is
+    /// consumed with a burst of crumbs and its sound (`Consumable.onConsume`), and its use
+    /// stops.
+    fn complete_using(&mut self) {
+        let Some(u) = self.using.take() else {
+            return;
+        };
+        if self.held(u.hand) == Some(u.item.as_str()) {
+            self.consume_effects(&u.item, 16);
+        }
+    }
+
+    /// `Consumable.emitParticlesAndSounds`: `count` crumbs of the item from the mouth, and
+    /// its sound, which the player hears themselves (`Player.playSound`); eating is loud
+    /// or quiet at random, drinking always half as loud.
+    fn consume_effects(&mut self, item: &str, count: u32) {
+        let Some(c) = self.item_uses.get(item).and_then(|i| i.consumable.clone()) else {
+            return;
+        };
+        // `ItemStackRenderState.pickParticleMaterial`: a generated model's particle is its
+        // first layer.
+        let sprite = match self.item_icons.get(item) {
+            Some(mc_render::item::ItemIcon::Flat { layers, .. }) => layers.first().map(|l| l.0),
+            _ => None,
+        };
+        if let Some(rect) = sprite.filter(|_| c.has_consume_particles) {
+            let eye = self.player.pos + DVec3::Y * self.player.eye_height();
+            let (yaw, pitch) = (self.player.yaw, self.player.pitch);
+            self.entities
+                .particles
+                .item_crumbs(rect, eye, yaw, pitch, count);
+        }
+        let r = &mut self.sound_random;
+        let (volume, pitch) = if c.animation == "drink" {
+            (0.5, 0.9 + r.next_float() * 0.1)
+        } else {
+            let volume = if r.next_float() < 0.5 { 0.5 } else { 1.0 };
+            (volume, 1.0 + 0.2 * (r.next_float() - r.next_float()))
+        };
+        self.player_sound(&c.sound, volume, pitch);
+    }
+
+    /// `Camera.getFov`'s modifier, `pt` of the way to the next tick: how much a drawn bow
+    /// narrows the view.
+    pub fn fov_modifier(&self) -> f32 {
+        let [old, now] = self.fov_modifier;
+        old + (now - old) * (self.since_tick / TICK)
     }
 
     fn send_changes(&mut self, input: Input) -> anyhow::Result<()> {

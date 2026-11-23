@@ -132,6 +132,49 @@ pub struct Equipment {
     pub hands: [Option<String>; 2],
     /// Whether its main hand is its left.
     pub left_handed: bool,
+    /// The item it's using, by arm, if any.
+    pub using: Option<Using>,
+}
+
+/// `ItemUseAnimation`, as far as it's drawn: what using an item looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UseAnim {
+    None,
+    Eat,
+    Drink,
+    /// A shield raised.
+    Block,
+    /// A bow drawn.
+    Bow,
+}
+
+/// An item being used (`LivingEntity.useItem`), already interpolated to the frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Using {
+    /// In first person, the main (0) or off (1) hand; in third person, the right (0) or
+    /// left (1) arm.
+    pub hand: usize,
+    pub anim: UseAnim,
+    /// `getUseDuration`.
+    pub duration: i32,
+    /// The ticks left, to the frame: `useItemRemainingTicks - partialTicks + 1`.
+    pub remaining: f32,
+    /// Whole ticks used (`UseDuration`), which picks a bow's pulling model.
+    pub ticks: i32,
+}
+
+/// The icon to draw `item` with in `hand`: what it shows while used, if it's the item in
+/// use and changes then (`minecraft:using_item`), or its own.
+fn held_icon<'a>(
+    models: &'a crate::bake::BlockModels,
+    item: &str,
+    hand: usize,
+    using: Option<Using>,
+) -> Option<&'a ItemIcon> {
+    let used = using
+        .filter(|u| u.hand == hand)
+        .and_then(|u| Some(models.hud.using.get(item)?.pick(u.ticks)));
+    used.or_else(|| models.hud.items.get(item))
 }
 
 /// An arm swinging (`ArmedEntityRenderState.currentSwing` and `swingAnimation`): which arm,
@@ -600,15 +643,38 @@ fn humanoid_parts(
     let mut right_arm = [(p + PI).cos() * 2.0 * s * 0.5, 0.0, 0.0];
     let mut left_arm = [p.cos() * 2.0 * s * 0.5, 0.0, 0.0];
     // `HumanoidModel.poseRightArm` and `poseLeftArm`: a player's arm holding an item
-    // (`ArmPose.ITEM`) swings half as far, raised a little. Mobs' arms stay `EMPTY`.
+    // (`ArmPose.ITEM`) swings half as far, raised a little; one raising a shield
+    // (`BLOCK`) holds it up across the body, following the head a little; and drawing a
+    // bow (`BOW_AND_ARROW`) raises both arms to aim where the head looks. Mobs' arms stay
+    // `EMPTY`.
     if matches!(l.kind, Kind::Player { .. }) {
-        for (arm, held) in [&mut right_arm, &mut left_arm]
+        let (head_x, head_y) = (l.pitch.to_radians(), l.head_yaw.to_radians());
+        let using = l.equipment.using.filter(|u| u.remaining > 0.0);
+        let bow = using.filter(|u| u.anim == UseAnim::Bow);
+        for (i, (arm, held)) in [&mut right_arm, &mut left_arm]
             .into_iter()
             .zip(&l.equipment.hands)
+            .enumerate()
         {
-            if held.is_some() {
-                arm[0] = arm[0] * 0.5 - PI / 10.0;
+            let sign = if i == 0 { -1.0 } else { 1.0 };
+            if bow.is_some() || held.is_none() {
+                continue;
             }
+            if using.is_some_and(|u| u.hand == i && u.anim == UseAnim::Block) {
+                arm[0] = arm[0] * 0.5 - 0.9424779 + head_x.clamp(-PI * 4.0 / 9.0, 0.43633232);
+                arm[1] = sign * 30f32.to_radians() + head_y.clamp(-PI / 6.0, PI / 6.0);
+            } else {
+                arm[0] = arm[0] * 0.5 - PI / 10.0;
+                arm[1] = 0.0;
+            }
+        }
+        if let Some(u) = bow {
+            // The other arm reaches further across to the string.
+            let reach = if u.hand == 0 { [0.0, 0.4] } else { [-0.4, 0.0] };
+            right_arm[1] = -0.1 + head_y + reach[0];
+            left_arm[1] = 0.1 + head_y + reach[1];
+            right_arm[0] = -PI / 2.0 + head_x;
+            left_arm[0] = -PI / 2.0 + head_x;
         }
     }
     // `HumanoidModel.setupAttackAnimation`: the body twists with the swing, carrying the
@@ -816,7 +882,11 @@ fn equipment(models: &crate::bake::BlockModels, l: &Living, light: [u8; 2], out:
     // forward, then placed by its model's hand transform.
     let nodes = humanoid_parts(l, [&[]; 3], ARMOR[3].1, zombie);
     for (i, held) in l.equipment.hands.iter().enumerate() {
-        let Some(icon) = held.as_ref().and_then(|item| models.hud.items.get(item)) else {
+        let using = l.equipment.using;
+        let Some(icon) = held
+            .as_ref()
+            .and_then(|item| held_icon(models, item, i, using))
+        else {
             continue;
         };
         let left = i == 1;
@@ -873,6 +943,8 @@ pub struct FirstPerson {
     /// How far the view has turned past where the hands have caught up to, in degrees
     /// (`viewXRot - xBob` and `viewYRot - yBob`); the hands lag a tenth of it.
     pub sway: [f32; 2],
+    /// The item being used, by hand, while it has ticks left.
+    pub using: Option<Using>,
 }
 
 /// `GameRenderer.renderItemInHand` and `FirstPersonHandsAndItemsRenderer.submitHandsWithItems`:
@@ -893,6 +965,13 @@ pub fn first_person(
         * Mat4::from_rotation_y((hands.sway[1] * 0.1).to_radians());
     let deg = |d: f32| d.to_radians();
     for (hand, item) in hands.items.iter().enumerate() {
+        // `evaluateWhichHandsToRender`: drawing a bow shows only the hand drawing it.
+        if hands
+            .using
+            .is_some_and(|u| u.anim == UseAnim::Bow && u.hand != hand)
+        {
+            continue;
+        }
         // `submitArmWithItem`: which arm holds this hand, and its swing.
         let left = (hand == 1) != hands.left_handed;
         let invert = if left { -1.0 } else { 1.0 };
@@ -941,13 +1020,29 @@ pub fn first_person(
             emit(&b.quads, camera.eye, [1.0; 3], light, &mut out);
             continue;
         };
-        let Some(icon) = models.hud.items.get(item) else {
+        let using = hands.using.filter(|u| u.hand == hand);
+        let Some(icon) = held_icon(models, item, hand, using) else {
             continue;
         };
-        // `applyItemArmTransform`, then `swingArm` for a whack in this hand.
-        let mut m =
-            root * Mat4::from_translation(Vec3::new(invert * 0.56, -0.52 + lowered * -0.6, -0.72));
-        if swing.is_some_and(|(_, kind, _)| kind == 1) {
+        // `applyItemArmTransform`, then `swingArm` for a whack in this hand, or how the
+        // item in use is held.
+        let arm = Mat4::from_translation(Vec3::new(invert * 0.56, -0.52 + lowered * -0.6, -0.72));
+        let mut m = match using {
+            Some(u) => match u.anim {
+                UseAnim::Eat | UseAnim::Drink => root * eat_transform(u, invert) * arm,
+                UseAnim::Bow => root * arm * bow_transform(u, invert),
+                UseAnim::Block if item != "minecraft:shield" => {
+                    root * arm
+                        * Mat4::from_translation(Vec3::new(invert * -0.14142136, 0.08, 0.14142136))
+                        * Mat4::from_rotation_x(deg(-102.25))
+                        * Mat4::from_rotation_y(deg(invert * 13.365))
+                        * Mat4::from_rotation_z(deg(invert * 78.05))
+                }
+                UseAnim::Block | UseAnim::None => root * arm,
+            },
+            None => root * arm,
+        };
+        if using.is_none() && swing.is_some_and(|(_, kind, _)| kind == 1) {
             let sqrt = attack.sqrt();
             let xz = (sqrt * PI).sin();
             m = m
@@ -975,6 +1070,44 @@ pub fn first_person(
         }
     }
     out
+}
+
+/// `FirstPersonHandsAndItemsRenderer.applyEatTransform`: the food bobs at the mouth, and
+/// is lifted in at the start, a jiggle that falls off sharply at the end.
+fn eat_transform(u: Using, invert: f32) -> Mat4 {
+    let deg = |d: f32| d.to_radians();
+    let time = u.remaining;
+    let scaled = time / u.duration as f32;
+    let mut m = Mat4::IDENTITY;
+    if scaled < 0.8 {
+        let bob = ((time / 4.0 * PI).cos() * 0.1).abs();
+        m *= Mat4::from_translation(Vec3::new(0.0, bob, 0.0));
+    }
+    let jiggle = 1.0 - scaled.powf(27.0);
+    m * Mat4::from_translation(Vec3::new(jiggle * 0.6 * invert, jiggle * -0.5, 0.0))
+        * Mat4::from_rotation_y(deg(invert * jiggle * 90.0))
+        * Mat4::from_rotation_x(deg(jiggle * 10.0))
+        * Mat4::from_rotation_z(deg(invert * jiggle * 30.0))
+}
+
+/// `submitArmWithItem`'s `BOW` case: the bow turned across the view, pulled back and
+/// stretched as it draws (`BowItem.getPowerForTime`), shaking once it's past a tenth.
+fn bow_transform(u: Using, invert: f32) -> Mat4 {
+    let deg = |d: f32| d.to_radians();
+    let held = u.duration as f32 - u.remaining;
+    let power = held / 20.0;
+    let power = ((power * power + power * 2.0) / 3.0).min(1.0);
+    let mut m = Mat4::from_translation(Vec3::new(invert * -0.2785682, 0.18344387, 0.15731531))
+        * Mat4::from_rotation_x(deg(-13.935))
+        * Mat4::from_rotation_y(deg(invert * 35.3))
+        * Mat4::from_rotation_z(deg(invert * -9.785));
+    if power > 0.1 {
+        let shake = ((held - 0.1) * 1.3).sin() * (power - 0.1);
+        m *= Mat4::from_translation(Vec3::new(0.0, shake * 0.004, 0.0));
+    }
+    m * Mat4::from_translation(Vec3::new(0.0, 0.0, power * 0.04))
+        * Mat4::from_scale(Vec3::new(1.0, 1.0, 1.0 + power * 0.2))
+        * Mat4::from_rotation_y(deg(-invert * 45.0))
 }
 
 /// `ScreenEffectRenderer.submitFire`: what a burning player sees, two cards of `fire_1`

@@ -40,6 +40,9 @@ const ATTACK_INDICATOR: [&str; 5] = [
     "hud/hotbar_attack_indicator_background",
     "hud/hotbar_attack_indicator_progress",
 ];
+/// `Hud.HOTBAR_OFFHAND_LEFT_SPRITE`: the off hand's slot, left of the hotbar for a
+/// right-handed player.
+const OFFHAND: &str = "hud/hotbar_offhand_left";
 /// `Entity.getMaxAirSupply` for a player: 15 seconds.
 const MAX_AIR: i32 = 300;
 
@@ -74,6 +77,7 @@ fn named_sprites() -> Vec<String> {
         .chain(FOOD)
         .chain(AIR)
         .chain(ATTACK_INDICATOR)
+        .chain([OFFHAND])
         .chain(BUTTON)
         .chain(menu::TEXT_FIELD)
         .chain(menu::TABS)
@@ -122,6 +126,8 @@ pub(crate) fn sprites() -> Vec<String> {
 #[derive(Clone)]
 pub struct HudArt {
     pub items: Arc<HashMap<String, ItemIcon>>,
+    /// What items that change while used (bows, shields) show then, by item.
+    pub using: Arc<HashMap<String, crate::item::UsingIcons>>,
     hotbar: [f32; 4],
     selection: [f32; 4],
     font: [f32; 4],
@@ -194,6 +200,7 @@ impl HudArt {
     ) -> Result<Self> {
         Ok(Self {
             items: Arc::new(items),
+            using: Default::default(),
             hotbar: atlas.sprite(HOTBAR).rect,
             selection: atlas.sprite(SELECTION).rect,
             font: atlas.sprite(FONT).rect,
@@ -224,17 +231,17 @@ impl HudArt {
     }
 }
 
-/// Each item's name key and rarity, from the `items.json` report (`[key, max stack, rarity,
-/// slot, equipment asset]`).
+/// Each item's name key and rarity, the first and third columns of the `items.json`
+/// report (see `mc_registry::ItemInfo`).
 pub(crate) fn item_names() -> Result<HashMap<String, (String, String)>> {
     let path = mc_registry::default_reports_dir().join("items.json");
-    type Report = (String, i32, String, Option<String>, Option<String>);
-    let items: HashMap<String, Report> = serde_json::from_slice(
+    let items: HashMap<String, Vec<serde_json::Value>> = serde_json::from_slice(
         &std::fs::read(&path).with_context(|| format!("{}", path.display()))?,
     )?;
+    let text = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map(str::to_owned);
     Ok(items
         .into_iter()
-        .map(|(item, (key, _, rarity, ..))| (item, (key, rarity)))
+        .filter_map(|(item, row)| Some((item, (text(row.first())?, text(row.get(2))?))))
         .collect())
 }
 
@@ -319,6 +326,8 @@ fn glyphs(res: &mc_assets::Resources) -> Result<HashMap<char, (u8, u8)>> {
 #[derive(Clone, Default, PartialEq)]
 pub struct Hotbar {
     pub slots: [Option<(String, i32)>; 9],
+    /// The item in the off hand, shown in its own slot when there is one.
+    pub offhand: Option<(String, i32)>,
     pub selected: u8,
     pub vitals: Option<Vitals>,
     /// The death screen, when the player has died.
@@ -705,6 +714,28 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
             bottom - 16.0 - 3.0,
         );
         mesh.slot_item(art, name, *count, x, y, 0.0, TEXT);
+    }
+    // `Hud.extractItemHotbar`'s off-hand slot, for a right-handed player.
+    if let Some((name, count)) = &hotbar.offhand {
+        let x = center - 91.0 - 29.0;
+        mesh.blit(
+            x,
+            bottom - 23.0,
+            BACK,
+            29.0,
+            24.0,
+            art.named[OFFHAND],
+            white,
+        );
+        mesh.slot_item(
+            art,
+            name,
+            *count,
+            center - 91.0 - 26.0,
+            bottom - 19.0,
+            0.0,
+            TEXT,
+        );
     }
     // `Hud.extractCrosshair`: the indicator a little below the crosshair.
     if let Some(indicator) = hotbar.attack_indicator {

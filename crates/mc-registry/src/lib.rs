@@ -46,6 +46,81 @@ pub struct ItemInfo {
     /// The equipment asset drawn where it's worn (`equippable`'s `asset_id`), such as
     /// `minecraft:diamond`.
     pub equipment: Option<String>,
+    /// What using it needs to know.
+    pub using: ItemUse,
+}
+
+/// An item's default components that using it depends on (`Item.use`,
+/// `getUseAnimation` and `getUseDuration`, and `LocalPlayer`'s slowdown).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ItemUse {
+    pub consumable: Option<Consumable>,
+    /// It's food: whether it can be eaten when the player isn't hungry
+    /// (`FoodProperties.canAlwaysEat`).
+    pub food: Option<bool>,
+    pub blocks_attacks: bool,
+    pub use_effects: UseEffects,
+    /// `Equippable.swappable`: using it puts it on.
+    pub swappable: bool,
+}
+
+impl Default for ItemUse {
+    fn default() -> Self {
+        Self {
+            consumable: None,
+            food: None,
+            blocks_attacks: false,
+            use_effects: UseEffects::default(),
+            swappable: true,
+        }
+    }
+}
+
+/// The `consumable` component.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Consumable {
+    /// `ItemUseAnimation`'s name, such as `eat` or `drink`.
+    pub animation: String,
+    pub consume_seconds: f32,
+    pub has_consume_particles: bool,
+    pub sound: String,
+}
+
+impl Default for Consumable {
+    fn default() -> Self {
+        Self {
+            animation: "eat".into(),
+            consume_seconds: 1.6,
+            has_consume_particles: true,
+            sound: "minecraft:entity.generic.eat".into(),
+        }
+    }
+}
+
+impl Consumable {
+    /// `consumeTicks`.
+    pub fn ticks(&self) -> i32 {
+        (self.consume_seconds * 20.0) as i32
+    }
+}
+
+/// The `use_effects` component.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct UseEffects {
+    pub can_sprint: bool,
+    pub speed_multiplier: f32,
+}
+
+impl Default for UseEffects {
+    fn default() -> Self {
+        Self {
+            can_sprint: false,
+            speed_multiplier: 0.2,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -197,20 +272,30 @@ impl Registry {
         let particle_types = names_by_id(&protocol_ids(&registries, "minecraft:particle_type")?);
         let sound_events = names_by_id(&protocol_ids(&registries, "minecraft:sound_event")?);
 
-        type Report = (String, i32, String, Option<String>, Option<String>);
+        type Report = (
+            String,
+            i32,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<ItemUse>,
+        );
         let item_info: HashMap<String, Report> = read_json(&reports_dir.join("items.json"))?;
         let item_info = item_info
             .into_iter()
-            .map(|(item, (name, max_stack, rarity, slot, equipment))| {
-                let info = ItemInfo {
-                    name,
-                    max_stack,
-                    rarity,
-                    slot,
-                    equipment,
-                };
-                (item, info)
-            })
+            .map(
+                |(item, (name, max_stack, rarity, slot, equipment, using))| {
+                    let info = ItemInfo {
+                        name,
+                        max_stack,
+                        rarity,
+                        slot,
+                        equipment,
+                        using: using.unwrap_or_default(),
+                    };
+                    (item, info)
+                },
+            )
             .collect();
 
         Ok(Self {

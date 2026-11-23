@@ -802,6 +802,7 @@ impl App {
                 scene.biomes.clone(),
                 mc_protocol::offline_uuid(&self.args.name),
                 self.vignette,
+                scene.models.hud.items.clone(),
             )?),
             None => None,
         };
@@ -2538,6 +2539,18 @@ impl winit::application::ApplicationHandler for App {
                         if let Some(state) = &mut self.state {
                             let mut hotbar = walker.hotbar();
                             hotbar.chat = self.chat.view(self.view.ticks as i32);
+                            // A screen the server opens frees the mouse, as `Gui.setScreen`
+                            // does, and the server closing it takes the mouse back.
+                            if walker.inventory_open() && self.captured {
+                                state.release();
+                                self.captured = false;
+                                self.keys.clear();
+                                self.toggles.release();
+                            }
+                            if walker.take_closed_screen() && !self.paused && self.menu.is_none() {
+                                self.captured = state.grab();
+                                self.toggles.restore(&self.bindings);
+                            }
                             if let Some(death) = &mut hotbar.death {
                                 // A screen frees the mouse, as `Gui.setScreen` does.
                                 if self.captured {
@@ -2575,6 +2588,16 @@ impl winit::application::ApplicationHandler for App {
                                 &walker.particles(),
                             ));
                             meshes.lightning = walker.lightning();
+                            for (pos, state, open, light) in walker.chest_lids() {
+                                if let Some(lid) = self
+                                    .models
+                                    .states
+                                    .get(state as usize)
+                                    .and_then(|s| s.lid.as_ref())
+                                {
+                                    meshes.cutout.extend(lid.vertices(pos, open, light));
+                                }
+                            }
                             renderer.set_entities(&meshes);
                             // F1 hides the hands with the HUD.
                             let hand = walker
@@ -2672,11 +2695,17 @@ impl winit::application::ApplicationHandler for App {
                     }
                 };
                 let target = frame.texture.create_view(&Default::default());
+                // `GameRenderer.getFov`: the FOV setting, narrowed while a bow is drawn.
+                let fov = self.walker.as_ref().map_or(1.0, |w| w.fov_modifier());
+                let camera = Camera {
+                    fov: self.args.camera.fov * fov,
+                    ..self.args.camera
+                };
                 state.renderer.render(
                     &target,
                     state.config.width,
                     state.config.height,
-                    &self.args.camera,
+                    &camera,
                     &self.view,
                 );
                 state.renderer.queue.present(frame);

@@ -99,6 +99,8 @@ pub struct BlockPhysics {
     /// at their tops.
     fences: Vec<bool>,
     walls_and_gates: Vec<bool>,
+    /// States whose block does something used with an empty hand (`useWithoutItem`).
+    interactive: Vec<bool>,
 }
 
 /// `SoundType`: the sound events a block plays when broken, walked on, placed, hit while
@@ -321,6 +323,20 @@ impl BlockPhysics {
                 }
                 air
             },
+            interactive: {
+                let mut states = vec![false; n];
+                for name in report["interactive"]
+                    .as_array()
+                    .context("physics.json has no interactive; run `cargo xtask gen-reports`")?
+                {
+                    let name = name.as_str().context("block name")?;
+                    if let Some(b) = registry.block(name) {
+                        let first = b.first_state as usize;
+                        states[first..first + b.state_count() as usize].fill(true);
+                    }
+                }
+                states
+            },
             fences: tagged("minecraft:fences")?,
             walls_and_gates: {
                 let walls = tagged("minecraft:walls")?;
@@ -456,6 +472,15 @@ impl BlockPhysics {
         self.sturdy
             .get(state as usize)
             .is_some_and(|s| s & 128 != 0)
+    }
+
+    /// Whether the block does something when used with an empty hand (its class overrides
+    /// `useWithoutItem`), so using an item on it may not use the item.
+    pub fn interactive(&self, state: u32) -> bool {
+        self.interactive
+            .get(state as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub fn friction(&self, state: u32) -> f32 {
@@ -621,6 +646,9 @@ pub struct Player {
     pub may_fly: bool,
     /// `Abilities.flyingSpeed`, 0.05 by default.
     pub flying_speed: f32,
+    /// While an item is in use: its `use_effects`' speed multiplier, and whether it lets
+    /// the player sprint (`LocalPlayer.itemUseSpeedMultiplier` and `isSlowDueToUsingItem`).
+    pub using_item: Option<(f32, bool)>,
     no_jump_delay: u32,
     jump_trigger_time: u32,
     was_jumping: bool,
@@ -677,6 +705,7 @@ impl Player {
             flying: false,
             may_fly: false,
             flying_speed: 0.05,
+            using_item: None,
             no_jump_delay: 0,
             jump_trigger_time: 0,
             was_jumping: false,
@@ -690,6 +719,11 @@ impl Player {
             first_tick: true,
             sounds: Vec::new(),
         }
+    }
+
+    /// `Entity.isShiftKeyDown`, which `isSecondaryUseActive` is.
+    pub fn shift_key_down(&self) -> bool {
+        self.shift_key_down
     }
 
     pub fn eye_height(&self) -> f64 {
@@ -853,6 +887,9 @@ impl Player {
         // `LocalPlayer.modifyInput`.
         if mv.length_squared() != 0.0 {
             mv *= 0.98;
+            if let Some((speed, _)) = self.using_item {
+                mv *= speed;
+            }
             if slowly {
                 mv *= 0.3; // `sneaking_speed`
             }
@@ -869,6 +906,7 @@ impl Player {
             && forward
             && (self.flying || !shallow)
             && (!slowly || self.under_water)
+            && !self.using_item.is_some_and(|(_, can_sprint)| !can_sprint)
         {
             self.sprinting = true;
         }

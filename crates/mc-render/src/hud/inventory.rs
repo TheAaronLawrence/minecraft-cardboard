@@ -1,14 +1,23 @@
-//! The survival inventory, as vanilla's `InventoryScreen` and `AbstractContainerScreen` draw
-//! it over the HUD: the dimmed world, the inventory texture, "Crafting", each slot's item (or
-//! the empty armour and offhand icons), the highlight on the slot under the mouse, the item
-//! on the cursor, and the hovered item's name in a tooltip. The player model isn't drawn yet.
+//! The survival inventory and the screens of chests, crafting tables and furnaces, as
+//! vanilla's `InventoryScreen`, `ContainerScreen`, `CraftingScreen` and `FurnaceScreen` draw
+//! them over the HUD with `AbstractContainerScreen`: the dimmed world, the screen's texture,
+//! its labels, each slot's item (or the empty armour and offhand icons), a furnace's flame
+//! and arrow, the highlight on the slot under the mouse, the item on the cursor, and the
+//! hovered item's name in a tooltip. The player model isn't drawn yet.
 
 use super::{GuiMesh, HudArt, SCREEN};
 
 const TEXTURE: &str = "minecraft:gui/container/inventory";
+const CHEST: &str = "minecraft:gui/container/generic_54";
+const CRAFTING: &str = "minecraft:gui/container/crafting_table";
+const FURNACE: &str = "minecraft:gui/container/furnace";
 
-/// The texture drawn whole, by its full id.
-pub(crate) const TEXTURES: [&str; 1] = [TEXTURE];
+/// The textures drawn whole, by their full ids.
+pub(crate) const TEXTURES: [&str; 4] = [TEXTURE, CHEST, CRAFTING, FURNACE];
+
+/// `FurnaceScreen`'s flame (14 × 14) and arrow (24 × 16).
+const LIT_PROGRESS: &str = "container/furnace/lit_progress";
+const BURN_PROGRESS: &str = "container/furnace/burn_progress";
 
 const HIGHLIGHT_BACK: &str = "container/slot_highlight_back";
 const HIGHLIGHT_FRONT: &str = "container/slot_highlight_front";
@@ -24,7 +33,9 @@ const EMPTY_ICONS: [&str; 5] = [
 ];
 
 /// The GUI sprites this screen draws by name.
-pub(crate) const SPRITES: [&str; 9] = [
+pub(crate) const SPRITES: [&str; 11] = [
+    LIT_PROGRESS,
+    BURN_PROGRESS,
     HIGHLIGHT_BACK,
     HIGHLIGHT_FRONT,
     TOOLTIP_BACKGROUND,
@@ -38,6 +49,82 @@ pub(crate) const SPRITES: [&str; 9] = [
 
 /// `AbstractContainerScreen.DEFAULT_IMAGE_WIDTH` and `_HEIGHT`.
 const IMAGE: (i32, i32) = (176, 166);
+
+/// Which menu a screen shows (`MenuType`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Menu {
+    /// `InventoryMenu`, the player's own.
+    #[default]
+    Player,
+    /// `ChestMenu` with this many rows: chests, barrels, ender chests.
+    Chest(u8),
+    /// `CraftingMenu`: 0 the result, 1 to 9 the grid.
+    Crafting,
+    /// `FurnaceMenu`: 0 the ingredient, 1 the fuel, 2 the result.
+    Furnace,
+}
+
+impl Menu {
+    /// The menu's own slots, before the player's inventory and hotbar (36 slots), which
+    /// every menu but the player's has after them.
+    pub fn own(self) -> usize {
+        match self {
+            Menu::Player => 9,
+            Menu::Chest(rows) => rows as usize * 9,
+            Menu::Crafting => 10,
+            Menu::Furnace => 3,
+        }
+    }
+
+    /// How many slots the menu has.
+    pub fn slot_count(self) -> usize {
+        match self {
+            Menu::Player => 46,
+            _ => self.own() + 36,
+        }
+    }
+
+    /// The screen's size (`imageWidth`, `imageHeight`): a chest's is 114 plus 18 a row.
+    pub fn image(self) -> (i32, i32) {
+        match self {
+            Menu::Chest(rows) => (176, 114 + rows as i32 * 18),
+            _ => IMAGE,
+        }
+    }
+
+    /// Where the menu puts slot `i`, from the screen's top left (`Slot.x`, `Slot.y`).
+    pub fn slot_position(self, i: usize) -> (i32, i32) {
+        let own = self.own();
+        let (inventory_top, own_slot) = match self {
+            Menu::Player => return slot_position(i),
+            // `ChestMenu`: rows of nine from (8, 18); the inventory 13 below them.
+            Menu::Chest(rows) => (
+                18 + rows as i32 * 18 + 13,
+                (8 + i as i32 % 9 * 18, 18 + i as i32 / 9 * 18),
+            ),
+            // `CraftingMenu`: the result at (124, 35), the grid from (30, 17).
+            Menu::Crafting => {
+                let g = i as i32 - 1;
+                let slot = match i {
+                    0 => (124, 35),
+                    _ => (30 + g % 3 * 18, 17 + g / 3 * 18),
+                };
+                (84, slot)
+            }
+            // `AbstractFurnaceMenu`.
+            Menu::Furnace => (84, [(56, 17), (56, 53), (116, 35)][i.min(2)]),
+        };
+        if i < own {
+            return own_slot;
+        }
+        // `addStandardInventorySlots`: three rows of nine, then the hotbar 58 below.
+        let j = (i - own) as i32;
+        match j {
+            0..27 => (8 + j % 9 * 18, inventory_top + j / 9 * 18),
+            _ => (8 + (j - 27) * 18, inventory_top + 58),
+        }
+    }
+}
 
 /// Depths: the dimming, the texture, the slot highlight behind the items, the items and
 /// their counts, the highlight in front, the carried item, then the tooltip.
@@ -53,7 +140,10 @@ pub type Stack = Option<(String, i32)>;
 /// What the inventory screen shows.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Inventory {
-    /// `InventoryMenu`'s 46 slots, as they show (with a drag's spread already in them).
+    pub menu: Menu,
+    /// The screen's title, from the server; the player's inventory has none.
+    pub title: String,
+    /// The menu's slots, as they show (with a drag's spread already in them).
     pub slots: Vec<Stack>,
     /// The item on the cursor.
     pub carried: Stack,
@@ -61,11 +151,15 @@ pub struct Inventory {
     pub dragged: Vec<u8>,
     /// Where the mouse is, in GUI pixels.
     pub mouse: Option<[f32; 2]>,
+    /// A furnace's fuel left (0 to 1) while it burns, and how far its cooking has got.
+    pub lit: Option<f32>,
+    pub burn: f32,
 }
 
 /// The screen's top left (`AbstractContainerScreen.init`'s `leftPos` and `topPos`).
-pub fn origin(width: i32, height: i32) -> (i32, i32) {
-    ((width - IMAGE.0) / 2, (height - IMAGE.1) / 2)
+pub fn origin(menu: Menu, width: i32, height: i32) -> (i32, i32) {
+    let (w, h) = menu.image();
+    ((width - w) / 2, (height - h) / 2)
 }
 
 /// Where `InventoryMenu` puts slot `i`, from the screen's top left: the crafting result,
@@ -85,20 +179,21 @@ pub fn slot_position(i: usize) -> (i32, i32) {
 
 /// `AbstractContainerScreen.getHoveredSlot`: the slot under `mouse`, a pixel of margin
 /// around its 16 × 16 (`isHovering`).
-pub fn slot_at(width: i32, height: i32, [mx, my]: [f32; 2]) -> Option<usize> {
-    let (left, top) = origin(width, height);
+pub fn slot_at(menu: Menu, width: i32, height: i32, [mx, my]: [f32; 2]) -> Option<usize> {
+    let (left, top) = origin(menu, width, height);
     let (mx, my) = (mx.floor() as i32 - left, my.floor() as i32 - top);
-    (0..46).find(|&i| {
-        let (x, y) = slot_position(i);
+    (0..menu.slot_count()).find(|&i| {
+        let (x, y) = menu.slot_position(i);
         mx >= x - 1 && mx < x + 17 && my >= y - 1 && my < y + 17
     })
 }
 
 /// `hasClickedOutside`: the mouse is off the screen's texture.
-pub fn outside(width: i32, height: i32, [mx, my]: [f32; 2]) -> bool {
-    let (left, top) = origin(width, height);
+pub fn outside(menu: Menu, width: i32, height: i32, [mx, my]: [f32; 2]) -> bool {
+    let (left, top) = origin(menu, width, height);
+    let (w, h) = menu.image();
     let (mx, my) = (mx.floor() as i32, my.floor() as i32);
-    mx < left || my < top || mx >= left + IMAGE.0 || my >= top + IMAGE.1
+    mx < left || my < top || mx >= left + w || my >= top + h
 }
 
 /// `Rarity`'s colours for an item's name.
@@ -127,36 +222,93 @@ impl GuiMesh {
                 light: [0; 4],
             });
         }
-        let (left, top) = origin(width, height);
-        let [u0, v0, u1, v1] = art.named[TEXTURE];
-        let part = [
-            u0,
-            v0,
-            u0 + (u1 - u0) * IMAGE.0 as f32 / 256.0,
-            v0 + (v1 - v0) * IMAGE.1 as f32 / 256.0,
-        ];
-        let (w, h) = (IMAGE.0 as f32, IMAGE.1 as f32);
-        self.blit(left as f32, top as f32, DIM + 1.0, w, h, part, [1.0; 4]);
-        // `extractLabels`: the title, 0x404040 and unshadowed.
-        let title = art
-            .lang
-            .get("container.crafting")
-            .map_or("container.crafting", String::as_str);
+        let menu = inv.menu;
+        let (left, top) = origin(menu, width, height);
+        let (image_w, image_h) = menu.image();
+        // Part of a 256 × 256 texture: `[u, v, w, h]` in its pixels, drawn at `[x, y]` from
+        // the screen's top left.
+        let part = |mesh: &mut Self, texture: &str, [u, v, w, h]: [i32; 4], [x, y]: [i32; 2]| {
+            let [u0, v0, u1, v1] = art.named[texture];
+            let at = |a: f32, b: f32, px: i32| a + (b - a) * px as f32 / 256.0;
+            let uv = [
+                at(u0, u1, u),
+                at(v0, v1, v),
+                at(u0, u1, u + w),
+                at(v0, v1, v + h),
+            ];
+            let (x, y) = ((left + x) as f32, (top + y) as f32);
+            mesh.blit(x, y, DIM + 1.0, w as f32, h as f32, uv, [1.0; 4]);
+        };
+        let whole = [0, 0, image_w, image_h];
+        match menu {
+            Menu::Player => part(self, TEXTURE, whole, [0, 0]),
+            // `ContainerScreen.extractBackground`: the rows, then the inventory below.
+            Menu::Chest(rows) => {
+                let rows_h = rows as i32 * 18 + 17;
+                part(self, CHEST, [0, 0, 176, rows_h], [0, 0]);
+                part(self, CHEST, [0, 126, 176, 96], [0, rows_h]);
+            }
+            Menu::Crafting => part(self, CRAFTING, whole, [0, 0]),
+            // `AbstractFurnaceScreen.extractBackground`: the flame shrinks from the top as
+            // the fuel burns, and the arrow grows as the item cooks.
+            Menu::Furnace => {
+                part(self, FURNACE, whole, [0, 0]);
+                let sprite = |name: &str, [u, v, w, h]: [i32; 4], sw: i32, sh: i32| {
+                    let [u0, v0, u1, v1] = art.named[name];
+                    let at = |a: f32, b: f32, px: i32, of: i32| a + (b - a) * px as f32 / of as f32;
+                    [
+                        at(u0, u1, u, sw),
+                        at(v0, v1, v, sh),
+                        at(u0, u1, u + w, sw),
+                        at(v0, v1, v + h, sh),
+                    ]
+                };
+                if let Some(lit) = inv.lit {
+                    let h = (lit * 13.0).ceil() as i32 + 1;
+                    let uv = sprite(LIT_PROGRESS, [0, 14 - h, 14, h], 14, 14);
+                    let (x, y) = ((left + 56) as f32, (top + 36 + 14 - h) as f32);
+                    self.blit(x, y, DIM + 2.0, 14.0, h as f32, uv, [1.0; 4]);
+                }
+                let w = (inv.burn * 24.0).ceil() as i32;
+                if w > 0 {
+                    let uv = sprite(BURN_PROGRESS, [0, 0, w, 16], 24, 16);
+                    let (x, y) = ((left + 79) as f32, (top + 34) as f32);
+                    self.blit(x, y, DIM + 2.0, w as f32, 16.0, uv, [1.0; 4]);
+                }
+            }
+        }
+        // `extractLabels`: the title, then (but in the player's inventory) "Inventory"
+        // above the player's slots, 0x404040 and unshadowed.
+        let lang = |key: &str| art.lang.get(key).map_or(key, String::as_str).to_owned();
         let grey = [64.0 / 255.0; 3];
-        let (tx, ty) = ((left + 97) as f32, (top + 6) as f32);
-        self.glyphs(art, title, tx, ty, DIM + 2.0, 1.0, grey);
+        let label = |mesh: &mut Self, text: &str, x: i32, y: i32| {
+            let (x, y) = ((left + x) as f32, (top + y) as f32);
+            mesh.glyphs(art, text, x, y, DIM + 2.0, 1.0, grey);
+        };
+        match menu {
+            Menu::Player => label(self, &lang("container.crafting"), 97, 6),
+            _ => {
+                let title_x = match menu {
+                    Menu::Crafting => 29,
+                    Menu::Furnace => (image_w - Self::text_width(art, &inv.title) as i32) / 2,
+                    _ => 8,
+                };
+                label(self, &inv.title, title_x, 6);
+                label(self, &lang("container.inventory"), 8, image_h - 94);
+            }
+        }
 
-        let hovered = inv.mouse.and_then(|m| slot_at(width, height, m));
+        let hovered = inv.mouse.and_then(|m| slot_at(menu, width, height, m));
         let highlight = |mesh: &mut Self, sprite: &str, z: f32| {
             if let Some(i) = hovered {
-                let (x, y) = slot_position(i);
+                let (x, y) = menu.slot_position(i);
                 let (x, y) = ((left + x - 4) as f32, (top + y - 4) as f32);
                 mesh.blit(x, y, z, 24.0, 24.0, art.named[sprite], [1.0; 4]);
             }
         };
         highlight(self, HIGHLIGHT_BACK, DIM + 3.0);
         for (i, stack) in inv.slots.iter().enumerate() {
-            let (x, y) = slot_position(i);
+            let (x, y) = menu.slot_position(i);
             let (x, y) = ((left + x) as f32, (top + y) as f32);
             match stack {
                 Some((name, count)) => {
@@ -169,6 +321,7 @@ impl GuiMesh {
                 }
                 None => {
                     let icon = match i {
+                        _ if menu != Menu::Player => None,
                         5..9 => Some(EMPTY_ICONS[i - 5]),
                         45 => Some(EMPTY_ICONS[4]),
                         _ => None,
@@ -271,8 +424,8 @@ mod tests {
     #[test]
     fn finds_slots_like_vanilla() {
         // At 480 × 270 the screen's top left is (152, 52).
-        assert_eq!(origin(480, 270), (152, 52));
-        let at = |x: f32, y: f32| slot_at(480, 270, [x, y]);
+        assert_eq!(origin(Menu::Player, 480, 270), (152, 52));
+        let at = |x: f32, y: f32| slot_at(Menu::Player, 480, 270, [x, y]);
         assert_eq!(at(152.0 + 154.0, 52.0 + 28.0), Some(0));
         assert_eq!(at(152.0 + 116.0, 52.0 + 36.0), Some(4));
         assert_eq!(at(152.0 + 7.0, 52.0 + 61.0), Some(8));
@@ -284,7 +437,25 @@ mod tests {
         assert_eq!(at(152.0 + 77.0, 52.0 + 62.0), Some(45));
         // Between the inventory's last row and the hotbar.
         assert_eq!(at(152.0 + 8.0, 52.0 + 139.0), None);
-        assert!(outside(480, 270, [151.0, 100.0]));
-        assert!(!outside(480, 270, [152.0, 52.0]));
+        assert!(outside(Menu::Player, 480, 270, [151.0, 100.0]));
+        assert!(!outside(Menu::Player, 480, 270, [152.0, 52.0]));
+    }
+
+    /// A container's player slots sit below its own: a three-row chest's inventory starts
+    /// 13 under its rows (y 85) and its hotbar 58 lower; the crafting grid's last slot and
+    /// a furnace's fuel are where their menus put them.
+    #[test]
+    fn places_container_slots_like_vanilla() {
+        let chest = Menu::Chest(3);
+        assert_eq!(chest.image(), (176, 168));
+        assert_eq!(chest.slot_position(26), (8 + 8 * 18, 18 + 2 * 18));
+        assert_eq!(chest.slot_position(27), (8, 85));
+        assert_eq!(chest.slot_position(62), (8 + 8 * 18, 143));
+        assert_eq!(Menu::Chest(6).slot_position(54), (8, 139));
+        assert_eq!(Menu::Crafting.slot_position(9), (66, 53));
+        assert_eq!(Menu::Crafting.slot_position(10), (8, 84));
+        assert_eq!(Menu::Furnace.slot_position(1), (56, 53));
+        assert_eq!(Menu::Furnace.slot_position(38), (8 + 8 * 18, 142));
+        assert_eq!(Menu::Furnace.slot_count(), 39);
     }
 }

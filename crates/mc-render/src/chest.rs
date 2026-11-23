@@ -1,8 +1,11 @@
 //! Chests, which vanilla draws in code (`ChestRenderer`) from an entity texture rather than
-//! a block model. The boxes and texture offsets are those of 26.3's `ChestModel`, closed.
+//! a block model. The boxes and texture offsets are those of 26.3's `ChestModel`. A closed
+//! chest is baked into its chunk whole; while its lid is open the chunk has only its body
+//! (`body`), and the lid is drawn each frame at its openness (`Lid::vertices`).
 
 use crate::atlas::Atlas;
 use crate::bake::{self, BakedModel, Dir, Quad};
+use crate::mesh::Vertex;
 use glam::{Quat, Vec3};
 
 /// Every chest texture, so the atlas loads them.
@@ -37,8 +40,105 @@ struct Box3 {
     open_side: Option<Dir>,
 }
 
-/// The chest model for a block state, or `None` if the block isn't a chest.
+/// The closed chest model for a block state, or `None` if the block isn't a chest.
 pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<BakedModel> {
+    let (quads, rotation) = model_quads(block, values, atlas)?;
+    Some(baked(quads.into_iter().map(|(_, q)| q), rotation))
+}
+
+/// The chest without its lid and lock, for a chunk while the lid is open.
+pub fn body(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<BakedModel> {
+    let (quads, rotation) = model_quads(block, values, atlas)?;
+    let body = quads.into_iter().filter(|(b, _)| *b == 0).map(|(_, q)| q);
+    Some(baked(body, rotation))
+}
+
+/// The chest's lid and lock, to draw at any openness.
+pub fn lid(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Lid> {
+    let (quads, rotation) = model_quads(block, values, atlas)?;
+    let quads = quads.into_iter().filter(|(b, _)| *b != 0).map(|(_, q)| q);
+    Some(Lid {
+        quads: quads.collect(),
+        rotation,
+    })
+}
+
+/// A chest's lid and lock in the model's own space (blocks, facing south), and the turn
+/// to the chest's facing.
+#[derive(Debug)]
+pub struct Lid {
+    quads: Vec<Quad>,
+    rotation: Quat,
+}
+
+impl Lid {
+    /// The lid's vertices for the chest at `pos`, `open` of the way open (`ChestModel
+    /// .setupAnim`: turned `open` × 90° up about its hinge, 9 pixels up at the back), lit
+    /// by `light` (sky and block, 0 to 15) and shaded as the chunk shades its faces.
+    pub fn vertices(&self, pos: [i32; 3], open: f32, [sky, block]: [u8; 2]) -> Vec<Vertex> {
+        let hinge = Vec3::new(0.0, 9.0, 1.0) / 16.0;
+        let turn = Quat::from_rotation_x(-open * std::f32::consts::FRAC_PI_2);
+        let center = Vec3::splat(0.5);
+        let origin = Vec3::from(pos.map(|c| c as f32));
+        let mut out = Vec::with_capacity(self.quads.len() * 4);
+        for q in &self.quads {
+            let p = q.pos.map(|p| {
+                let p = turn * (p - hinge) + hinge;
+                origin + self.rotation * (p - center) + center
+            });
+            let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            let shade = (normal * normal).dot(Vec3::new(
+                Dir::East.shade(),
+                if normal.y > 0.0 {
+                    Dir::Up.shade()
+                } else {
+                    Dir::Down.shade()
+                },
+                Dir::South.shade(),
+            ));
+            let c = (shade * 255.0).round() as u8;
+            for (p, uv) in p.iter().zip(q.uv) {
+                out.push(Vertex {
+                    pos: p.to_array(),
+                    uv,
+                    color: [c, c, c, 255],
+                    light: [sky.min(15) * 16, block.min(15) * 16, 0, 0],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Quads turned to the chest's facing, as a block entity's model: lit flat, without
+/// ambient occlusion.
+fn baked(quads: impl Iterator<Item = Quad>, rotation: Quat) -> BakedModel {
+    let center = Vec3::splat(0.5);
+    let quads = quads
+        .map(|q| {
+            let pos = q.pos.map(|p| bake::snap(rotation * (p - center) + center));
+            let dir = Dir::nearest(rotation * q.dir.normal());
+            Quad {
+                pos,
+                dir,
+                on_face: bake::lies_on_face(&pos, dir),
+                ..q
+            }
+        })
+        .collect();
+    BakedModel {
+        quads,
+        ambient_occlusion: false,
+    }
+}
+
+/// The chest's quads in model space (blocks, facing south), each with its box: 0 the
+/// bottom, 1 the lid and 2 the lock; and the turn to its facing.
+fn model_quads(
+    block: &str,
+    values: &[(&str, &str)],
+    atlas: &Atlas,
+) -> Option<(Vec<(usize, Quad)>, Quat)> {
     let name = block.strip_prefix("minecraft:").unwrap_or(block);
     let name = name.strip_prefix("waxed_").unwrap_or(name);
     let material = match name {
@@ -137,7 +237,7 @@ pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Bake
     let to_atlas = |u: f32, v: f32| [su0 + (su1 - su0) * u / 64.0, sv0 + (sv1 - sv0) * v / 64.0];
 
     let mut quads = Vec::new();
-    for b in &boxes {
+    for (index, b) in boxes.iter().enumerate() {
         let min = Vec3::from(b.from);
         let max = min + Vec3::from(b.size);
         let [w, h, d] = b.size;
@@ -164,24 +264,20 @@ pub fn model(block: &str, values: &[(&str, &str)], atlas: &Atlas) -> Option<Bake
                 debug_assert!(tv <= v1 + h + 1e-3);
                 to_atlas(tu, tv)
             });
-            let center = Vec3::splat(0.5);
-            let pos = corners.map(|p| bake::snap(rotation * (p / 16.0 - center) + center));
-            let dir = Dir::nearest(rotation * face.normal());
-            quads.push(Quad {
-                pos,
-                uv,
-                dir,
-                cull: None,
-                tint: -1,
-                shade: None,
-                layer: sprite.layer,
-                on_face: bake::lies_on_face(&pos, dir),
-            });
+            quads.push((
+                index,
+                Quad {
+                    pos: corners.map(|p| p / 16.0),
+                    uv,
+                    dir: face,
+                    cull: None,
+                    tint: -1,
+                    shade: None,
+                    layer: sprite.layer,
+                    on_face: false,
+                },
+            ));
         }
     }
-    // Block entities are lit flat, without ambient occlusion.
-    Some(BakedModel {
-        quads,
-        ambient_occlusion: false,
-    })
+    Some((quads, rotation))
 }

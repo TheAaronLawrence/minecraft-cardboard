@@ -1,6 +1,6 @@
 //! Particles: `SingleQuadParticle`s, sprites on quads that face the camera: the poof of
 //! smoke a mob leaves when it dies (`ExplodeParticle`), and the sparks and dark hearts of
-//! a hit (`CritParticle`).
+//! a hit (`CritParticle`), and crumbs of an item (`BreakingItemParticle`).
 
 use crate::atlas::Atlas;
 use crate::mesh::Vertex;
@@ -33,6 +33,8 @@ pub struct Particle {
     pub size: f32,
     /// Its sprite's id.
     pub sprite: &'static str,
+    /// Or the part of a sprite it shows, in atlas coordinates, as an item's crumbs do.
+    pub rect: Option<[f32; 4]>,
     /// Its tint (`rCol`, `gCol` and `bCol`).
     pub color: [f32; 3],
     /// The sky and block light where it is.
@@ -46,7 +48,7 @@ pub fn vertices(atlas: &Atlas, camera: &crate::gpu::Camera, particles: &[Particl
     let rotation = camera.rotation();
     let mut out = Vec::with_capacity(particles.len() * 4);
     for p in particles {
-        let [u0, v0, u1, v1] = atlas.sprite(p.sprite).rect;
+        let [u0, v0, u1, v1] = p.rect.unwrap_or_else(|| atlas.sprite(p.sprite).rect);
         let [r, g, b] = p.color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
         let [sky, block] = p.light;
         for ([x, y], uv) in [

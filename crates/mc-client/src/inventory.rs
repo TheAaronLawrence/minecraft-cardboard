@@ -1,12 +1,16 @@
-//! The player's inventory as the client keeps it: `InventoryMenu`'s 46 slots and the item on
-//! the cursor, and `InventoryScreen`'s mouse and keys. Each click is predicted as
+//! The open screen's menu as the client keeps it: the player's own (`InventoryMenu`'s 46
+//! slots), or a chest, crafting table or furnace the server opened, whose own slots come
+//! before the player's inventory and hotbar; the item on the cursor; and
+//! `AbstractContainerScreen`'s mouse and keys. Each click is predicted as
 //! `AbstractContainerMenu.doClick` does and sent as `MultiPlayerGameMode.handleContainerInput`
 //! does, with the slots it changed, so the server only corrects what we got wrong.
 //!
-//! Slots: 0 the crafting result, 1 to 4 the grid, 5 to 8 armour (head first), 9 to 35 the
-//! inventory, 36 to 44 the hotbar, 45 the offhand.
+//! The player's slots: 0 the crafting result, 1 to 4 the grid, 5 to 8 armour (head first),
+//! 9 to 35 the inventory, 36 to 44 the hotbar, 45 the offhand. A container's slot `own + j`
+//! is the player's slot `9 + j`, as `addStandardInventorySlots` adds them.
 
 use mc_protocol::codec::Put;
+use mc_render::hud::inventory::Menu;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -22,6 +26,8 @@ const PICKUP_ALL: i32 = 6;
 /// The slot number of a click outside the screen.
 const OUTSIDE: i32 = -999;
 const SLOTS: usize = 46;
+/// The player's first inventory slot, which a container's slot `own` is.
+const INVENTORY: usize = 9;
 /// The armour slots' `EquipmentSlot`s, from slot 5.
 const ARMOR: [&str; 4] = ["head", "chest", "legs", "feet"];
 
@@ -36,13 +42,31 @@ fn with_count(name: &str, count: i32) -> Stack {
     (count > 0).then(|| (name.to_owned(), count))
 }
 
+/// A menu the server opened (`ClientboundOpenScreenPacket`).
+struct Container {
+    id: i32,
+    menu: Menu,
+    title: String,
+    /// The menu's own slots; the rest are the player's.
+    own: Vec<Stack>,
+    state_id: i32,
+    /// `ContainerData`: a furnace's lit time, lit duration, cooking progress and cooking
+    /// total time.
+    data: [i32; 4],
+}
+
 pub struct Inventory {
+    /// The player's `InventoryMenu` slots, which a container shows from slot 9 on.
     pub slots: Vec<Stack>,
     pub carried: Stack,
-    /// The server's count of the menu's changes, which each click echoes.
+    /// The server's count of the player menu's changes, which each click echoes.
     state_id: i32,
     items: HashMap<String, Item>,
     open: bool,
+    /// The container open, if it isn't the player's own menu.
+    container: Option<Container>,
+    /// The server closed the screen, so the game takes the mouse back.
+    closed_by_server: bool,
     /// `AbstractContainerMenu`'s drag (`quickcraftStatus`, `quickcraftType`, its slots).
     qc_status: i32,
     qc_type: i32,
@@ -76,6 +100,8 @@ impl Inventory {
             state_id: 0,
             items,
             open: false,
+            container: None,
+            closed_by_server: false,
             qc_status: 0,
             qc_type: 0,
             qc_slots: Vec::new(),
@@ -87,16 +113,65 @@ impl Inventory {
         }
     }
 
-    /// The server set these slots (and maybe the state id).
-    pub fn set(&mut self, state_id: Option<i32>, slots: Vec<(u8, Stack)>) {
-        if let Some(id) = state_id {
-            self.state_id = id;
+    /// The server set these slots of menu `container` (and maybe its state id): the
+    /// player's (0), or the open container's. Another menu's are stale and go.
+    pub fn set(&mut self, container: i32, state_id: Option<i32>, slots: Vec<(u8, Stack)>) {
+        if container == 0 {
+            if let Some(id) = state_id {
+                self.state_id = id;
+            }
+            for (slot, stack) in slots {
+                if let Some(s) = self.slots.get_mut(slot as usize) {
+                    *s = stack;
+                }
+            }
+            return;
         }
+        let Some(c) = self.container.as_mut().filter(|c| c.id == container) else {
+            return;
+        };
+        if let Some(id) = state_id {
+            c.state_id = id;
+        }
+        let len = c.menu.slot_count();
         for (slot, stack) in slots {
-            if let Some(s) = self.slots.get_mut(slot as usize) {
-                *s = stack;
+            if (slot as usize) < len {
+                self.put(slot as usize, stack);
             }
         }
+    }
+
+    /// Which menu is open (the player's when none is).
+    pub fn menu(&self) -> Menu {
+        self.container.as_ref().map_or(Menu::Player, |c| c.menu)
+    }
+
+    fn len(&self) -> usize {
+        self.menu().slot_count()
+    }
+
+    /// The open menu's slot `i`.
+    fn get(&self, i: usize) -> &Stack {
+        match &self.container {
+            Some(c) if i < c.own.len() => &c.own[i],
+            Some(c) => &self.slots[INVENTORY + i - c.own.len()],
+            None => &self.slots[i],
+        }
+    }
+
+    fn put(&mut self, i: usize, stack: Stack) {
+        match &mut self.container {
+            Some(c) if i < c.own.len() => c.own[i] = stack,
+            Some(c) => self.slots[INVENTORY + i - c.own.len()] = stack,
+            None => self.slots[i] = stack,
+        }
+    }
+
+    /// The open menu's container id and state id, which clicks and closing send.
+    fn ids(&self) -> (i32, i32) {
+        self.container
+            .as_ref()
+            .map_or((0, self.state_id), |c| (c.id, c.state_id))
     }
 
     pub fn is_open(&self) -> bool {
@@ -105,20 +180,76 @@ impl Inventory {
 
     pub fn open(&mut self) {
         self.open = true;
+        self.container = None;
         self.last_click = None;
     }
 
-    /// `AbstractContainerScreen.onClose`: `ServerboundContainerClosePacket`, then
-    /// `InventoryMenu.removed` drops what's on the cursor (the server drops it in the world)
-    /// and clears the crafting result; the server moves the grid back into the inventory.
-    pub fn close(&mut self, outbox: &mc_protocol::Outbox) -> anyhow::Result<()> {
-        self.open = false;
-        (self.carried, self.slots[0]) = (None, None);
+    /// `ClientPacketListener.handleOpenScreen`: the server opened a container, over any
+    /// screen that was open (`MenuScreens.create`).
+    pub fn open_container(&mut self, id: i32, menu: Menu, title: String) {
         self.reset_drag();
-        self.qc_status = 0;
-        self.qc_slots.clear();
+        self.reset_quick_craft();
+        self.container = Some(Container {
+            id,
+            menu,
+            title,
+            own: vec![None; menu.own()],
+            state_id: 0,
+            data: [0; 4],
+        });
+        self.open = true;
+        self.last_click = None;
+    }
+
+    /// `handleContainerSetData`.
+    pub fn set_data(&mut self, container: i32, id: i16, value: i16) {
+        if let Some(c) = self.container.as_mut().filter(|c| c.id == container)
+            && let Some(d) = c.data.get_mut(id as usize)
+        {
+            *d = value as i32;
+        }
+    }
+
+    /// `handleContainerClose`: `LocalPlayer.clientSideCloseContainer`, which closes the
+    /// screen without telling the server.
+    pub fn server_close(&mut self, container: i32) {
+        if self.open && self.ids().0 == container {
+            self.open = false;
+            self.carried = None;
+            self.container = None;
+            self.reset_drag();
+            self.reset_quick_craft();
+            self.closed_by_server = true;
+        }
+    }
+
+    /// Whether the server closed the screen since this was last asked.
+    pub fn take_closed_by_server(&mut self) -> bool {
+        std::mem::take(&mut self.closed_by_server)
+    }
+
+    /// `AbstractContainerScreen.onClose`: `ServerboundContainerClosePacket`, then the menu's
+    /// `removed` drops what's on the cursor (the server drops it in the world); the player's
+    /// clears its crafting result, and the server moves crafting grids back into the
+    /// inventory.
+    pub fn close(&mut self, outbox: &mc_protocol::Outbox) -> anyhow::Result<()> {
+        let id = self.ids().0;
+        self.open = false;
+        self.carried = None;
+        if self.container.take().is_none() {
+            self.slots[0] = None;
+        }
+        self.reset_drag();
+        self.reset_quick_craft();
         let mut body = Vec::new();
-        body.put_varint(0);
+        body.put_varint(id);
+        outbox.send("container_close", &body)
+    }
+
+    /// Closes a menu the server opened that this game can't show yet.
+    pub fn refuse(outbox: &mc_protocol::Outbox, id: i32) -> anyhow::Result<()> {
+        let mut body = Vec::new();
+        body.put_varint(id);
         outbox.send("container_close", &body)
     }
 
@@ -126,17 +257,27 @@ impl Inventory {
         self.items.get(name).map_or(64, |i| i.max)
     }
 
-    /// `Slot.getMaxStackSize(stack)`: armour slots hold one, the rest the inventory's 99.
+    /// `Slot.getMaxStackSize(stack)`: armour slots hold one, the rest a container's 99.
     fn max_in(&self, slot: usize, name: &str) -> i32 {
-        let limit = if (5..9).contains(&slot) { 1 } else { 99 };
-        self.max_of(name).min(limit)
+        let armour = self.menu() == Menu::Player && (5..9).contains(&slot);
+        self.max_of(name).min(if armour { 1 } else { 99 })
     }
 
-    /// `Slot.mayPlace`: nothing goes into the result, and armour only where it's worn.
+    /// The menu's result slot, which takes nothing (`ResultSlot`, `FurnaceResultSlot`).
+    fn is_result(&self, slot: usize) -> bool {
+        match self.menu() {
+            Menu::Player | Menu::Crafting => slot == 0,
+            Menu::Furnace => slot == 2,
+            Menu::Chest(_) => false,
+        }
+    }
+
+    /// `Slot.mayPlace`: nothing goes into a result, and armour only where it's worn. A
+    /// furnace's fuel slot takes only fuel, which isn't known here; the server corrects it.
     fn may_place(&self, slot: usize, name: &str) -> bool {
         match slot {
-            0 => false,
-            5..9 => {
+            _ if self.is_result(slot) => false,
+            5..9 if self.menu() == Menu::Player => {
                 let worn = self.items.get(name).and_then(|i| i.slot.as_deref());
                 worn == Some(ARMOR[slot - 5])
             }
@@ -144,10 +285,21 @@ impl Inventory {
         }
     }
 
+    /// The open menu's slot for hotbar slot `n` (0 to 8), or 40 for the offhand, which only
+    /// the player's menu has.
+    fn hotbar_slot(&self, n: i32) -> Option<usize> {
+        match (self.menu(), n) {
+            (Menu::Player, 40) => Some(45),
+            (Menu::Player, _) => Some(36 + n as usize),
+            (_, 40) => None,
+            (menu, _) => Some(menu.own() + 27 + n as usize),
+        }
+    }
+
     /// `canItemQuickReplace` ignoring size: the slot is empty, or holds the same item and
     /// not more than a stack.
     fn can_quick_replace(&self, slot: usize, name: &str) -> bool {
-        match &self.slots[slot] {
+        match self.get(slot) {
             None => true,
             Some((n, c)) => n == name && *c <= self.max_of(name),
         }
@@ -175,21 +327,22 @@ impl Inventory {
         if !self.may_place(slot, &name) {
             return;
         }
-        let have = match &self.slots[slot] {
+        let have = match self.get(slot) {
             None => 0,
             Some((n, c)) if *n == name => *c,
             Some(_) => return,
         };
         let moved = amount.min(count).min(self.max_in(slot, &name) - have);
         if moved > 0 {
-            self.slots[slot] = Some((name.clone(), have + moved));
+            self.put(slot, Some((name.clone(), have + moved)));
             self.carried = with_count(&name, count - moved);
         }
     }
 
-    /// `AbstractContainerMenu.doClick`, as far as the inventory goes. Bundles, recipes and
-    /// item behaviours on click aren't predicted; the server corrects them.
+    /// `AbstractContainerMenu.doClick` on the open menu. Bundles, recipes and item
+    /// behaviours on click aren't predicted; the server corrects them.
     fn do_click(&mut self, slot: i32, button: i32, input: i32, creative: bool) {
+        let len = self.len();
         if input == QUICK_CRAFT {
             let expected = self.qc_status;
             self.qc_status = button & 3;
@@ -209,7 +362,7 @@ impl Inventory {
             } else if self.qc_status == 1 {
                 let (name, count) = self.carried.clone().expect("checked above");
                 let s = slot as usize;
-                if s < SLOTS
+                if s < len
                     && self.can_drag_to(s, &name)
                     && (self.qc_type == 2 || count > self.qc_slots.len() as i32)
                     && !self.qc_slots.contains(&s)
@@ -229,11 +382,11 @@ impl Inventory {
                 let n = self.qc_slots.len();
                 for s in self.qc_slots.clone() {
                     if self.can_drag_to(s, &name) && (self.qc_type == 2 || count >= n as i32) {
-                        let carry = self.slots[s].as_ref().map_or(0, |(_, c)| *c);
+                        let carry = self.get(s).as_ref().map_or(0, |(_, c)| *c);
                         let share = self.place_count(n, self.qc_type, &name, count);
                         let new = (share + carry).min(self.max_in(s, &name));
                         remaining -= new - carry;
-                        self.slots[s] = Some((name.clone(), new));
+                        self.put(s, Some((name.clone(), new)));
                     }
                 }
                 self.carried = with_count(&name, remaining);
@@ -259,12 +412,12 @@ impl Inventory {
                             with_count(&name, count - 1)
                         };
                     }
-                } else if slot < 0 || slot as usize >= SLOTS {
+                } else if slot < 0 || slot as usize >= len {
                 } else if input == QUICK_MOVE {
                     let s = slot as usize;
                     let mut moved = self.quick_move_stack(s);
                     while let Some((name, _)) = &moved
-                        && self.slots[s].as_ref().is_some_and(|(n, _)| n == name)
+                        && self.get(s).as_ref().is_some_and(|(n, _)| n == name)
                     {
                         moved = self.quick_move_stack(s);
                     }
@@ -273,41 +426,37 @@ impl Inventory {
                 }
             }
             SWAP if (0..9).contains(&button) || button == 40 => {
-                self.swap(
-                    slot as usize,
-                    if button == 40 {
-                        45
-                    } else {
-                        36 + button as usize
-                    },
-                );
+                if let Some(source) = self.hotbar_slot(button)
+                    && (0..len as i32).contains(&slot)
+                {
+                    self.swap(slot as usize, source);
+                }
             }
-            THROW if self.carried.is_none() && (0..SLOTS as i32).contains(&slot) => {
+            THROW if self.carried.is_none() && (0..len as i32).contains(&slot) => {
                 let s = slot as usize;
-                if let Some((name, count)) = self.slots[s].clone() {
-                    self.slots[s] = if primary {
+                if let Some((name, count)) = self.get(s).clone() {
+                    let left = if primary {
                         with_count(&name, count - 1)
                     } else {
                         None
                     };
+                    self.put(s, left);
                 }
             }
-            PICKUP_ALL if (0..SLOTS as i32).contains(&slot) => {
-                self.pickup_all(slot as usize, button)
-            }
+            PICKUP_ALL if (0..len as i32).contains(&slot) => self.pickup_all(slot as usize, button),
             _ => {}
         }
     }
 
     /// A left (`primary`) or right click on a slot.
     fn pickup(&mut self, s: usize, primary: bool) {
-        match (self.slots[s].clone(), self.carried.clone()) {
+        match (self.get(s).clone(), self.carried.clone()) {
             (None, Some((_, count))) => self.insert(s, if primary { count } else { 1 }),
             (None, None) => {}
             // Take it all, or half rounded up.
             (Some((name, count)), None) => {
                 let amount = if primary { count } else { (count + 1) / 2 };
-                self.slots[s] = with_count(&name, count - amount);
+                self.put(s, with_count(&name, count - amount));
                 self.carried = Some((name, amount));
             }
             (Some((clicked, have)), Some((name, count))) => {
@@ -315,14 +464,14 @@ impl Inventory {
                     if clicked == name {
                         self.insert(s, if primary { count } else { 1 });
                     } else if count <= self.max_in(s, &name) {
-                        self.slots[s] = Some((name, count));
+                        self.put(s, Some((name, count)));
                         self.carried = Some((clicked, have));
                     }
                 } else if clicked == name {
                     // Such as the crafting result: added to the cursor's stack.
                     let take = have.min(self.max_of(&name) - count);
                     if take > 0 {
-                        self.slots[s] = with_count(&clicked, have - take);
+                        self.put(s, with_count(&clicked, have - take));
                         self.carried = Some((name, count + take));
                     }
                 }
@@ -330,32 +479,63 @@ impl Inventory {
         }
     }
 
-    /// `InventoryMenu.quickMoveStack`: where shift-clicking a slot sends its items. Returns
-    /// what was in the slot, or `None` when nothing moved.
+    /// The open menu's `quickMoveStack`: where shift-clicking a slot sends its items.
+    /// Returns what was in the slot, or `None` when nothing moved.
     fn quick_move_stack(&mut self, s: usize) -> Stack {
-        let (name, count) = self.slots[s].clone()?;
-        let worn = self.items.get(&name).and_then(|i| i.slot.clone());
-        let armor = ARMOR
-            .iter()
-            .position(|a| Some(*a) == worn.as_deref())
-            .map(|i| 5 + i);
+        let (name, count) = self.get(s).clone()?;
         let mut left = count;
-        let (start, end, backwards) = match s {
-            0 => (9, 45, true),
-            1..9 => (9, 45, false),
-            _ if armor.is_some_and(|a| self.slots[a].is_none()) => {
-                let a = armor.expect("checked");
-                (a, a + 1, false)
-            }
-            _ if worn.as_deref() == Some("offhand") && self.slots[45].is_none() => (45, 46, false),
-            9..36 => (36, 45, false),
-            36..45 => (9, 36, false),
-            _ => (9, 45, false),
+        let menu = self.menu();
+        let own = menu.own();
+        let mut to = |inv: &mut Self, start: usize, end: usize, backwards: bool| {
+            inv.move_to(&name, &mut left, start, end, backwards)
         };
-        if !self.move_to(&name, &mut left, start, end, backwards) {
+        let moved = match menu {
+            // `InventoryMenu`.
+            Menu::Player => {
+                let worn = self.items.get(&name).and_then(|i| i.slot.clone());
+                let armor = ARMOR
+                    .iter()
+                    .position(|a| Some(*a) == worn.as_deref())
+                    .map(|i| 5 + i);
+                match s {
+                    0 => to(self, 9, 45, true),
+                    1..9 => to(self, 9, 45, false),
+                    _ if armor.is_some_and(|a| self.slots[a].is_none()) => {
+                        let a = armor.expect("checked");
+                        to(self, a, a + 1, false)
+                    }
+                    _ if worn.as_deref() == Some("offhand") && self.slots[45].is_none() => {
+                        to(self, 45, 46, false)
+                    }
+                    9..36 => to(self, 36, 45, false),
+                    36..45 => to(self, 9, 36, false),
+                    _ => to(self, 9, 45, false),
+                }
+            }
+            // `ChestMenu`: out of the chest into the player's slots, hotbar end first;
+            // from the player's into the chest.
+            Menu::Chest(_) if s < own => to(self, own, menu.slot_count(), true),
+            Menu::Chest(_) => to(self, 0, own, false),
+            // `CraftingMenu`: the result into the player's slots; theirs into the grid,
+            // failing that between the inventory and the hotbar.
+            Menu::Crafting => match s {
+                0 => to(self, 10, 46, true),
+                10..37 => to(self, 1, 10, false) || to(self, 37, 46, false),
+                37..46 => to(self, 1, 10, false) || to(self, 10, 37, false),
+                _ => to(self, 10, 46, false),
+            },
+            // `AbstractFurnaceMenu`: whether the player's item smelts or burns isn't known
+            // here, so the server moves those.
+            Menu::Furnace => match s {
+                2 => to(self, 3, 39, true),
+                0 | 1 => to(self, 3, 39, false),
+                _ => return None,
+            },
+        };
+        if !moved {
             return None;
         }
-        self.slots[s] = with_count(&name, left);
+        self.put(s, with_count(&name, left));
         (left != count).then_some((name, count))
     }
 
@@ -380,23 +560,23 @@ impl Inventory {
                 if *left == 0 {
                     break;
                 }
-                let Some((n, c)) = self.slots[d].clone() else {
+                let Some((n, c)) = self.get(d).clone() else {
                     continue;
                 };
                 let max = self.max_in(d, name);
                 if n == name && c < max {
                     let moved = (*left).min(max - c);
                     *left -= moved;
-                    self.slots[d] = Some((n, c + moved));
+                    self.put(d, Some((n, c + moved)));
                     changed = true;
                 }
             }
         }
         if *left > 0 {
             for &d in &order {
-                if self.slots[d].is_none() && self.may_place(d, name) {
+                if self.get(d).is_none() && self.may_place(d, name) {
                     let moved = (*left).min(self.max_in(d, name));
-                    self.slots[d] = Some((name.to_owned(), moved));
+                    self.put(d, Some((name.to_owned(), moved)));
                     *left -= moved;
                     changed = true;
                     break;
@@ -406,15 +586,14 @@ impl Inventory {
         changed
     }
 
-    /// A number key (or F for the offhand) over a slot: swaps it with that hotbar slot.
+    /// A number key (or F for the offhand) over a slot: swaps it with the menu's slot
+    /// `source` for that hotbar slot.
     fn swap(&mut self, s: usize, source: usize) {
-        if s >= SLOTS {
-            return;
-        }
-        match (self.slots[source].clone(), self.slots[s].clone()) {
+        match (self.get(source).clone(), self.get(s).clone()) {
             (None, None) => {}
             (None, Some(target)) => {
-                (self.slots[source], self.slots[s]) = (Some(target), None);
+                self.put(source, Some(target));
+                self.put(s, None);
             }
             (Some((name, count)), target) => {
                 if !self.may_place(s, &name) {
@@ -424,11 +603,11 @@ impl Inventory {
                 if count > max {
                     // Splits; a target that was there goes elsewhere in the inventory,
                     // which the server works out.
-                    self.slots[s] = Some((name.clone(), max));
-                    self.slots[source] = Some((name, count - max));
+                    self.put(s, Some((name.clone(), max)));
+                    self.put(source, Some((name, count - max)));
                 } else {
-                    self.slots[source] = target;
-                    self.slots[s] = Some((name, count));
+                    self.put(source, target);
+                    self.put(s, Some((name, count)));
                 }
             }
         }
@@ -439,31 +618,33 @@ impl Inventory {
         let Some((name, mut count)) = self.carried.clone() else {
             return;
         };
-        if self.slots[s].is_some() {
+        if self.get(s).is_some() {
             return;
         }
         let max = self.max_of(&name);
+        let len = self.len();
         let order: Vec<usize> = if button == 0 {
-            (0..SLOTS).collect()
+            (0..len).collect()
         } else {
-            (0..SLOTS).rev().collect()
+            (0..len).rev().collect()
         };
+        let crafted = matches!(self.menu(), Menu::Player | Menu::Crafting);
         for pass in 0..2 {
             for &i in &order {
                 if count >= max {
                     break;
                 }
-                // `InventoryMenu.canTakeItemForPickAll`: not from the crafting result.
-                if i == 0 {
+                // `canTakeItemForPickAll`: not from a crafting result.
+                if crafted && i == 0 {
                     continue;
                 }
-                if let Some((n, c)) = self.slots[i].clone()
+                if let Some((n, c)) = self.get(i).clone()
                     && n == name
                     && c <= max
                     && (pass != 0 || c != max)
                 {
                     let take = c.min(max - count);
-                    self.slots[i] = with_count(&n, c - take);
+                    self.put(i, with_count(&n, c - take));
                     count += take;
                 }
             }
@@ -511,19 +692,21 @@ impl Inventory {
         input: i32,
         creative: bool,
     ) -> anyhow::Result<()> {
-        let before = self.slots.clone();
+        let len = self.len();
+        let before: Vec<Stack> = (0..len).map(|i| self.get(i).clone()).collect();
         self.do_click(slot, button, input, creative);
-        let changed: Vec<usize> = (0..SLOTS).filter(|&i| before[i] != self.slots[i]).collect();
+        let changed: Vec<usize> = (0..len).filter(|&i| before[i] != *self.get(i)).collect();
+        let (container, state_id) = self.ids();
         let mut body = Vec::new();
-        body.put_varint(0)
-            .put_varint(self.state_id)
+        body.put_varint(container)
+            .put_varint(state_id)
             .put_u16(slot as i16 as u16)
             .put_u8(button as u8)
             .put_varint(input)
             .put_varint(changed.len() as i32);
         for i in changed {
             body.put_u16(i as u16);
-            self.put_hashed(&mut body, &self.slots[i]);
+            self.put_hashed(&mut body, self.get(i));
         }
         self.put_hashed(&mut body, &self.carried.clone());
         outbox.send("container_click", &body)
@@ -668,7 +851,7 @@ impl Inventory {
             InventoryKey::Offhand if self.carried.is_none() => {
                 self.click(outbox, s as i32, 40, SWAP, creative)
             }
-            InventoryKey::Drop { all } if self.slots[s].is_some() => {
+            InventoryKey::Drop { all } if self.get(s).is_some() => {
                 self.click(outbox, s as i32, all as i32, THROW, creative)
             }
             _ => Ok(()),
@@ -678,7 +861,7 @@ impl Inventory {
     /// What the screen draws: during a drag over more than one slot, each slot with its
     /// share and the cursor with what's left (`extractSlot`, `recalculateQuickCraftRemaining`).
     pub fn view(&self, mouse: Option<[f32; 2]>) -> mc_render::hud::inventory::Inventory {
-        let mut slots = self.slots.clone();
+        let mut slots: Vec<Stack> = (0..self.len()).map(|i| self.get(i).clone()).collect();
         let mut carried = self.carried.clone();
         let mut dragged = Vec::new();
         if let (Some((_, kind)), Some((name, count))) = (self.dragging, &self.carried)
@@ -698,11 +881,25 @@ impl Inventory {
             }
             carried = Some((name.clone(), remaining));
         }
+        // `AbstractFurnaceMenu.getLitProgress` and `getBurnProgress`.
+        let [lit, duration, progress, total] = self.container.as_ref().map_or([0; 4], |c| c.data);
+        let fraction = |a: i32, b: i32| (a as f32 / b as f32).clamp(0.0, 1.0);
         mc_render::hud::inventory::Inventory {
+            menu: self.menu(),
+            title: self
+                .container
+                .as_ref()
+                .map_or(String::new(), |c| c.title.clone()),
             slots,
             carried,
             dragged,
             mouse,
+            lit: (lit > 0).then(|| fraction(lit, if duration == 0 { 200 } else { duration })),
+            burn: if total != 0 && progress != 0 {
+                fraction(progress, total)
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -779,5 +976,33 @@ mod tests {
             ]
         );
         assert_eq!(inv.carried, stack("ender_pearl", 1));
+    }
+
+    /// In a three-row chest the player's slot 9 is the menu's 27: shift-clicking it fills
+    /// the chest's first slot, and shift-clicking that sends it to the hotbar's last slot
+    /// first, as `ChestMenu.quickMoveStack` moves backwards. In a crafting table the
+    /// player's items go into the grid.
+    #[test]
+    fn predicts_container_clicks_like_vanilla() {
+        let mut inv = inventory();
+        inv.slots[9] = stack("stone", 10);
+        inv.open_container(3, Menu::Chest(3), "Chest".into());
+        assert_eq!(inv.get(27), &stack("stone", 10));
+        inv.do_click(27, 0, QUICK_MOVE, false);
+        assert_eq!((inv.get(0), &inv.slots[9]), (&stack("stone", 10), &None));
+        inv.do_click(0, 0, QUICK_MOVE, false);
+        assert_eq!((inv.get(0), &inv.slots[44]), (&None, &stack("stone", 10)));
+        // The hotbar key 1 over a chest slot swaps with the hotbar's first slot (menu 54).
+        inv.slots[36] = stack("dirt", 2);
+        inv.do_click(5, 0, SWAP, false);
+        assert_eq!((inv.get(5), &inv.slots[36]), (&stack("dirt", 2), &None));
+
+        // The server's slot updates for the chest land in the player's slots past its own.
+        inv.set(3, Some(7), vec![(30, stack("oak_log", 4))]);
+        assert_eq!(inv.slots[12], stack("oak_log", 4));
+
+        inv.open_container(4, Menu::Crafting, "Crafting".into());
+        inv.do_click(10 + 3, 0, QUICK_MOVE, false);
+        assert_eq!((inv.get(1), &inv.slots[12]), (&stack("oak_log", 4), &None));
     }
 }

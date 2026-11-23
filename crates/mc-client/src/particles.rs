@@ -1,6 +1,6 @@
 //! The particles in the world, moved each tick: `Particle.tick` and `move`, for the poofs
-//! of smoke dying mobs leave (`ExplodeParticle`) and the sparks and dark hearts of hits
-//! (`CritParticle`).
+//! of smoke dying mobs leave (`ExplodeParticle`), the sparks and dark hearts of hits
+//! (`CritParticle`), and the crumbs of food being eaten (`BreakingItemParticle`).
 
 use glam::DVec3;
 
@@ -14,6 +14,8 @@ pub enum Kind {
     EnchantedHit,
     /// `ParticleTypes.DAMAGE_INDICATOR`: a dark heart, flung up.
     Damage,
+    /// `ParticleTypes.ITEM`: a quarter of an item's sprite, the part in `rect`.
+    Item,
 }
 
 /// A particle: where it is now and last tick, its motion, and how far through its life.
@@ -29,6 +31,8 @@ struct Particle {
     lifetime: u32,
     size: f32,
     color: [f32; 3],
+    /// An item particle's part of its sprite, in atlas coordinates.
+    rect: Option<[f32; 4]>,
     /// `Particle.gravity`, `friction` and `hasPhysics`.
     gravity: f64,
     friction: f64,
@@ -125,6 +129,7 @@ impl Particles {
                 lifetime,
                 size,
                 color: [grey; 3],
+                rect: None,
                 // Smoke rises.
                 gravity: -0.1,
                 friction: 0.9,
@@ -169,6 +174,7 @@ impl Particles {
             lifetime,
             size,
             color: [grey; 3],
+            rect: None,
             gravity: 0.5,
             friction: 0.7,
             physics: false,
@@ -184,6 +190,65 @@ impl Particles {
             _ => {}
         }
         self.particles.push(p);
+    }
+
+    /// `LivingEntity.spawnItemParticles`: `count` crumbs of the item whose sprite is
+    /// `sprite` (atlas coordinates), from in front of the mouth of an entity with its eye
+    /// at `eye` looking at `yaw` and `pitch`, tossed forward and up.
+    pub fn item_crumbs(&mut self, sprite: [f32; 4], eye: DVec3, yaw: f32, pitch: f32, count: u32) {
+        // `Vec3.xRot(-xRot)` then `yRot(-yRot)`.
+        let (x_rot, y_rot) = (-pitch.to_radians() as f64, -yaw.to_radians() as f64);
+        let turn = |v: DVec3| {
+            let (s, c) = x_rot.sin_cos();
+            let v = DVec3::new(v.x, v.y * c + v.z * s, v.z * c - v.y * s);
+            let (s, c) = y_rot.sin_cos();
+            DVec3::new(v.x * c + v.z * s, v.y, v.z * c - v.x * s)
+        };
+        for _ in 0..count {
+            let d = DVec3::new(
+                (self.random() as f64 - 0.5) * 0.1,
+                self.random() as f64 * 0.1 + 0.1,
+                0.0,
+            );
+            let d = turn(d);
+            let y = -self.random() as f64 * 0.6 - 0.3;
+            let p = DVec3::new((self.random() as f64 - 0.5) * 0.3, y, 0.6);
+            let pos = eye + turn(p);
+            // `ClientLevel.addParticle`, which the Particles option limits.
+            if !self.allowed(false, false) {
+                continue;
+            }
+            // `Particle`, `SingleQuadParticle` and `BreakingItemParticle`'s constructors:
+            // its own motion is none, so it moves as tossed; half the usual size; and a
+            // random quarter of the sprite, flipped across.
+            let lifetime = (4.0 / (self.random() * 0.9 + 0.1)) as u32;
+            let size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 / 2.0;
+            let (uo, vo) = (self.random() * 3.0, self.random() * 3.0);
+            let [u0, v0, u1, v1] = sprite;
+            let u = |f: f32| u0 + (u1 - u0) * f;
+            let v = |f: f32| v0 + (v1 - v0) * f;
+            self.particles.push(Particle {
+                kind: Kind::Item,
+                old: pos,
+                pos,
+                velocity: d + DVec3::Y * 0.05,
+                on_ground: false,
+                stopped: false,
+                age: 0,
+                lifetime,
+                size,
+                color: [1.0; 3],
+                rect: Some([
+                    u((uo + 1.0) / 4.0),
+                    v(vo / 4.0),
+                    u(uo / 4.0),
+                    v((vo + 1.0) / 4.0),
+                ]),
+                gravity: 1.0,
+                friction: 0.98,
+                physics: true,
+            });
+        }
     }
 
     /// `Particle.tick` for each, and gone once it's lived its life.
@@ -211,7 +276,9 @@ impl Particles {
                     Kind::Crit => CRIT,
                     Kind::EnchantedHit => ENCHANTED_HIT,
                     Kind::Damage => DAMAGE,
+                    Kind::Item => "",
                 },
+                rect: p.rect,
                 color: p.color,
                 light: light(p.pos),
             })
@@ -254,7 +321,7 @@ impl Particle {
             self.velocity.x *= 0.7;
             self.velocity.z *= 0.7;
         }
-        if self.kind != Kind::Poof {
+        if matches!(self.kind, Kind::Crit | Kind::EnchantedHit | Kind::Damage) {
             self.color[1] *= 0.96;
             self.color[2] *= 0.9;
         }

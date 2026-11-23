@@ -181,6 +181,13 @@ fn work(
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+        for [x, _, z] in view.take_shut_lids(std::time::Instant::now()) {
+            let key = (x.div_euclid(16), z.div_euclid(16));
+            if meshed.contains(&key) {
+                dirty.insert(key);
+                idle = false;
+            }
+        }
         let distance = distance.load(std::sync::atomic::Ordering::Relaxed);
         let center = chunk_of(eye);
         let ring = |(x, z): (i32, i32)| (x - center.0).abs().max((z - center.1).abs());
@@ -302,6 +309,11 @@ fn work(
 }
 
 /// Applies one server event; false once the renderer has gone.
+/// How long after a chest starts to close its chunk has its lid again: the lid takes half
+/// a second to shut, and the game draws it for a second after (`Walker::chest_lids`), so
+/// the chunk's lid is back before the game's goes.
+const LID_SHUT: std::time::Duration = std::time::Duration::from_millis(750);
+
 fn receive(
     event: mc_protocol::Event,
     view: &mut WorldView,
@@ -436,6 +448,20 @@ fn receive(
                 return true;
             }
             Update::Remove((x, z))
+        }
+        // A chest's lid opening or closing: its chunk is meshed without it while the game
+        // draws it, until a while after it's shut.
+        Event::BlockEvent {
+            pos,
+            kind: 1,
+            value,
+            ref block,
+        } if block.ends_with("chest") => {
+            let shut = std::time::Instant::now() + LID_SHUT;
+            if view.set_lid(pos, value > 0, shut) {
+                touch(pos[0].div_euclid(16), pos[2].div_euclid(16), 0..=0, 0..=0);
+            }
+            Update::Server(event)
         }
         Event::Position(teleport) => Update::Teleport(teleport),
         Event::Disconnected(reason) => Update::Disconnected(reason),

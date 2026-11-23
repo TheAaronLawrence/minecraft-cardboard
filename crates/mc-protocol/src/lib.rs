@@ -114,13 +114,39 @@ pub enum Event {
     },
     /// The server selected this hotbar slot (0 to 8), such as after picking a block.
     HeldSlot(u8),
-    /// Slots of the player's inventory menu (`InventoryMenu`: 0 the crafting result, 1 to 4
-    /// the grid, 5 to 8 armour, 9 to 35 the inventory, 36 to 44 the hotbar, 45 the
-    /// offhand) now hold these items: name and count, or nothing. With the state id the
-    /// server numbers the menu's changes by, when the packet has one.
+    /// Slots of menu `container` now hold these items: name and count, or nothing. Menu 0
+    /// is the player's inventory (`InventoryMenu`: 0 the crafting result, 1 to 4 the grid,
+    /// 5 to 8 armour, 9 to 35 the inventory, 36 to 44 the hotbar, 45 the offhand); others
+    /// are what `OpenScreen` opened. With the state id the server numbers the menu's
+    /// changes by, when the packet has one.
     Inventory {
+        container: i32,
         state_id: Option<i32>,
         slots: Vec<(u8, Option<(String, i32)>)>,
+    },
+    /// The server opened a menu (`ClientboundOpenScreenPacket`): its container id, its
+    /// `MenuType` by name, such as `minecraft:generic_9x3`, and its title.
+    OpenScreen {
+        container: i32,
+        menu: &'static str,
+        title: String,
+    },
+    /// One of an open menu's numbers changed (`ClientboundContainerSetDataPacket`), such as
+    /// a furnace's burn and cooking progress.
+    ContainerData {
+        container: i32,
+        id: i16,
+        value: i16,
+    },
+    /// The server closed the open menu.
+    ContainerClosed(i32),
+    /// `ClientboundBlockEventPacket`: a block's `triggerEvent(kind, value)`, such as a
+    /// chest's lid opening (kind 1, value its number of viewers). With the block's name.
+    BlockEvent {
+        pos: [i32; 3],
+        kind: u8,
+        value: u8,
+        block: String,
     },
     /// The item held on the mouse cursor in an open inventory.
     Carried(Option<(String, i32)>),
@@ -1197,14 +1223,8 @@ fn play(
                 tx.send(Event::Chunk(chunk)).is_ok()
             }
             "container_set_content" => {
-                // The player's inventory menu is container 0: crafting result and grid (0 to
-                // 4), armour (5 to 8), the inventory (9 to 35), then the hotbar (36 to 44).
-                // Only the player's inventory menu, container 0, is open in this game.
                 let container = r.varint()?;
                 let state_id = r.varint()?;
-                if container != 0 {
-                    continue;
-                }
                 let mut slots = Vec::new();
                 let mut whole = true;
                 for slot in 0..r.count()? {
@@ -1217,6 +1237,7 @@ fn play(
                 }
                 let sent = tx
                     .send(Event::Inventory {
+                        container,
                         state_id: Some(state_id),
                         slots,
                     })
@@ -1230,10 +1251,11 @@ fn play(
                 let container = r.varint()?;
                 let state_id = r.varint()?;
                 let slot = r.i16()?;
-                if container != 0 || !(0..46).contains(&slot) {
+                if !(0..=u8::MAX as i16).contains(&slot) {
                     continue;
                 }
                 tx.send(Event::Inventory {
+                    container,
                     state_id: Some(state_id),
                     slots: vec![(slot as u8, item_stack(&mut r, registry)?)],
                 })
@@ -1254,8 +1276,56 @@ fn play(
                     _ => continue,
                 };
                 tx.send(Event::Inventory {
+                    container: 0,
                     state_id: None,
                     slots: vec![(menu_slot as u8, item_stack(&mut r, registry)?)],
+                })
+                .is_ok()
+            }
+            "open_screen" => {
+                let container = r.varint()?;
+                // `MenuType`'s protocol ids, from registries.json; the others aren't built.
+                let menu = match r.varint()? {
+                    0 => "minecraft:generic_9x1",
+                    1 => "minecraft:generic_9x2",
+                    2 => "minecraft:generic_9x3",
+                    3 => "minecraft:generic_9x4",
+                    4 => "minecraft:generic_9x5",
+                    5 => "minecraft:generic_9x6",
+                    12 => "minecraft:crafting",
+                    14 => "minecraft:furnace",
+                    _ => "",
+                };
+                let title = chat::plain(&chat::spans(&chat::component(r.nbt()?), &lang));
+                tx.send(Event::OpenScreen {
+                    container,
+                    menu,
+                    title,
+                })
+                .is_ok()
+            }
+            "container_set_data" => {
+                let container = r.varint()?;
+                let (id, value) = (r.i16()?, r.i16()?);
+                tx.send(Event::ContainerData {
+                    container,
+                    id,
+                    value,
+                })
+                .is_ok()
+            }
+            "container_close" => tx.send(Event::ContainerClosed(r.varint()?)).is_ok(),
+            "block_event" => {
+                let pos = r.block_pos()?;
+                let (kind, value) = (r.u8()?, r.u8()?);
+                let block = registry
+                    .block_by_id(r.varint()? as u32)
+                    .map_or(String::new(), |b| b.name.clone());
+                tx.send(Event::BlockEvent {
+                    pos,
+                    kind,
+                    value,
+                    block,
                 })
                 .is_ok()
             }

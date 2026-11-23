@@ -8,7 +8,9 @@
 // the light engine sees them (`LightEngine.getOcclusionShape`) and as faces are culled against
 // them (`BlockState.getFaceOcclusionShape`, `Block.shouldRenderFace`), and every state's
 // `SoundType`: its break, step, place, hit and fall sound events, volume and pitch, which the
-// client plays as blocks are walked on, placed and mined. `cargo xtask gen-reports`
+// client plays as blocks are walked on, placed and mined, and which blocks do something
+// when used with an empty hand (their class overrides `useWithoutItem`), which the client
+// tries before using the item held. `cargo xtask gen-reports`
 // runs it on the unpacked server with `java DumpPhysics.java OUT.json`, which needs a JDK.
 //
 // Shapes are taken at the origin with an empty collision context, as for a block nothing is
@@ -142,6 +144,13 @@ public class DumpPhysics {
                 .append(state.requiresCorrectToolForDrops()).append(']');
         }
 
+        StringBuilder interactive = new StringBuilder();
+        for (Block block : BuiltInRegistries.BLOCK) {
+            if (!overridesUseWithoutItem(block.getClass())) continue;
+            if (interactive.length() > 0) interactive.append(',');
+            interactive.append('"').append(BuiltInRegistries.BLOCK.getKey(block)).append('"');
+        }
+
         try (PrintWriter out = new PrintWriter(args[0], "UTF-8")) {
             out.println("{");
             out.println("  \"shapes\": [");
@@ -165,10 +174,26 @@ public class DumpPhysics {
             out.println("  \"sounds\": [" + sounds + "],");
             out.println("  \"sound_types\": [\n    " + String.join(",\n    ", soundTypes) + "\n  ],");
             out.println("  \"blocks\": {\n    " + blocks + "\n  },");
-            out.println("  \"mining\": {\n    " + mining + "\n  }");
+            out.println("  \"mining\": {\n    " + mining + "\n  },");
+            out.println("  \"interactive\": [" + interactive + "]");
             out.println("}");
         }
         System.out.println(shapes.size() + " collision and outline shapes for " + Block.BLOCK_STATE_REGISTRY.size() + " states");
+    }
+
+    /** Whether a block class, or one it extends, overrides `BlockBehaviour.useWithoutItem`. */
+    static boolean overridesUseWithoutItem(Class<?> c) {
+        return overrides(c, net.minecraft.world.level.block.state.BlockBehaviour.class, "useWithoutItem", 5);
+    }
+
+    /** Whether `c`, or a class it extends below `base`, declares a method `name` with `params` parameters. */
+    static boolean overrides(Class<?> c, Class<?> base, String name, int params) {
+        for (; c != null && c != base; c = c.getSuperclass()) {
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                if (m.getName().equals(name) && m.getParameterCount() == params) return true;
+            }
+        }
+        return false;
     }
 
     /**

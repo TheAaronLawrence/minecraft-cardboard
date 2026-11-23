@@ -131,8 +131,10 @@ fn gen_reports(version: &str) -> Result<()> {
 }
 
 /// Each item's `[name key, max stack size, rarity, equipment slot or null, equipment
-/// asset or null]`, from the
-/// components report's file per item, sorted by name.
+/// asset or null, use or null]`, from the components report's file per item, sorted by
+/// name. Use holds what using the item needs, each left out when it's the default: its
+/// `consumable`, its `food`'s `can_always_eat`, `blocks_attacks` (as true), its
+/// `use_effects`, and `equippable`'s `swappable`.
 fn item_report(dir: &Path) -> Result<String> {
     let mut items = std::collections::BTreeMap::new();
     for entry in std::fs::read_dir(dir)? {
@@ -140,12 +142,42 @@ fn item_report(dir: &Path) -> Result<String> {
         let name = path.file_stem().context("item file")?.to_string_lossy();
         let json: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let c = &json["components"];
+        let mut using = serde_json::Map::new();
+        if let Some(consumable) = c.get("minecraft:consumable") {
+            let mut consumable = consumable.clone();
+            // What consuming does is the server's business.
+            if let Some(map) = consumable.as_object_mut() {
+                map.remove("on_consume_effects");
+            }
+            using.insert("consumable".into(), consumable);
+        }
+        if let Some(food) = c.get("minecraft:food") {
+            let always = food["can_always_eat"].as_bool().unwrap_or(false);
+            using.insert("food".into(), always.into());
+        }
+        if c.get("minecraft:blocks_attacks").is_some() {
+            using.insert("blocks_attacks".into(), true.into());
+        }
+        if let Some(effects) = c
+            .get("minecraft:use_effects")
+            .filter(|e| e != &&serde_json::json!({}))
+        {
+            using.insert("use_effects".into(), effects.clone());
+        }
+        if let Some(swappable) = c["minecraft:equippable"].get("swappable") {
+            using.insert("swappable".into(), swappable.clone());
+        }
         let entry = serde_json::json!([
             c["minecraft:item_name"]["translate"],
             c["minecraft:max_stack_size"],
             c["minecraft:rarity"],
             c["minecraft:equippable"]["slot"],
             c["minecraft:equippable"]["asset_id"],
+            if using.is_empty() {
+                Value::Null
+            } else {
+                Value::Object(using)
+            },
         ]);
         items.insert(format!("minecraft:{name}"), entry.to_string());
     }

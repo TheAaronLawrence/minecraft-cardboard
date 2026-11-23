@@ -271,6 +271,7 @@ mod tests {
         let res = mc_assets::Resources::new(mc_assets::default_root());
         let art = HudArt {
             items: Default::default(),
+            using: Default::default(),
             hotbar: [0.0; 4],
             selection: [0.0; 4],
             font: [0.0; 4],

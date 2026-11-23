@@ -117,6 +117,10 @@ pub struct StateModel {
     /// `getFaceOcclusionShape` for each `Dir`, as `BlockPhysics::face_occlusion` gives
     /// them: what of its neighbours' faces it hides. None when it can't occlude.
     pub faces: Option<Arc<[[u64; 4]; 6]>>,
+    /// A chest's model without its lid, which its chunk has while the lid is open, and
+    /// the lid to draw then.
+    pub body: Option<Arc<BakedModel>>,
+    pub lid: Option<Arc<crate::chest::Lid>>,
 }
 
 pub struct BlockModels {
@@ -264,22 +268,29 @@ impl BlockModels {
                 });
                 let entity = crate::chest::model(&block.name, &values, &atlas)
                     .or_else(|| crate::entity_model::model(&block.name, &values, &atlas));
+                let body = crate::chest::body(&block.name, &values, &atlas).map(Arc::new);
+                let lid = crate::chest::lid(&block.name, &values, &atlas).map(Arc::new);
                 states[state as usize] = match entity {
                     Some(model) => StateModel {
                         parts: vec![vec![(1, Arc::new(model))]],
                         occludes: false,
                         faces,
+                        body,
+                        lid,
                     },
                     None => StateModel {
                         parts,
                         occludes,
                         faces,
+                        body,
+                        lid,
                     },
                 };
             }
         }
-        let icons = crate::item::bake(items, &atlas, &states, registry)?;
-        let hud = crate::hud::HudArt::new(res, &atlas, icons, crate::hud::item_names()?)?;
+        let (icons, using) = crate::item::bake(items, &atlas, &states, registry)?;
+        let mut hud = crate::hud::HudArt::new(res, &atlas, icons, crate::hud::item_names()?)?;
+        hud.using = Arc::new(using);
         Ok(Self {
             states,
             atlas,

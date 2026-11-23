@@ -185,6 +185,9 @@ fn state_infos(registry: &Registry) -> Vec<StateInfo> {
 pub struct WorldView {
     chunks: HashMap<(i32, i32), Chunk>,
     air: u32,
+    /// Chests whose lids are open, which are meshed without them: open, or closing until
+    /// this time, once the lid has shut and the game draws it no more.
+    open_lids: HashMap<[i32; 3], Option<std::time::Instant>>,
 }
 
 impl WorldView {
@@ -214,7 +217,41 @@ impl WorldView {
         Self {
             chunks: HashMap::new(),
             air,
+            open_lids: HashMap::new(),
         }
+    }
+
+    /// `ChestBlockEntity.triggerEvent(1, viewers)`: a chest's lid opens, or with no
+    /// viewers left starts to close, and its chunk is meshed again without it until
+    /// `shut` has passed. False when nothing changed.
+    pub fn set_lid(&mut self, pos: [i32; 3], open: bool, shut: std::time::Instant) -> bool {
+        let new = if open { None } else { Some(shut) };
+        match self.open_lids.get(&pos) {
+            None if !open => false,
+            Some(old) if *old == new => false,
+            _ => {
+                self.open_lids.insert(pos, new);
+                true
+            }
+        }
+    }
+
+    /// The chests whose lids have shut since: their chunks have them again.
+    pub fn take_shut_lids(&mut self, now: std::time::Instant) -> Vec<[i32; 3]> {
+        let shut: Vec<_> = self
+            .open_lids
+            .iter()
+            .filter(|(_, t)| t.is_some_and(|t| t <= now))
+            .map(|(p, _)| *p)
+            .collect();
+        for p in &shut {
+            self.open_lids.remove(p);
+        }
+        shut
+    }
+
+    fn lid_open(&self, pos: [i32; 3]) -> bool {
+        self.open_lids.contains_key(&pos)
     }
 
     pub fn insert(&mut self, chunk: Chunk) {
@@ -236,6 +273,7 @@ impl WorldView {
             return false;
         };
         chunk.block_entities.remove(&[x, y, z]);
+        self.open_lids.remove(&[x, y, z]);
         let Some(section) = chunk.section_mut(y.div_euclid(16)) else {
             return false;
         };
@@ -496,7 +534,16 @@ impl<'a> Mesher<'a> {
         } else {
             None
         };
-        for part in &model.parts {
+        // An open chest's lid is drawn by the game, at its openness.
+        let open;
+        let parts = match &model.body {
+            Some(body) if view.lid_open([x, y, z]) => {
+                open = [vec![(1, body.clone())]];
+                &open[..]
+            }
+            _ => &model.parts[..],
+        };
+        for part in parts {
             if let Some(seed) = part_seed {
                 random = JavaRandom::new(seed);
             }

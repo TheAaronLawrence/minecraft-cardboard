@@ -246,6 +246,9 @@ struct Tracked {
     hurt_time: i32,
     /// `LivingEntity.deathTime`: ticks since its health ran out.
     death_time: u32,
+    /// The item it's using (`useItem`): its hand (0 main, 1 off), the item, and the ticks
+    /// left (`useItemRemaining`).
+    using: Option<(u8, String, i32)>,
 }
 
 /// `PlayerInfo.getSkin`: a player's downloaded skin once it's arrived, else the default
@@ -327,6 +330,8 @@ const MAIN_HAND: u8 = 15;
 /// `Pose.CROUCHING`'s id.
 const CROUCHING: i32 = 5;
 const ITEM: u8 = 8;
+/// `LivingEntity.DATA_LIVING_ENTITY_FLAGS`: 1 using an item, 2 in the off hand.
+const LIVING_FLAGS: u8 = 8;
 const MOB_FLAGS: u8 = 15;
 const BABY: u8 = 16;
 const SHEEP_WOOL: u8 = 18;
@@ -344,11 +349,13 @@ pub struct Entities {
     names: HashMap<u128, String>,
     /// Each wearable item's equipment asset (`equippable`'s `asset_id`), by item.
     armor: HashMap<String, String>,
+    /// What using each item looks like and how long it lasts, by item.
+    uses: HashMap<String, (mc_render::entity::UseAnim, i32)>,
     tracked: HashMap<i32, Tracked>,
     /// Seeds items' bob offsets, as `Entity.random` would.
     seed: u64,
     /// The poofs of smoke dying mobs leave.
-    particles: crate::particles::Particles,
+    pub(crate) particles: crate::particles::Particles,
     /// `TrackingEmitter`s: sparks burst from an entity hit critically, for three ticks.
     /// The entity, the particle, and the bursts left.
     emitters: Vec<(i32, crate::particles::Kind, u8)>,
@@ -384,6 +391,7 @@ impl Entities {
                     Some((item.to_owned(), asset))
                 })
                 .collect(),
+            uses: crate::hands::use_animations(registry),
             tracked: HashMap::new(),
             seed: 0x5DEECE66D,
             particles: Default::default(),
@@ -509,6 +517,7 @@ impl Entities {
                         swing: SwingState::default(),
                         hurt_time: 0,
                         death_time: 0,
+                        using: None,
                     },
                 );
             }
@@ -743,7 +752,7 @@ impl Entities {
         blocks: &mc_physics::BlockPhysics,
     ) -> bool {
         for e in self.tracked.values_mut() {
-            e.tick(world, blocks);
+            e.tick(world, blocks, &self.uses);
         }
         self.particles.tick(world, blocks);
         self.emit();
@@ -841,7 +850,8 @@ impl Entities {
         self.tracked
             .values()
             .filter_map(|e| {
-                let entity = e.render(partial, &self.skins, &self.names, &self.armor)?;
+                let entity =
+                    e.render(partial, &self.skins, &self.names, &self.armor, &self.uses)?;
                 let (feet, baby) = match &entity {
                     Entity::Living(l) => (l.pos, l.baby),
                     Entity::Item(d) => (d.pos, false),
@@ -946,7 +956,12 @@ impl Tracked {
         self.interpolation.cancel();
     }
 
-    fn tick(&mut self, world: &impl mc_physics::World, blocks: &mc_physics::BlockPhysics) {
+    fn tick(
+        &mut self,
+        world: &impl mc_physics::World,
+        blocks: &mc_physics::BlockPhysics,
+        uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>,
+    ) {
         // `Entity.commonTick`.
         self.old = self.now;
         self.old_head_yaw = self.head_yaw;
@@ -959,7 +974,35 @@ impl Tracked {
         self.age += 1;
         match self.sort {
             Sort::Item => self.tick_item(world, blocks),
-            Sort::Player | Sort::Mob(_) => self.tick_living(),
+            Sort::Player | Sort::Mob(_) => {
+                self.tick_living();
+                self.tick_using(uses);
+            }
+        }
+    }
+
+    /// `LivingEntity.onSyncedDataUpdated` and `updatingUsingItem` for another entity: its
+    /// living flags (data 8) start using the item in the hand they name, for its use
+    /// duration, and stop it; it counts down while that item stays in the hand.
+    fn tick_using(&mut self, uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>) {
+        let flags = match self.data.get(&LIVING_FLAGS) {
+            Some(DataValue::Byte(f)) => *f,
+            _ => 0,
+        };
+        if flags & 1 == 0 {
+            self.using = None;
+            return;
+        }
+        let hand = u8::from(flags & 2 != 0);
+        let held = self.equipment.get(&hand).map(|e| e.item.clone());
+        match (&mut self.using, held) {
+            (Some((_, item, remaining)), Some(held)) if *item == held => *remaining -= 1,
+            (Some(_), _) => self.using = None,
+            (None, Some(held)) => {
+                let duration = uses.get(&held).map_or(0, |u| u.1);
+                self.using = Some((hand, held, duration - 1));
+            }
+            (None, None) => {}
         }
     }
 
@@ -1081,6 +1124,7 @@ impl Tracked {
         skins: &HashMap<u128, (String, bool)>,
         names: &HashMap<u128, String>,
         armor: &HashMap<String, String>,
+        uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>,
     ) -> Option<Entity> {
         let pos = self.old.pos.lerp(self.now.pos, pt as f64).as_vec3();
         let age = self.age as f32 + pt;
@@ -1160,7 +1204,7 @@ impl Tracked {
             flap_speed: self.flap_speed[0] + (self.flap_speed[1] - self.flap_speed[0]) * pt,
             baby: flag(BABY),
             name_tag: self.name_tag(names),
-            equipment: self.equipment(armor),
+            equipment: self.equipment(armor, uses, pt),
             swing: self.swing(pt),
             burning: self.burning(flag(BABY)),
             // `hasRedOverlay`.
@@ -1178,8 +1222,24 @@ impl Tracked {
     /// asset, and the main hand's (slot 0) and off hand's (slot 1) items in whichever hands
     /// they're in. Players say which is their main arm; mobs are left-handed when their flags
     /// have `MOB_FLAG_LEFTHANDED` (2) set.
-    fn equipment(&self, armor: &HashMap<String, String>) -> Equipment {
+    /// The item in use is drawn in the arm holding it, while it has ticks left.
+    fn equipment(
+        &self,
+        armor: &HashMap<String, String>,
+        uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>,
+        pt: f32,
+    ) -> Equipment {
         let left_handed = self.left_handed();
+        let using = self.using.as_ref().and_then(|(hand, item, remaining)| {
+            let &(anim, duration) = uses.get(item)?;
+            (*remaining > 0).then_some(mc_render::entity::Using {
+                hand: usize::from((*hand == 1) != left_handed),
+                anim,
+                duration,
+                remaining: *remaining as f32 - pt + 1.0,
+                ticks: duration - remaining,
+            })
+        });
         let item = |slot| self.equipment.get(&slot).map(|e| e.item.clone());
         let (main, off) = (item(0), item(1));
         Equipment {
@@ -1196,6 +1256,7 @@ impl Tracked {
                 [main, off]
             },
             left_handed,
+            using,
         }
     }
 
@@ -1305,6 +1366,7 @@ mod tests {
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
+            uses: HashMap::new(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),
@@ -1344,6 +1406,7 @@ mod tests {
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
+            uses: HashMap::new(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),
@@ -1436,6 +1499,7 @@ mod tests {
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
+            uses: HashMap::new(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),
@@ -1486,6 +1550,7 @@ mod tests {
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
+            uses: HashMap::new(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),
