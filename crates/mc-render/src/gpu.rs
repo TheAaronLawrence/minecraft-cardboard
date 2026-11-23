@@ -63,6 +63,27 @@ pub struct View {
     pub ticks: f32,
     /// Draw the crosshair (a window does; screenshots for comparison don't).
     pub hud: bool,
+    /// The video options the world draws with: the brightness (`gamma`), whether the
+    /// vignette shows, the clouds, and how far they reach, in chunks.
+    pub gamma: f32,
+    pub vignette: bool,
+    pub clouds: crate::hud::options::Clouds,
+    pub cloud_range: i32,
+}
+
+impl View {
+    /// Vanilla's default options, at `distance` blocks.
+    pub fn new(distance: f32, ticks: f32, hud: bool) -> Self {
+        Self {
+            distance,
+            ticks,
+            hud,
+            gamma: 0.5,
+            vignette: true,
+            clouds: Default::default(),
+            cloud_range: 128,
+        }
+    }
 }
 
 /// What a camera inside water or lava sees (`FogRenderer.setupFog`): the fluid's fog,
@@ -133,11 +154,28 @@ const OVERLAY: wgpu::BlendState = wgpu::BlendState {
     },
 };
 
-/// Vanilla's automatic GUI scale: the largest that leaves the screen at least 320 × 240
-/// GUI pixels (`Window.calculateScale` with the setting at 0).
+/// The GUI Scale option: 0 for auto.
+static GUI_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Sets the GUI Scale option, which every GUI drawn after follows.
+pub fn set_gui_scale(scale: u32) {
+    GUI_SCALE.store(scale, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `Window.calculateScale`: the GUI Scale option, or with it at 0 (auto), the largest that
+/// leaves the screen at least 320 × 240 GUI pixels; never larger than that.
 pub fn gui_scale(width: u32, height: u32) -> u32 {
+    calculate_scale(
+        width,
+        height,
+        GUI_SCALE.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+pub fn calculate_scale(width: u32, height: u32, max: u32) -> u32 {
     let mut scale = 1;
-    while scale < width
+    while scale != max
+        && scale < width
         && scale < height
         && width / (scale + 1) >= 320
         && height / (scale + 1) >= 240
@@ -181,7 +219,15 @@ pub struct Renderer {
     celestial_sprites: std::collections::HashMap<String, [f32; 4]>,
     clouds: crate::sky::Clouds,
     /// The cloud faces drawn, with the cell and side of the layer they were built for.
-    cloud_faces: Option<(crate::sky::CloudKey, Option<(wgpu::Buffer, u32)>)>,
+    /// The clouds' faces, for the cell under the eye, fancy or flat, and the radius in
+    /// cells they were built for.
+    #[allow(clippy::type_complexity)]
+    cloud_faces: Option<(
+        (crate::sky::CloudKey, bool, i32),
+        Option<(wgpu::Buffer, u32)>,
+    )>,
+    /// `RenderPipelines.FLAT_CLOUDS`: fast clouds, drawn from both sides.
+    flat_clouds_pipeline: wgpu::RenderPipeline,
     opaque: wgpu::RenderPipeline,
     cutout: wgpu::RenderPipeline,
     entity: wgpu::RenderPipeline,
@@ -628,40 +674,44 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &wgpu::vertex_attr_array![0 => Uint32],
         };
-        let clouds_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("clouds"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_cloud"),
-                buffers: &[Some(cloud_layout)],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_cloud"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let clouds_pipeline_with = |label, cull_mode| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_cloud"),
+                    buffers: &[Some(cloud_layout.clone())],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_cloud"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    cull_mode,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let clouds_pipeline = clouds_pipeline_with("clouds", Some(wgpu::Face::Back));
+        let flat_clouds_pipeline = clouds_pipeline_with("flat clouds", None);
         let opaque = pipeline("fs_opaque", None, true, false, true);
         let cutout = pipeline("fs_cutout", None, true, false, true);
         // `RenderPipelines.ENTITY_CUTOUT`: entities show their boxes' back faces too, which
@@ -912,6 +962,7 @@ impl Renderer {
             celestial,
             stars_pipeline,
             clouds_pipeline,
+            flat_clouds_pipeline,
             sky_state: Default::default(),
             stars: crate::sky::stars(),
             celestial_sprites: crate::sky::sprites()
@@ -1282,9 +1333,9 @@ impl Renderer {
         let hand_fov = 70.0 * fov_scale;
         let state = self.sky_state;
         let v = &state.visuals;
-        // `GameRenderer`'s depth far: four times the render distance, or the cloud range
-        // (vanilla's default, 128 chunks).
-        let far = (view.distance * 4.0).max(2048.0);
+        // `Camera`'s depth far: four times the render distance, or the cloud range.
+        let cloud_blocks = (view.cloud_range * 16) as f32;
+        let far = (view.distance * 4.0).max(cloud_blocks);
         let view_proj = camera.view_proj(width as f32 / height as f32, far);
         // Vanilla's terrain fog: it ends at the render distance and starts a tenth before.
         let fog_end = view.distance;
@@ -1351,8 +1402,12 @@ impl Renderer {
         }
         // `CloudRenderer.prepare`: the faces around the cell under the eye, rebuilt when
         // the eye moves to another cell or to another side of the layer.
-        let draw_clouds =
-            v.cloud_color[3] > 0.0 && state.skybox == crate::environment::Skybox::Overworld;
+        let draw_clouds = view.clouds != crate::hud::options::Clouds::Off
+            && v.cloud_color[3] > 0.0
+            && state.skybox == crate::environment::Skybox::Overworld;
+        let fancy = view.clouds == crate::hud::options::Clouds::Fancy;
+        // `CloudRenderer.prepare`: the range in cells of 12 blocks, rounded up.
+        let radius = (view.cloud_range * 16 + 11) / 12;
         let eye64 = camera.eye.as_dvec3().to_array();
         let (cloud_key, cloud_offset) =
             self.clouds
@@ -1361,9 +1416,9 @@ impl Renderer {
             && self
                 .cloud_faces
                 .as_ref()
-                .is_none_or(|(key, _)| *key != cloud_key)
+                .is_none_or(|(key, _)| *key != (cloud_key, fancy, radius))
         {
-            let faces = self.clouds.faces(cloud_key, crate::sky::CLOUD_RADIUS);
+            let faces = self.clouds.faces(cloud_key, radius, fancy);
             let buffer = (!faces.is_empty()).then(|| {
                 let buffer = self
                     .device
@@ -1374,7 +1429,7 @@ impl Renderer {
                     });
                 (buffer, faces.len() as u32)
             });
-            self.cloud_faces = Some((cloud_key, buffer));
+            self.cloud_faces = Some(((cloud_key, fancy, radius), buffer));
         }
         // The sky's sunrise fan, sun, moon and stars, placed around the eye.
         let sky_mesh = {
@@ -1406,7 +1461,7 @@ impl Renderer {
             fog_color,
             // The sky fogs out at the render distance, or the fluid's fog (`FogData.skyEnd`).
             sky_color: [sky[0], sky[1], sky[2], sky_end],
-            params: [fog_start, fog_end, 1.0, 0.5],
+            params: [fog_start, fog_end, 1.0, view.gamma],
             // `GlobalSettingsUniform`'s GameTime.
             time: [(view.ticks % 24000.0) / 24000.0, 0.0, 0.0, 0.0],
             screen: [
@@ -1441,7 +1496,7 @@ impl Renderer {
                 cloud_offset.x,
                 cloud_offset.y,
                 cloud_offset.z,
-                v.cloud_fog_end.min(2048.0),
+                v.cloud_fog_end.min(cloud_blocks),
             ],
             sky_flags: [
                 f32::from(u8::from(state.dark_disc)),
@@ -1475,8 +1530,14 @@ impl Renderer {
             (Some(crate::hud::Screen::Launcher(launcher)), ..) => {
                 crate::hud::launcher::launcher(&self.hud_art, launcher, gui_width, gui_height)
             }
+            (Some(crate::hud::Screen::Options(o)), ..) if !o.in_world => Default::default(),
             (
-                None | Some(crate::hud::Screen::Pause(_) | crate::hud::Screen::Inventory(_)),
+                None
+                | Some(
+                    crate::hud::Screen::Pause(_)
+                    | crate::hud::Screen::Inventory(_)
+                    | crate::hud::Screen::Options(_),
+                ),
                 Some(hotbar),
                 true,
             ) => crate::hud::hotbar(
@@ -1493,6 +1554,7 @@ impl Renderer {
             Some(crate::hud::Screen::Inventory(inv)) => {
                 gui_mesh.inventory(&self.hud_art, inv, gw, gh)
             }
+            Some(crate::hud::Screen::Options(o)) => gui_mesh.options(&self.hud_art, o, gw, gh),
             _ => {}
         }
         let gui_buffer = self.quads_buffer("gui", &gui_mesh.vertices);
@@ -1621,7 +1683,11 @@ impl Renderer {
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
                 if draw_clouds && let Some((_, Some((buffer, count)))) = &self.cloud_faces {
-                    pass.set_pipeline(&self.clouds_pipeline);
+                    pass.set_pipeline(if fancy {
+                        &self.clouds_pipeline
+                    } else {
+                        &self.flat_clouds_pipeline
+                    });
                     pass.set_vertex_buffer(0, buffer.slice(..));
                     pass.draw(0..6, 0..*count);
                 }
@@ -1698,7 +1764,7 @@ impl Renderer {
             draw(&mut pass, &self.see_through, &self.fire_overlay_vertices);
         }
         // `Hud.extractCameraOverlays`: the vignette first, under the rest of the HUD.
-        let vignette = view.hud && state.vignette > 0.0;
+        let vignette = view.hud && view.vignette && state.vignette > 0.0;
         if gui_buffer.is_some() || inverted_buffer.is_some() || vignette {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hud"),

@@ -27,6 +27,7 @@ pub struct Registry {
     entity_types: Vec<String>,
     mob_effects: Vec<String>,
     particle_types: Vec<String>,
+    sound_events: Vec<String>,
     /// What the inventory needs to know of each item, by name.
     item_info: HashMap<String, ItemInfo>,
 }
@@ -194,6 +195,7 @@ impl Registry {
         let entity_types = names_by_id(&protocol_ids(&registries, "minecraft:entity_type")?);
         let mob_effects = names_by_id(&protocol_ids(&registries, "minecraft:mob_effect")?);
         let particle_types = names_by_id(&protocol_ids(&registries, "minecraft:particle_type")?);
+        let sound_events = names_by_id(&protocol_ids(&registries, "minecraft:sound_event")?);
 
         type Report = (String, i32, String, Option<String>, Option<String>);
         let item_info: HashMap<String, Report> = read_json(&reports_dir.join("items.json"))?;
@@ -223,6 +225,7 @@ impl Registry {
             entity_types,
             mob_effects,
             particle_types,
+            sound_events,
         })
     }
 
@@ -290,6 +293,11 @@ impl Registry {
     /// A mob effect's name, such as `minecraft:fire_resistance`, from its protocol id.
     pub fn mob_effect(&self, id: u32) -> Option<&str> {
         self.mob_effects.get(id as usize).map(String::as_str)
+    }
+
+    /// A sound event's name, such as `minecraft:block.stone.step`, from its protocol id.
+    pub fn sound_event(&self, id: u32) -> Option<&str> {
+        self.sound_events.get(id as usize).map(String::as_str)
     }
 
     pub fn item_count(&self) -> u32 {

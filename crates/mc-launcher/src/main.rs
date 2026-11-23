@@ -72,6 +72,7 @@ fn main() -> Result<()> {
         state: None,
         cursor: None,
         focused_at: Instant::now(),
+        shift: false,
         game: None,
         home,
         game_dir,
@@ -163,6 +164,8 @@ struct App {
     cursor: Option<[f32; 2]>,
     /// When a box was last focused or edited, which restarts the cursor's blink.
     focused_at: Instant,
+    /// Shift is held, for Shift+Tab.
+    shift: bool,
     /// The game, while it runs.
     game: Option<Child>,
     /// The launcher's folder, with its settings.
@@ -244,6 +247,7 @@ impl App {
 
     fn focus(&mut self, focused: bool) {
         self.screen.focused = focused;
+        self.screen.play_focused = false;
         self.focused_at = Instant::now();
     }
 
@@ -375,6 +379,55 @@ impl App {
         }
     }
 
+    /// Tab or an arrow: the focus to the name box or Play (when it works).
+    fn navigate(&mut self, code: winit::keyboard::KeyCode) {
+        use mc_render::hud::nav;
+        use winit::keyboard::KeyCode as K;
+        let Some((width, height, _)) = self.gui() else {
+            return;
+        };
+        let layout = launcher::layout(width, height);
+        let item = |rect, active| nav::Item {
+            rect,
+            active,
+            row: None,
+        };
+        let items = [
+            item(layout.name, true),
+            item(layout.play, self.button_active()),
+        ];
+        let focused = match (self.screen.focused, self.screen.play_focused) {
+            (true, _) => Some(0),
+            (_, true) if items[1].active => Some(1),
+            _ => None,
+        };
+        let direction = match code {
+            K::Tab => {
+                let next = nav::tab(&items, focused, !self.shift);
+                return self.focus_on(next);
+            }
+            K::ArrowUp => nav::Direction::Up,
+            K::ArrowDown => nav::Direction::Down,
+            K::ArrowLeft => nav::Direction::Left,
+            K::ArrowRight => nav::Direction::Right,
+            _ => return,
+        };
+        let next = nav::arrow(&items, focused, direction, [0, 0, width, height], [0; 4]);
+        self.focus_on(next);
+    }
+
+    /// Moves the focus to the name box (0) or Play (1); nowhere keeps it where it is.
+    fn focus_on(&mut self, next: Option<usize>) {
+        match next {
+            Some(0) => self.focus(true),
+            Some(_) => {
+                self.focus(false);
+                self.screen.play_focused = true;
+            }
+            None => {}
+        }
+    }
+
     fn click(&mut self) {
         let Some((width, height, Some(mouse))) = self.gui() else {
             return;
@@ -394,14 +447,21 @@ impl App {
         }
     }
 
-    /// A key: Enter plays; in the name box, editing as `EditBox` does.
+    /// A key: Enter plays, and so does Space on Play; Tab (Shift+Tab back) and the arrows
+    /// move the focus between the name box and Play, as the game's menus do; in the name
+    /// box, editing as `EditBox` does, where Left and Right move the cursor.
     fn key(&mut self, event: &winit::event::KeyEvent) {
-        use winit::keyboard::{Key, NamedKey};
-        if event.logical_key == Key::Named(NamedKey::Enter) {
+        use winit::keyboard::{Key, KeyCode as K, NamedKey, PhysicalKey};
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        if matches!(code, K::Enter | K::NumpadEnter) || code == K::Space && self.screen.play_focused
+        {
             return self.press();
         }
-        if !self.screen.focused {
-            return;
+        let editing = self.screen.focused && !matches!(code, K::Tab | K::ArrowUp | K::ArrowDown);
+        if !editing {
+            return self.navigate(code);
         }
         let field = &mut self.screen.name;
         match &event.logical_key {
@@ -463,6 +523,9 @@ impl winit::application::ApplicationHandler for App {
                 self.cursor = Some([position.x as f32, position.y as f32]);
             }
             WindowEvent::CursorLeft { .. } => self.cursor = None,
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.shift = modifiers.state().shift_key();
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
@@ -503,11 +566,7 @@ impl winit::application::ApplicationHandler for App {
                     fov: 70.0,
                     bob: glam::Mat4::IDENTITY,
                 };
-                let view = View {
-                    distance: 16.0,
-                    ticks: 0.0,
-                    hud: false,
-                };
+                let view = View::new(16.0, 0.0, false);
                 state.renderer.render(
                     &target,
                     state.config.width,

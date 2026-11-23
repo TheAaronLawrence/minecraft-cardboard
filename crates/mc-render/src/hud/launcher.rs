@@ -25,7 +25,10 @@ const RED: [f32; 3] = [1.0, 85.0 / 255.0, 85.0 / 255.0];
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Launcher {
     pub name: Field,
+    /// The name box has the focus, and takes typing.
     pub focused: bool,
+    /// Play has the keyboard focus, outlined in white.
+    pub play_focused: bool,
     /// The cursor is in the visible half of its blink.
     pub cursor_on: bool,
     /// Play works: the name is a valid player name.
@@ -163,6 +166,9 @@ pub fn launcher(art: &HudArt, l: &Launcher, width: u32, height: u32) -> GuiMesh 
     };
     mesh.rect(art, layout.play, BOX, color);
     let [px, py, pw, ph] = layout.play;
+    if l.play_focused {
+        mesh.rect(art, [px - 1, py - 1, pw + 2, ph + 2], BOX - 1.0, [255; 4]);
+    }
     let label = if l.button.is_empty() {
         "PLAY"
     } else {

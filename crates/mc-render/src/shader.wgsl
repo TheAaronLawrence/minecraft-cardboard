@@ -244,7 +244,9 @@ fn vs_cloud(@builtin(vertex_index) i: u32, @location(0) face: u32) -> CloudOut {
     let pos = vertex * CLOUD_CELL + vec3<f32>(x, 0.0, z) * CLOUD_CELL + u.cloud_offset.xyz;
     var out: CloudOut;
     out.clip = u.view_proj * vec4<f32>(pos + u.eye.xyz, 1.0);
-    out.color = vec4<f32>(vec3<f32>(CLOUD_SHADE[direction]), 1.0) * u.cloud_color;
+    // `FLAG_USE_TOP_COLOR`: a fast cloud's face takes the top's shade.
+    let shade = select(CLOUD_SHADE[direction], 1.0, ((face >> 24u) & 1u) == 1u);
+    out.color = vec4<f32>(vec3<f32>(shade), 1.0) * u.cloud_color;
     out.distance = length(pos);
     return out;
 }

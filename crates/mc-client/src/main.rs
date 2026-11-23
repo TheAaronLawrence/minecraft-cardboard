@@ -20,21 +20,25 @@
 //! server run on this machine (see `local`), and Multiplayer asks for a server's address
 //! (remembered in `options.txt` beside the exe). In a world, Esc (or the window losing focus) opens the pause screen,
 //! whose Disconnect, or Save and Quit to Title, comes back to the menus, as losing the
-//! connection does.
+//! connection does. Options, from the title or pause screen, sets the FOV and each sound
+//! category's volume, saved in `options.txt` as vanilla saves them.
 
 use anyhow::{Context, Result, bail};
 use glam::Vec3;
 use mc_render::bake::BlockModels;
-use mc_render::hud::menu;
+use mc_render::hud::keys::Key;
+use mc_render::hud::{menu, nav, options};
 
 mod chat;
 mod entities;
 mod hands;
 mod inventory;
+mod keys;
 mod light;
 mod local;
 mod particles;
 mod skins;
+mod sound;
 mod stream;
 mod walk;
 use mc_render::gpu::{Camera, Renderer, View};
@@ -51,6 +55,8 @@ struct Args {
     world_given: bool,
     server: Option<String>,
     name: String,
+    /// `--distance` was given, so it wins over the saved Render Distance.
+    distance_given: bool,
     /// `--pos` and `--look` were given, so they win over the server's placement.
     pos_given: bool,
     look_given: bool,
@@ -66,6 +72,7 @@ fn parse_args() -> Result<Args> {
     let mut args = Args {
         world: mc_assets::locate("fixtures/worlds/test-world"),
         world_given: false,
+        distance_given: false,
         server: None,
         name: "cardboard".into(),
         pos_given: false,
@@ -109,7 +116,7 @@ fn parse_args() -> Result<Args> {
                 }
                 _ => bail!("--look takes YAW,PITCH"),
             },
-            "--distance" => args.distance = value()?.parse()?,
+            "--distance" => (args.distance, args.distance_given) = (value()?.parse()?, true),
             "--ticks" => args.ticks = value()?.parse()?,
             "--fov" => args.camera.fov = value()?.parse()?,
             "--screenshot" => args.screenshot = Some(value()?.into()),
@@ -254,11 +261,7 @@ fn report_failure(message: &str) {
 
 fn run() -> Result<()> {
     let mut args = parse_args()?;
-    let view = View {
-        distance: (args.distance * 16) as f32,
-        ticks: args.ticks,
-        hud: false,
-    };
+    let view = View::new((args.distance * 16) as f32, args.ticks, false);
     match args.screenshot.clone() {
         Some(path) if args.server.is_some() => {
             let scene = load_scene(&args)?;
@@ -324,20 +327,35 @@ fn run() -> Result<()> {
                 singleplayer: false,
                 last_row_click: None,
                 view: View { hud: true, ..view },
-                buttons: Default::default(),
+                bindings: Default::default(),
+                toggles: Default::default(),
                 outlined: None,
                 shown_hotbar: None,
                 shown_cracks: Vec::new(),
                 state: None,
                 keys: Default::default(),
                 last_frame: Instant::now(),
+                sounds: sound::Sounds::new(),
+                options: None,
+                fov: 70,
+                drag: None,
+                video: Default::default(),
+                mouse: Default::default(),
+                wheel: 0.0,
+                last_input: Instant::now(),
+                frame_due: Instant::now(),
+                started: Instant::now(),
+                sound_clock: 0.0,
                 captured: false,
                 cursor: None,
                 focused_at: Instant::now(),
                 paused: false,
+                pause_focus: None,
+                input_type: None,
                 chat: Default::default(),
                 modifiers: Default::default(),
             };
+            app.load_options();
             if app.start.server.is_some() || app.start.world_given {
                 app.play(app.start.server.clone());
             } else {
@@ -352,6 +370,19 @@ fn run() -> Result<()> {
     }
 }
 
+/// The VSync option: presenting in step with the display (`Fifo`), or not, if the surface
+/// can.
+fn present_mode(modes: &[wgpu::PresentMode], vsync: bool) -> wgpu::PresentMode {
+    use wgpu::PresentMode::{Fifo, Immediate, Mailbox};
+    match vsync {
+        true => Fifo,
+        false => [Immediate, Mailbox]
+            .into_iter()
+            .find(|m| modes.contains(m))
+            .unwrap_or(Fifo),
+    }
+}
+
 /// `options.txt` beside the exe, where vanilla keeps its options.
 fn options_path() -> PathBuf {
     std::env::current_exe()
@@ -360,27 +391,38 @@ fn options_path() -> PathBuf {
         .unwrap_or_else(|| "options.txt".into())
 }
 
-/// `Options.lastMpIp`, saved as vanilla saves it: `lastServer:` in `options.txt`.
-fn last_server() -> String {
+/// An option saved in `options.txt` as vanilla saves them, `name:value` a line.
+fn option(name: &str) -> Option<String> {
     std::fs::read_to_string(options_path())
-        .unwrap_or_default()
+        .ok()?
         .lines()
-        .find_map(|l| l.strip_prefix("lastServer:"))
-        .unwrap_or_default()
-        .to_owned()
+        .find_map(|l| Some(l.strip_prefix(name)?.strip_prefix(':')?.to_owned()))
 }
 
-fn save_last_server(address: &str) {
+/// Saves `options` into `options.txt`, keeping the other lines there.
+fn save_options(options: &[(String, String)]) {
     let old = std::fs::read_to_string(options_path()).unwrap_or_default();
     let mut lines: Vec<String> = old
         .lines()
-        .filter(|l| !l.starts_with("lastServer:"))
+        .filter(|l| {
+            let name = l.split(':').next().unwrap_or_default();
+            !options.iter().any(|(n, _)| n == name)
+        })
         .map(str::to_owned)
         .collect();
-    lines.push(format!("lastServer:{address}"));
+    lines.extend(options.iter().map(|(n, v)| format!("{n}:{v}")));
     if let Err(e) = std::fs::write(options_path(), lines.join("\n") + "\n") {
         eprintln!("saving options.txt: {e}");
     }
+}
+
+/// `Options.lastMpIp`, saved as `lastServer:`.
+fn last_server() -> String {
+    option("lastServer").unwrap_or_default()
+}
+
+fn save_last_server(address: &str) {
+    save_options(&[("lastServer".into(), address.into())]);
 }
 
 fn spawn_streamer(scene: Scene, args: &Args) -> stream::Streamer {
@@ -486,8 +528,18 @@ fn folder_and_date(world: &local::World) -> String {
     )
 }
 
+/// What the mouse is dragging on an options screen.
+#[derive(Clone, Copy)]
+enum Drag {
+    Slider(options::Action),
+    /// The scroll bar, from this height in GUI pixels.
+    Scrollbar(f32),
+}
+
 struct WindowState {
     window: Arc<winit::window::Window>,
+    /// The ways the surface can present, for VSync on or off.
+    present_modes: Vec<wgpu::PresentMode>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
@@ -522,21 +574,50 @@ struct App {
     focused_at: Instant,
     /// The pause screen is open over the world.
     paused: bool,
+    /// The pause screen's focused button.
+    pause_focus: Option<mc_render::hud::pause::Action>,
+    /// `Minecraft.lastInputType`: the mouse, Tab or an arrow key, which decides whether a
+    /// screen opens with a widget focused and whether a slider takes the arrows.
+    input_type: Option<InputType>,
     /// The chat on a server, and its screen when open.
     chat: chat::Chat,
     /// Shift, Ctrl and the like, held now.
     modifiers: winit::keyboard::ModifiersState,
     view: View,
     state: Option<WindowState>,
-    keys: std::collections::HashSet<winit::keyboard::KeyCode>,
-    /// Mouse buttons held while the mouse is captured.
-    buttons: walk::Buttons,
+    /// The keys and mouse buttons held in the game.
+    keys: std::collections::HashSet<Key>,
+    /// Which key each key mapping is on.
+    bindings: keys::Bindings,
+    /// Sneak and Sprint, held or toggled.
+    toggles: keys::Toggles,
     /// The block the outline is drawn around, and its state.
     outlined: Option<(glam::IVec3, u32)>,
     /// What the hotbar and the cracks last showed.
     shown_hotbar: Option<mc_render::hud::Hotbar>,
     shown_cracks: Vec<([i32; 3], u32, u8)>,
     last_frame: Instant,
+    /// The sound engine and the music.
+    sounds: sound::Sounds,
+    /// The options screens, open over the title screen or the pause screen.
+    options: Option<options::Options>,
+    /// `Options.fov`, in degrees.
+    fov: i32,
+    /// The slider or scroll bar being dragged on an options screen.
+    drag: Option<Drag>,
+    /// The video options.
+    video: options::Video,
+    mouse: options::Mouse,
+    /// `ScrollWheelHandler`'s scrolling not yet a whole notch.
+    wheel: f64,
+    /// When the player last pressed a key or moved or clicked the mouse
+    /// (`FramerateLimitTracker.latestInputTime`), and when the last frame started.
+    last_input: Instant,
+    frame_due: Instant,
+    /// When the game started, which scrolls labels too wide for their buttons.
+    started: Instant,
+    /// Time not yet ticked by the sounds, which tick 20 times a second with the game.
+    sound_clock: f32,
     captured: bool,
     /// Where the mouse pointer is in the window, in pixels.
     cursor: Option<[f32; 2]>,
@@ -604,7 +685,7 @@ impl App {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: present_mode(&caps.present_modes, self.video.vsync),
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
@@ -614,6 +695,7 @@ impl App {
         let renderer = Renderer::new(device, queue, format, &self.models);
         self.state = Some(WindowState {
             window,
+            present_modes: caps.present_modes.clone(),
             surface,
             config,
             renderer,
@@ -675,6 +757,10 @@ impl App {
             .iter()
             .map(|w| menu::WorldRow {
                 name: w.settings.name.clone(),
+                folder: w
+                    .dir
+                    .file_name()
+                    .map_or(String::new(), |f| f.to_string_lossy().into()),
                 folder_and_date: folder_and_date(w),
                 mode: menu::GameMode::from_name(&w.settings.game_mode),
                 commands: w.settings.commands,
@@ -695,12 +781,14 @@ impl App {
         } else {
             menu::Screen::SelectWorld
         };
-        (m.worlds, m.selected) = (rows, None);
+        (m.worlds, m.selected, m.search) = (rows, None, Default::default());
     }
 
     /// The world finished loading: draw it with a renderer for its models.
     fn enter_world(&mut self, scene: Scene, server: Option<local::LocalServer>) -> Result<()> {
         self.local_server = server;
+        // `Minecraft.updateLevelInEngines`: a new level stops every sound.
+        self.sounds.stop_all();
         let state = self.state.as_mut().context("no window")?;
         if let Some(walker) = &self.walker {
             self.vignette = walker.vignette();
@@ -725,11 +813,13 @@ impl App {
         );
         self.models = scene.models.clone();
         self.streamer = Some(spawn_streamer(scene, &self.args));
-        (self.menu, self.paused) = (None, false);
+        (self.menu, self.paused, self.options) = (None, false, None);
         self.chat = Default::default();
         (self.outlined, self.shown_hotbar) = (None, None);
         self.shown_cracks.clear();
         self.view.ticks = self.args.ticks;
+        // The walker's options.
+        self.apply_video(Some(self.video));
         Ok(())
     }
 
@@ -740,6 +830,8 @@ impl App {
             self.vignette = walker.vignette();
         }
         (self.walker, self.streamer, self.loading) = (None, None, None);
+        // `Minecraft.disconnect` stops every sound.
+        self.sounds.stop_all();
         // Stops the world's server, which saves the world.
         self.local_server = None;
         self.args.camera.bob = glam::Mat4::IDENTITY;
@@ -753,8 +845,10 @@ impl App {
             );
         }
         self.models = self.menu_models.clone();
-        (self.captured, self.buttons, self.paused) = (false, Default::default(), false);
+        (self.captured, self.paused) = (false, false);
+        (self.options, self.drag) = (None, None);
         self.keys.clear();
+        self.toggles.release();
         self.chat = Default::default();
         self.menu = Some(menu::Menu {
             screen,
@@ -787,6 +881,7 @@ impl App {
     ) {
         let back = self.back_screen();
         let Some(m) = &mut self.menu else { return };
+        let before = m.screen.clone();
         match action {
             menu::Action::Singleplayer => self.open_worlds(),
             menu::Action::OpenCreateWorld => {
@@ -829,7 +924,7 @@ impl App {
                 m.address = menu::Field::new(&last_server());
                 self.focused_at = Instant::now();
             }
-            menu::Action::Options => {}
+            menu::Action::Options => self.open_options(false),
             menu::Action::Quit => event_loop.exit(),
             menu::Action::Join => {
                 let address = m.address.value.trim().to_owned();
@@ -851,8 +946,101 @@ impl App {
                 m.screen = screen;
             }
         }
+        // `Gui.setScreen` clears the focus of the screen it leaves, and a screen gone back
+        // to has none; a new one takes its initial focus. A button that leaves the screen
+        // as it is keeps the focus.
+        let Some(m) = &mut self.menu else { return };
+        match action {
+            menu::Action::Back | menu::Action::Options => m.focused = None,
+            _ if m.screen != before => self.menu_initial_focus(),
+            _ => {}
+        }
     }
 
+    /// `Screen.setInitialFocus` for a menu screen just opened: Direct Connection's, Select
+    /// World's and Create New World's box; on the others, the first widget if the keyboard
+    /// was last used.
+    fn menu_initial_focus(&mut self) {
+        let (items, focuses) = self.menu_items();
+        let keyboard = self.input_type.is_some_and(InputType::keyboard);
+        let Some(m) = &mut self.menu else { return };
+        m.focused = match m.screen {
+            menu::Screen::DirectConnect | menu::Screen::SelectWorld | menu::Screen::CreateWorld => {
+                Some(menu::Focus::Box)
+            }
+            _ if keyboard => nav::tab(&items, None, true).map(|i| focuses[i]),
+            _ => None,
+        };
+        self.focused_at = Instant::now();
+    }
+
+    /// The menu screen's widgets that may take the focus, in tab order (`Screen.children`
+    /// by `getTabOrderGroup`), and which each is.
+    fn menu_items(&self) -> (Vec<nav::Item>, Vec<menu::Focus>) {
+        let Some(m) = &self.menu else {
+            return Default::default();
+        };
+        let [_, _, width, height] = self.gui_rect();
+        let item = |rect, active| nav::Item {
+            rect,
+            active,
+            row: None,
+        };
+        let mut items = Vec::new();
+        match m.screen {
+            // The tab bar, the tab's widgets row by row, then the footer's.
+            menu::Screen::CreateWorld => {
+                let tabs = menu::tab_rects(width);
+                let bar = [tabs[0][0], 0, tabs[2][0] + tabs[2][2] - tabs[0][0], 24];
+                items.push((item(bar, true), menu::Focus::Tabs));
+            }
+            // The search box, the list, then the buttons.
+            menu::Screen::SelectWorld => {
+                items.push((item(menu::search_rect(width), true), menu::Focus::Box));
+                let worlds = !menu::shown_worlds(m, height).is_empty();
+                let list = menu::list_rect(width, height);
+                items.push((item(list, worlds), menu::Focus::List));
+            }
+            _ => {}
+        }
+        if m.screen != menu::Screen::SelectWorld
+            && let Some(rect) = m.field_rect(width, height)
+        {
+            items.push((item(rect, true), menu::Focus::Box));
+        }
+        let buttons = menu::buttons(m, &self.menu_models.hud, width, height);
+        let footer = (items.len() + buttons.len()).saturating_sub(2);
+        items.extend(
+            buttons
+                .into_iter()
+                .map(|(action, b, active)| (item(b.rect, active), menu::Focus::Button(action))),
+        );
+        if m.screen == menu::Screen::CreateWorld {
+            items[1..footer].sort_by_key(|(item, _)| item.rect[1]);
+        }
+        items.into_iter().unzip()
+    }
+
+    /// `TabNavigationBar.selectTab`: Create New World shows tab `tab` with a click, and
+    /// the focus leaves the widgets of the tab it hides.
+    fn select_tab(&mut self, tab: usize) {
+        use menu::{Action, Focus};
+        let Some(m) = &mut self.menu else { return };
+        if m.new_world.tab == tab {
+            return;
+        }
+        m.new_world.tab = tab;
+        if !matches!(
+            m.focused,
+            Some(Focus::Tabs | Focus::Button(Action::Create | Action::Back))
+        ) {
+            m.focused = None;
+        }
+        self.click_sound();
+    }
+
+    /// A click on a menu (`ContainerEventHandler.mouseClicked`): the widget clicked takes
+    /// the focus, and a click on nothing leaves it where it is.
     fn menu_click(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         let Some(state) = &self.state else { return };
         let (width, height, Some(mouse)) = state.gui(self.cursor) else {
@@ -864,39 +1052,35 @@ impl App {
             let [x, y, w, h] = rect.map(|c| c as f32);
             mouse[0] >= x && mouse[1] >= y && mouse[0] < x + w && mouse[1] < y + h
         };
+        // A click on the box moves its cursor there.
+        if let Some(rect) = m.field_rect(width, height)
+            && inside(rect)
+            && let Some(field) = m.field()
+        {
+            field.cursor = menu::clicked_position(art, field, rect, mouse[0]);
+            m.focused = Some(menu::Focus::Box);
+            self.focused_at = Instant::now();
+            return;
+        }
         match m.screen {
-            menu::Screen::DirectConnect => {
-                let rect = menu::address_rect(width);
-                if inside(rect) {
-                    m.address.cursor = menu::clicked_position(art, &m.address, rect, mouse[0]);
-                    self.focused_at = Instant::now();
-                }
-            }
-            // A click on a tab shows it; on the tab's box, moves its cursor there.
             menu::Screen::CreateWorld => {
-                let new = &mut m.new_world;
                 if let Some(tab) = menu::tab_rects(width).iter().position(|&r| inside(r)) {
-                    new.tab = tab;
-                    self.focused_at = Instant::now();
-                } else if let Some(rect) = menu::new_world_box(new.tab, width, height)
-                    && inside(rect)
-                    && let Some(field) = new.focused()
-                {
-                    field.cursor = menu::clicked_position(art, field, rect, mouse[0]);
-                    self.focused_at = Instant::now();
+                    m.focused = Some(menu::Focus::Tabs);
+                    return self.select_tab(tab);
                 }
             }
             // A click selects a world; a second within a quarter of a second plays it.
             menu::Screen::SelectWorld => {
                 if let Some(row) = menu::world_at(m, width, height, mouse) {
-                    m.selected = Some(row);
+                    (m.selected, m.focused) = (Some(row), Some(menu::Focus::List));
                     let double = self
                         .last_row_click
                         .is_some_and(|(r, at)| r == row && at.elapsed().as_millis() < 250);
                     self.last_row_click = Some((row, Instant::now()));
                     if double {
-                        return self.menu_action(menu::Action::PlaySelected, event_loop);
+                        self.menu_action(menu::Action::PlaySelected, event_loop);
                     }
+                    return;
                 }
             }
             _ => {}
@@ -906,72 +1090,210 @@ impl App {
             .find(|(_, button, active)| *active && button.contains(mouse))
             .map(|(action, ..)| action);
         if let Some(action) = action {
+            m.focused = Some(menu::Focus::Button(action));
+            self.click_sound();
             self.menu_action(action, event_loop);
         }
     }
 
-    /// A key on a menu: Direct Connection's box edits as `EditBox` does, Enter joins and
-    /// Esc goes back.
+    /// `AbstractWidget.playDownSound`: a button pressed.
+    fn click_sound(&mut self) {
+        let seed = self.sounds.seed();
+        self.sounds
+            .play(sound::Instance::ui("minecraft:ui.button.click", 1.0, seed));
+    }
+
+    /// The sounds the world queued, the listener at the camera, and the sound engine and
+    /// music ticked for the time that's passed (`Minecraft.tick`'s `musicManager.tick` and
+    /// `soundManager.tick`).
+    fn tick_sounds(&mut self, dt: f32) {
+        if let Some(walker) = &mut self.walker {
+            for instance in walker.take_sounds() {
+                self.sounds.play(instance);
+            }
+        }
+        if self.streamer.is_some() {
+            let camera = &self.args.camera;
+            let look = |pitch: f32| mc_physics::view_vector(camera.yaw, pitch).as_vec3();
+            self.sounds
+                .listener(camera.eye, look(camera.pitch), look(camera.pitch - 90.0));
+        }
+        self.sound_clock += dt;
+        while self.sound_clock >= 0.05 {
+            self.sound_clock -= 0.05;
+            // `getSituationalMusic`: the world's music in a world, the menu's out of one.
+            let track = match &self.walker {
+                Some(walker) => walker.music(),
+                None if self.streamer.is_some() => None,
+                None => Some(sound::Track::menu()),
+            };
+            self.sounds
+                .tick_music(track.as_ref(), 1.0, self.loading.is_some());
+            let walker = self.walker.as_ref();
+            self.sounds
+                .tick(&|id| walker.and_then(|w| w.entity_position(id)));
+        }
+    }
+
+    /// A key on a menu (`Screen.keyPressed`): Esc goes back from the screens with a box,
+    /// the focused box edits as `EditBox` does, Enter or Space presses the focused button,
+    /// and Tab and the arrows move the focus.
     fn menu_key(
         &mut self,
         event: &winit::event::KeyEvent,
         event_loop: &winit::event_loop::ActiveEventLoop,
     ) {
-        use winit::keyboard::{Key, NamedKey};
+        use menu::{Action, Focus};
+        use winit::keyboard::{KeyCode as K, PhysicalKey};
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return;
+        };
+        let (items, focuses) = self.menu_items();
+        let height = self.gui_rect()[3];
+        let control = self.modifiers.control_key();
+        let back_tab = self.modifiers.shift_key();
         let Some(m) = &mut self.menu else { return };
-        let (field, enter, max) = match m.screen {
-            menu::Screen::DirectConnect => (&mut m.address, menu::Action::Join, 128),
-            // Ctrl+Tab shows the next tab (Shift for the one before), as
-            // `TabNavigationBar.keyPressed` does; the name and seed take up to `EditBox`'s
-            // 32 characters.
-            menu::Screen::CreateWorld => {
-                let new = &mut m.new_world;
-                let key = &event.logical_key;
-                if *key == Key::Named(NamedKey::Tab) && self.modifiers.control_key() {
-                    let step = if self.modifiers.shift_key() { 2 } else { 1 };
-                    new.tab = (new.tab + step) % 3;
-                    self.focused_at = Instant::now();
+        let screen = m.screen.clone();
+        let has_box = matches!(
+            screen,
+            menu::Screen::DirectConnect | menu::Screen::SelectWorld | menu::Screen::CreateWorld
+        );
+        if has_box && code == K::Escape {
+            return self.menu_action(Action::Back, event_loop);
+        }
+        // `TabNavigationBar.keyPressed`: Ctrl+Tab shows the next tab (with Shift, the one
+        // before), and Ctrl and a digit that tab, the last for any past it.
+        if screen == menu::Screen::CreateWorld && control {
+            let tab = m.new_world.tab;
+            let next = match code {
+                K::Tab if back_tab => Some((tab + 2) % 3),
+                K::Tab => Some((tab + 1) % 3),
+                _ => digit(code).map(|n| ((n + 9) % 10).min(2)),
+            };
+            if let Some(next) = next {
+                return self.select_tab(next);
+            }
+        }
+        if m.focused == Some(Focus::Box) {
+            let join = screen == menu::Screen::DirectConnect
+                && confirmation(code)
+                && menu::valid_address(&m.address.value);
+            let Some(field) = m.field() else { return };
+            let max = if screen == menu::Screen::DirectConnect {
+                128
+            } else {
+                32
+            };
+            let typed = event
+                .text
+                .as_deref()
+                .filter(|t| t.chars().all(|c| c >= ' '));
+            match (code, typed) {
+                (K::Backspace, _) => field.backspace(),
+                (K::Delete, _) => field.delete(),
+                (K::ArrowLeft, _) => field.step(-1),
+                (K::ArrowRight, _) => field.step(1),
+                (K::Home, _) => field.home(),
+                (K::End, _) => field.end(),
+                (_, Some(text)) if !text.is_empty() => field.insert(text, max),
+                // `DirectJoinServerScreen.keyPressed`: Enter in the box joins.
+                _ if join => return self.menu_action(Action::Join, event_loop),
+                _ if screen == menu::Screen::CreateWorld && confirmation(code) => {
+                    return self.menu_action(Action::Create, event_loop);
+                }
+                _ => return self.menu_navigate(code),
+            }
+            // `WorldSelectionList.fillLevels`: the selection goes if the search hides it.
+            let shown = menu::shown_worlds(m, height);
+            m.selected = m.selected.filter(|s| shown.contains(s));
+            self.focused_at = Instant::now();
+            return;
+        }
+        let focused = focuses
+            .iter()
+            .zip(&items)
+            .find(|(f, item)| item.active && Some(**f) == m.focused)
+            .map(|(f, _)| *f);
+        if selection(code) {
+            match focused {
+                Some(Focus::Button(action)) => {
+                    self.click_sound();
+                    return self.menu_action(action, event_loop);
+                }
+                // `WorldListEntry.keyPressed`: plays the world.
+                Some(Focus::List) if m.selected.is_some() => {
+                    self.click_sound();
+                    return self.menu_action(Action::PlaySelected, event_loop);
+                }
+                _ => {}
+            }
+        }
+        // `CreateWorldScreen.keyPressed`: Enter that nothing else took creates the world.
+        if screen == menu::Screen::CreateWorld && confirmation(code) {
+            return self.menu_action(Action::Create, event_loop);
+        }
+        self.menu_navigate(code);
+    }
+
+    /// Tab or an arrow on a menu: first inside the focused list or tab bar, then from
+    /// widget to widget.
+    fn menu_navigate(&mut self, code: winit::keyboard::KeyCode) {
+        use menu::Focus;
+        use winit::keyboard::KeyCode as K;
+        let screen = self.gui_rect();
+        let back_tab = code == K::Tab && self.modifiers.shift_key();
+        let Some(m) = &mut self.menu else { return };
+        let shown = menu::shown_worlds(m, screen[3]);
+        match (m.focused, code) {
+            // `ObjectSelectionList.nextFocusPath`: up or down the list from the selected
+            // world (from none, the first or the last); off its end, or with Left or
+            // Right, the list loses its selection and the focus moves on from it.
+            (Some(Focus::List), K::ArrowUp | K::ArrowDown | K::ArrowLeft | K::ArrowRight) => {
+                let at = m.selected.and_then(|s| shown.iter().position(|&i| i == s));
+                let next = match (code, at) {
+                    (K::ArrowUp, Some(a)) => a.checked_sub(1),
+                    (K::ArrowDown, Some(a)) => Some(a + 1),
+                    (K::ArrowUp, None) => shown.len().checked_sub(1),
+                    (K::ArrowDown, None) => Some(0),
+                    _ => None,
+                };
+                m.selected = next.and_then(|i| shown.get(i)).copied();
+                if m.selected.is_some() {
+                    self.input_type = Some(InputType::Arrow);
                     return;
                 }
-                match (new.focused(), key) {
-                    (Some(field), _) => (field, menu::Action::Create, 32),
-                    (None, Key::Named(NamedKey::Enter)) => {
-                        return self.menu_action(menu::Action::Create, event_loop);
-                    }
-                    (None, Key::Named(NamedKey::Escape)) => {
-                        return self.menu_action(menu::Action::Back, event_loop);
-                    }
-                    (None, _) => return,
+            }
+            // The tab bar's own arrow navigation: focusing a tab shows it.
+            (Some(Focus::Tabs), K::ArrowLeft | K::ArrowRight) => {
+                let step = if code == K::ArrowLeft { -1 } else { 1 };
+                let tab = m.new_world.tab as i32 + step;
+                if (0..3).contains(&tab) {
+                    self.input_type = Some(InputType::Arrow);
+                    return self.select_tab(tab as usize);
                 }
             }
-            menu::Screen::SelectWorld => {
-                match &event.logical_key {
-                    Key::Named(NamedKey::Enter) => {
-                        self.menu_action(menu::Action::PlaySelected, event_loop)
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        self.menu_action(menu::Action::Back, event_loop)
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            _ => return,
-        };
-        match &event.logical_key {
-            Key::Named(NamedKey::Enter) => return self.menu_action(enter, event_loop),
-            Key::Named(NamedKey::Escape) => {
-                return self.menu_action(menu::Action::Back, event_loop);
-            }
-            Key::Named(NamedKey::Backspace) => field.backspace(),
-            Key::Named(NamedKey::Delete) => field.delete(),
-            Key::Named(NamedKey::ArrowLeft) => field.step(-1),
-            Key::Named(NamedKey::ArrowRight) => field.step(1),
-            Key::Named(NamedKey::Home) => field.home(),
-            Key::Named(NamedKey::End) => field.end(),
-            _ => field.insert(event.text.as_deref().unwrap_or(""), max),
+            _ => {}
         }
-        self.focused_at = Instant::now();
+        let (items, focuses) = self.menu_items();
+        let Some(m) = &self.menu else { return };
+        let focused = focuses
+            .iter()
+            .zip(&items)
+            .position(|(f, item)| item.active && Some(*f) == m.focused);
+        let Some(next) = self.navigate(code, &items, focused, screen, [0; 4]) else {
+            return;
+        };
+        let Some(m) = &mut self.menu else { return };
+        m.focused = Some(focuses[next]);
+        match focuses[next] {
+            // Into the list: its selected world, or the first (the last going up).
+            Focus::List if !m.selected.is_some_and(|s| shown.contains(&s)) => {
+                let up = code == K::ArrowUp || back_tab;
+                m.selected = if up { shown.last() } else { shown.first() }.copied();
+            }
+            Focus::Box => self.focused_at = Instant::now(),
+            _ => {}
+        }
     }
 
     /// `Minecraft.pauseGame`: opens the pause screen over the world in play, letting go of
@@ -990,8 +1312,16 @@ impl App {
         if let Some(state) = &self.state {
             state.release();
         }
-        (self.paused, self.captured, self.buttons) = (true, false, Default::default());
+        (self.paused, self.captured) = (true, false);
+        self.pause_focus = None;
+        let items = self.pause_items().0;
+        if self.input_type.is_some_and(InputType::keyboard)
+            && let Some(i) = nav::tab(&items, None, true)
+        {
+            self.pause_focus = Some(self.pause_items().1[i]);
+        }
         self.keys.clear();
+        self.toggles.release();
     }
 
     /// Back to Game: closes the pause screen and captures the mouse again.
@@ -999,6 +1329,7 @@ impl App {
         self.paused = false;
         if let Some(state) = &self.state {
             self.captured = state.grab();
+            self.toggles.restore(&self.bindings);
         }
     }
 
@@ -1010,15 +1341,681 @@ impl App {
         let pause = mc_render::hud::pause::Pause {
             local: self.walker.is_none() || self.singleplayer,
             mouse: None,
+            focused: None,
         };
         let action = mc_render::hud::pause::buttons(&pause, width, height)
             .into_iter()
             .find(|(_, button, active, _)| *active && button.contains(mouse))
             .map(|(action, ..)| action);
-        match action {
+        if let Some(action) = action {
+            self.pause_focus = Some(action);
+            self.pause_activate(action);
+        }
+    }
+
+    /// A pause screen button pressed, by the mouse or the keyboard.
+    fn pause_activate(&mut self, action: mc_render::hud::pause::Action) {
+        self.click_sound();
+        match Some(action) {
             Some(mc_render::hud::pause::Action::ReturnToGame) => self.resume(),
+            Some(mc_render::hud::pause::Action::Options) => self.open_options(true),
             Some(mc_render::hud::pause::Action::Leave) => self.leave_world(menu::Screen::Title),
             _ => {}
+        }
+    }
+
+    /// The pause screen's buttons for navigation, and what each does.
+    fn pause_items(&self) -> (Vec<nav::Item>, Vec<mc_render::hud::pause::Action>) {
+        let Some(state) = &self.state else {
+            return Default::default();
+        };
+        let (width, height, _) = state.gui(None);
+        let pause = mc_render::hud::pause::Pause {
+            local: self.walker.is_none() || self.singleplayer,
+            mouse: None,
+            focused: None,
+        };
+        mc_render::hud::pause::buttons(&pause, width, height)
+            .into_iter()
+            .map(|(action, b, active, _)| {
+                let item = nav::Item {
+                    rect: b.rect,
+                    active,
+                    row: None,
+                };
+                (item, action)
+            })
+            .unzip()
+    }
+
+    /// A key on the pause screen: Enter or Space presses the focused button, Tab and the
+    /// arrows move the focus.
+    fn pause_key(&mut self, code: winit::keyboard::KeyCode) {
+        let (items, actions) = self.pause_items();
+        let focused = actions
+            .iter()
+            .zip(&items)
+            .position(|(a, item)| item.active && Some(*a) == self.pause_focus);
+        if selection(code) {
+            if let Some(f) = focused {
+                self.pause_activate(actions[f]);
+            }
+            return;
+        }
+        let screen = self.gui_rect();
+        if let Some(next) = self.navigate(code, &items, focused, screen, [0; 4]) {
+            self.pause_focus = Some(actions[next]);
+        }
+    }
+
+    /// A key on the death screen or its confirmation: Enter or Space presses the focused
+    /// button once the buttons work, Tab and the arrows move the focus.
+    fn death_key(&mut self, code: winit::keyboard::KeyCode) {
+        let screen = self.gui_rect();
+        let Some(death) = self.walker.as_ref().and_then(walk::Walker::death_screen) else {
+            return;
+        };
+        let items: Vec<nav::Item> = mc_render::hud::death_buttons(&death, screen[2], screen[3])
+            .iter()
+            .map(|b| nav::Item {
+                rect: b.rect,
+                active: death.active,
+                row: None,
+            })
+            .collect();
+        if selection(code) {
+            let Some(walker) = &mut self.walker else {
+                return;
+            };
+            if let Some(f) = death.focused
+                && walker.press_screen(f) == walk::ScreenAction::Quit
+            {
+                return self.leave_world(menu::Screen::Title);
+            }
+            // `TitleConfirmScreen` opened by keyboard: `setInitialFocus` focuses its first
+            // button before `setDelay` turns them off.
+            if walker
+                .death_screen()
+                .is_some_and(|d| d.confirm && d.focused.is_none())
+            {
+                walker.focus_screen(Some(0));
+            }
+            return;
+        }
+        if let Some(next) = self.navigate(code, &items, death.focused, screen, [0; 4])
+            && let Some(walker) = &mut self.walker
+        {
+            walker.focus_screen(Some(next));
+        }
+    }
+
+    /// The GUI's rectangle, in GUI pixels.
+    fn gui_rect(&self) -> [i32; 4] {
+        let (w, h) = self.state.as_ref().map_or((0, 0), |s| {
+            let (w, h, _) = s.gui(None);
+            (w, h)
+        });
+        [0, 0, w, h]
+    }
+
+    /// `Screen.keyPressed`'s navigation: Tab (Shift+Tab back) or an arrow from the item
+    /// `focused` among `items`, noting the keyboard as the last input.
+    fn navigate(
+        &mut self,
+        code: winit::keyboard::KeyCode,
+        items: &[nav::Item],
+        focused: Option<usize>,
+        screen: [i32; 4],
+        list: [i32; 4],
+    ) -> Option<usize> {
+        use winit::keyboard::KeyCode as K;
+        let direction = match code {
+            K::Tab => {
+                self.input_type = Some(InputType::Tab);
+                return nav::tab(items, focused, !self.modifiers.shift_key());
+            }
+            K::ArrowUp => nav::Direction::Up,
+            K::ArrowDown => nav::Direction::Down,
+            K::ArrowLeft => nav::Direction::Left,
+            K::ArrowRight => nav::Direction::Right,
+            _ => return None,
+        };
+        self.input_type = Some(InputType::Arrow);
+        nav::arrow(items, focused, direction, screen, list)
+    }
+
+    /// `Options.load` from `options.txt`: the FOV (saved as `(fov - 70) / 40`), the sound
+    /// volumes and the video options. `--fov` and `--distance` win over what's saved.
+    fn load_options(&mut self) {
+        let number = |name: &str| option(name)?.trim().parse::<f64>().ok();
+        let flag = |name: &str| option(name).map(|v| v.trim() == "true");
+        let text = |name: &str| option(name).map(|v| v.trim().trim_matches('"').to_owned());
+        if let Some(v) = number("fov") {
+            self.fov = ((v * 40.0 + 70.0) as i32).clamp(30, 110);
+        }
+        if self.start.camera.fov == 70.0 {
+            self.set_fov(self.fov);
+        } else {
+            self.fov = self.start.camera.fov as i32;
+        }
+        for (i, name) in options::CATEGORIES.iter().enumerate() {
+            if let Some(v) = number(&format!("soundCategory_{name}")) {
+                self.sounds
+                    .set_volume(sound::Category::from_id(i as i32), v.clamp(0.0, 1.0));
+            }
+        }
+        let v = &mut self.video;
+        let int = |name: &str| number(name).map(|n| n as i32);
+        v.framerate = int("maxFps").map_or(v.framerate, |n| n.clamp(10, 260));
+        v.vsync = flag("enableVsync").unwrap_or(v.vsync);
+        v.afk_limit = text("inactivityFpsLimit").is_none_or(|t| t != "minimized");
+        v.gui_scale = int("guiScale").map_or(v.gui_scale, |n| n.max(0));
+        v.fullscreen = flag("fullscreen").unwrap_or(v.fullscreen);
+        v.gamma = number("gamma").map_or(v.gamma, |g| g.clamp(0.0, 1.0));
+        v.render_distance = match self.start.distance_given {
+            true => self.start.distance,
+            false => int("renderDistance").map_or(v.render_distance, |n| n.clamp(2, 32)),
+        };
+        v.clouds = match text("renderClouds").as_deref() {
+            Some("false") => options::Clouds::Off,
+            Some("fast") => options::Clouds::Fast,
+            _ => options::Clouds::Fancy,
+        };
+        v.particles = match int("particles") {
+            Some(1) => options::Particles::Decreased,
+            Some(2) => options::Particles::Minimal,
+            _ => options::Particles::All,
+        };
+        v.cloud_range = int("cloudRange").map_or(v.cloud_range, |n| n.clamp(2, 128));
+        v.vignette = flag("vignette").unwrap_or(v.vignette);
+        v.attack_indicator = match int("attackIndicator") {
+            Some(0) => options::AttackIndicator::Off,
+            Some(2) => options::AttackIndicator::Hotbar,
+            _ => options::AttackIndicator::Crosshair,
+        };
+        let m = &mut self.mouse;
+        m.sensitivity = number("mouseSensitivity").map_or(m.sensitivity, |n| n.clamp(0.0, 1.0));
+        m.wheel = number("mouseWheelSensitivity").map_or(m.wheel, |n| n.clamp(0.01, 10.0));
+        m.discrete_scroll = flag("discrete_mouse_scroll").unwrap_or(m.discrete_scroll);
+        m.invert_x = flag("invertXMouse").unwrap_or(m.invert_x);
+        m.invert_y = flag("invertYMouse").unwrap_or(m.invert_y);
+        self.toggles.sneak.toggle = flag("toggleCrouch").unwrap_or(false);
+        self.toggles.sprint.toggle = flag("toggleSprint").unwrap_or(false);
+        self.toggles.attack.toggle = flag("toggleAttack").unwrap_or(false);
+        self.toggles.use_item.toggle = flag("toggleUse").unwrap_or(false);
+        self.bindings = keys::Bindings::load(option);
+        self.apply_video(None);
+    }
+
+    /// `Options.save`, for the options these screens change, written as vanilla writes
+    /// them (Java's `Double.toString`: "1.0", not "1"); in a world, `broadcastOptions`
+    /// tells the server the view distance.
+    fn save_options(&self) {
+        let fov = (self.fov as f64 - 70.0) / 40.0;
+        let mut saved = vec![("fov".to_owned(), format!("{fov:?}"))];
+        for (i, name) in options::CATEGORIES.iter().enumerate() {
+            let volume = self.sounds.volumes[i];
+            saved.push((format!("soundCategory_{name}"), format!("{volume:?}")));
+        }
+        let v = &self.video;
+        let clouds = match v.clouds {
+            options::Clouds::Off => "\"false\"",
+            options::Clouds::Fast => "\"fast\"",
+            options::Clouds::Fancy => "\"true\"",
+        };
+        let inactivity = if v.afk_limit {
+            "\"afk\""
+        } else {
+            "\"minimized\""
+        };
+        for (name, value) in [
+            ("maxFps", v.framerate.to_string()),
+            ("enableVsync", v.vsync.to_string()),
+            ("inactivityFpsLimit", inactivity.into()),
+            ("guiScale", v.gui_scale.to_string()),
+            ("fullscreen", v.fullscreen.to_string()),
+            ("gamma", format!("{:?}", v.gamma)),
+            ("renderDistance", v.render_distance.to_string()),
+            ("renderClouds", clouds.into()),
+            ("particles", (v.particles as i32).to_string()),
+            ("cloudRange", v.cloud_range.to_string()),
+            ("vignette", v.vignette.to_string()),
+            ("attackIndicator", (v.attack_indicator as i32).to_string()),
+        ] {
+            saved.push((name.to_owned(), value));
+        }
+        let m = &self.mouse;
+        for (name, value) in [
+            ("mouseSensitivity", format!("{:?}", m.sensitivity)),
+            ("mouseWheelSensitivity", format!("{:?}", m.wheel)),
+            ("discrete_mouse_scroll", m.discrete_scroll.to_string()),
+            ("invertXMouse", m.invert_x.to_string()),
+            ("invertYMouse", m.invert_y.to_string()),
+            ("toggleCrouch", self.toggles.sneak.toggle.to_string()),
+            ("toggleSprint", self.toggles.sprint.toggle.to_string()),
+            ("toggleAttack", self.toggles.attack.toggle.to_string()),
+            ("toggleUse", self.toggles.use_item.toggle.to_string()),
+        ] {
+            saved.push((name.to_owned(), value));
+        }
+        saved.extend(self.bindings.saved());
+        save_options(&saved);
+        if let Some(walker) = &self.walker {
+            walker.send_view_distance(v.render_distance);
+        }
+    }
+
+    fn set_fov(&mut self, fov: i32) {
+        self.fov = fov;
+        self.args.camera.fov = fov as f32;
+        self.start.camera.fov = fov as f32;
+    }
+
+    /// The video options take effect: each that changed from `old`, or all of them.
+    fn apply_video(&mut self, old: Option<options::Video>) {
+        let v = self.video;
+        let changed = |f: fn(&options::Video) -> bool| old.is_none_or(|o| f(&o) != f(&v));
+        mc_render::gpu::set_gui_scale(v.gui_scale as u32);
+        (self.view.gamma, self.view.vignette) = (v.gamma as f32, v.vignette);
+        (self.view.clouds, self.view.cloud_range) = (v.clouds, v.cloud_range);
+        if old.is_none_or(|o| o.render_distance != v.render_distance) {
+            (self.args.distance, self.start.distance) = (v.render_distance, v.render_distance);
+            self.view.distance = (v.render_distance * 16) as f32;
+            if let Some(streamer) = &mut self.streamer {
+                streamer.set_distance(v.render_distance);
+            }
+        }
+        if let Some(walker) = &mut self.walker {
+            walker.set_particle_status(v.particles);
+            walker.attack_indicator_mode = v.attack_indicator;
+        }
+        if let Some(state) = &mut self.state {
+            if changed(|v| v.vsync) {
+                state.config.present_mode = present_mode(&state.present_modes, v.vsync);
+                state
+                    .surface
+                    .configure(&state.renderer.device, &state.config);
+            }
+            // `Window.setFullscreen`: borderless on the monitor the window is on.
+            if changed(|v| v.fullscreen) {
+                let mode = v
+                    .fullscreen
+                    .then_some(winit::window::Fullscreen::Borderless(None));
+                state.window.set_fullscreen(mode);
+            }
+        }
+    }
+
+    /// `FramerateLimitTracker.getFramerateLimit`: 10 a second minimized or after ten idle
+    /// minutes, at most 30 after one (unless only minimized windows are limited), 60 on a
+    /// menu out of a world, otherwise the Max Framerate option.
+    fn framerate_limit(&self) -> i32 {
+        let minimized = self
+            .state
+            .as_ref()
+            .and_then(|s| s.window.is_minimized())
+            .unwrap_or(false);
+        let idle = self.last_input.elapsed().as_secs();
+        if minimized || (self.video.afk_limit && idle > 600) {
+            10
+        } else if self.video.afk_limit && idle > 60 {
+            self.video.framerate.min(30)
+        } else if self.streamer.is_none() && (self.menu.is_some() || self.options.is_some()) {
+            60
+        } else {
+            self.video.framerate
+        }
+    }
+
+    /// `RenderSystem.limitDisplayFPS`: under the limit (260 being none), waits out the rest
+    /// of the frame's time.
+    fn limit_frame_rate(&mut self) {
+        let limit = self.framerate_limit();
+        if limit < 260 {
+            let due = self.frame_due + std::time::Duration::from_secs_f64(1.0 / limit as f64);
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
+        self.frame_due = Instant::now();
+    }
+
+    /// Opens Options, from the title screen or, over the world, from the pause screen.
+    fn open_options(&mut self, in_world: bool) {
+        self.options = Some(options::Options {
+            in_world,
+            ..Default::default()
+        });
+        self.options_initial_focus();
+    }
+
+    /// `Screen.setInitialFocus`: with the keyboard last used, the first widget.
+    fn options_initial_focus(&mut self) {
+        if !self.input_type.is_some_and(InputType::keyboard) {
+            return;
+        }
+        let Some(state) = &self.state else { return };
+        let (width, height, _) = state.gui(None);
+        let Some(o) = self.options_view() else { return };
+        let widgets = options::widgets(&o, &self.menu_models.hud, width, height);
+        let items: Vec<_> = widgets.iter().map(options::Widget::nav).collect();
+        if let Some(i) = nav::tab(&items, None, true) {
+            self.options_focus(&widgets[i], height);
+        }
+    }
+
+    /// The focus moves to `w` (`AbstractSliderButton.setFocused`: a slider takes the arrows
+    /// when focused by the mouse or Tab), and the list scrolls to show it.
+    fn options_focus(&mut self, w: &options::Widget, height: i32) {
+        let tab_or_mouse = matches!(self.input_type, Some(InputType::Mouse | InputType::Tab));
+        let Some(o) = &mut self.options else { return };
+        (o.focused, o.can_change) = (Some(w.action), tab_or_mouse);
+        if let Some((_, y, h)) = w.entry {
+            o.scroll = options::scroll_to(o.page, o.scroll, (y, h), height);
+        }
+    }
+
+    /// A key on an options screen (`Screen.keyPressed`): the focused widget's first, Enter
+    /// or Space pressing a button or making a slider take the arrows (or let go of them),
+    /// and the left and right arrows moving a slider that takes them a pixel's worth; then
+    /// Tab and the arrows move the focus.
+    fn options_key(&mut self, code: winit::keyboard::KeyCode) {
+        use winit::keyboard::KeyCode as K;
+        let Some(state) = &self.state else { return };
+        let (width, height, _) = state.gui(None);
+        let Some(o) = self.options_view() else { return };
+        let widgets = options::widgets(&o, &self.menu_models.hud, width, height);
+        let focused = widgets
+            .iter()
+            .position(|w| w.active && Some(w.action) == o.focused);
+        if let Some(w) = focused.map(|f| &widgets[f]) {
+            match (code, w.slider) {
+                (_, Some(_)) if selection(code) => {
+                    if let Some(o) = &mut self.options {
+                        o.can_change = !o.can_change;
+                    }
+                    return;
+                }
+                (_, None) if selection(code) => {
+                    self.click_sound();
+                    return self.options_activate(w.action);
+                }
+                (K::ArrowLeft | K::ArrowRight, Some(value)) if o.can_change => {
+                    let sign = if code == K::ArrowLeft { -1.0 } else { 1.0 };
+                    let step = sign / (w.button.rect[2] - 8) as f64;
+                    return self.set_slider(w.action, (value + step).clamp(0.0, 1.0));
+                }
+                _ => {}
+            }
+        }
+        let items: Vec<_> = widgets.iter().map(options::Widget::nav).collect();
+        let (top, list_height) = options::list_area(height);
+        let list = [0, top, width, list_height];
+        if let Some(next) = self.navigate(code, &items, focused, [0, 0, width, height], list) {
+            self.options_focus(&widgets[next], height);
+        }
+    }
+
+    /// Opens another options page, keeping this one's focus for coming back.
+    fn options_page(&mut self, page: options::Page) {
+        if let Some(o) = &mut self.options {
+            o.parent_focus.push(o.focused);
+            (o.page, o.scroll, o.focused, o.dragging) = (page, 0.0, None, None);
+        }
+        self.options_initial_focus();
+    }
+
+    /// The options screen with the options as they are now.
+    fn options_view(&self) -> Option<options::Options> {
+        let mut o = self.options.clone()?;
+        (o.fov, o.volumes, o.video) = (self.fov, self.sounds.volumes, self.video);
+        o.mouse_options = self.mouse;
+        o.toggle_sneak = self.toggles.sneak.toggle;
+        o.toggle_sprint = self.toggles.sprint.toggle;
+        o.toggle_attack = self.toggles.attack.toggle;
+        o.toggle_use = self.toggles.use_item.toggle;
+        if let Some(state) = &self.state {
+            let (w, h) = (state.config.width, state.config.height);
+            o.video.gui_scale_max = mc_render::gpu::calculate_scale(w, h, 0) as i32;
+        }
+        o.millis = self.started.elapsed().as_millis() as u64;
+        o.keys = self.bindings.0.clone();
+        Some(o)
+    }
+
+    /// `OptionsSubScreen.onClose` and `OptionsScreen.onClose`: Mouse Settings and Key Binds
+    /// go back to Controls, the other pages to Options, and Options to the screen it opened from,
+    /// saving the options (`removed`).
+    fn options_back(&mut self) {
+        let Some(o) = &mut self.options else { return };
+        let back = match o.page {
+            options::Page::KeyBinds | options::Page::Mouse => options::Page::Controls,
+            _ => options::Page::Options,
+        };
+        match o.page {
+            // Back on the pause screen, nothing is focused, or with the keyboard last used,
+            // its first button (`Screen.setInitialFocus`).
+            options::Page::Options => {
+                self.options = None;
+                self.pause_focus = None;
+                if self.paused && self.input_type.is_some_and(InputType::keyboard) {
+                    let (items, actions) = self.pause_items();
+                    self.pause_focus = nav::tab(&items, None, true).map(|i| actions[i]);
+                }
+            }
+            _ => {
+                let focused = o.parent_focus.pop().flatten();
+                (o.page, o.scroll, o.focused, o.selected) = (back, 0.0, focused, None);
+                o.dragging = None;
+            }
+        }
+        self.drag = None;
+        self.save_options();
+    }
+
+    /// A slider moved to `value` (`AbstractSliderButton.setValue`): the FOV and the video
+    /// options change in their steps; a volume changes the sounds playing and, out of a
+    /// world, plays its category's preview.
+    fn set_slider(&mut self, action: options::Action, value: f64) {
+        let Some(o) = &mut self.options else { return };
+        o.dragging = Some((action, value));
+        match action {
+            options::Action::Fov => {
+                let fov = options::fov_from_slider(value);
+                if fov != self.fov {
+                    self.set_fov(fov);
+                }
+            }
+            options::Action::Volume(i) => {
+                if self.sounds.volumes[i] != value {
+                    let category = sound::Category::from_id(i as i32);
+                    self.sounds.set_volume(category, value);
+                    if self.streamer.is_none() {
+                        self.sounds.preview(category, value as f32);
+                    }
+                }
+            }
+            options::Action::Mouse(option) => self.mouse.set_slider(option, value),
+            options::Action::Video(option) => {
+                let old = self.video;
+                self.video.set_slider(option, value);
+                if self.video != old {
+                    self.apply_video(Some(old));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn options_click(&mut self) {
+        let Some(state) = &self.state else { return };
+        let (width, height, Some(mouse)) = state.gui(self.cursor) else {
+            return;
+        };
+        let Some(o) = self.options_view() else { return };
+        // `AbstractScrollArea.mouseClicked`: on the scroll bar, it drags.
+        if let Some([x, y, w, h]) = options::scrollbar(o.page, width, height)
+            && mouse[0] >= x as f32
+            && mouse[0] <= (x + w) as f32
+            && mouse[1] >= y as f32
+            && mouse[1] < (y + h) as f32
+        {
+            self.drag = Some(Drag::Scrollbar(mouse[1]));
+            return;
+        }
+        let (top, list_height) = options::list_area(height);
+        let in_list = mouse[1] >= top as f32 && mouse[1] < (top + list_height) as f32;
+        let hit = options::widgets(&o, &self.menu_models.hud, width, height)
+            .into_iter()
+            .find(|w| w.active && w.button.contains(mouse) && (!w.in_list || in_list));
+        // `ContainerEventHandler.mouseClicked`: the widget clicked takes the focus; a click
+        // on nothing leaves it.
+        let Some(w) = hit else { return };
+        self.options_focus(&w, height);
+        if w.slider.is_some() {
+            // `AbstractSliderButton.onClick`: the handle jumps to the mouse; the click
+            // sounds when it's let go.
+            self.drag = Some(Drag::Slider(w.action));
+            self.set_slider(w.action, options::slider_at(w.button.rect, mouse[0]));
+            return;
+        }
+        self.click_sound();
+        self.options_activate(w.action);
+    }
+
+    /// A button on an options screen pressed, by the mouse or the keyboard.
+    fn options_activate(&mut self, action: options::Action) {
+        match action {
+            options::Action::OpenSounds => self.options_page(options::Page::Sounds),
+            options::Action::OpenVideo => self.options_page(options::Page::Video),
+            options::Action::OpenControls => self.options_page(options::Page::Controls),
+            options::Action::OpenMouse => self.options_page(options::Page::Mouse),
+            options::Action::OpenKeyBinds => self.options_page(options::Page::KeyBinds),
+            options::Action::Mouse(option) => self.mouse.cycle(option),
+            options::Action::ToggleSneak => {
+                self.toggles.sneak.toggle = !self.toggles.sneak.toggle;
+            }
+            options::Action::ToggleSprint => {
+                self.toggles.sprint.toggle = !self.toggles.sprint.toggle;
+            }
+            options::Action::ToggleAttack => {
+                self.toggles.attack.toggle = !self.toggles.attack.toggle;
+            }
+            options::Action::ToggleUse => {
+                self.toggles.use_item.toggle = !self.toggles.use_item.toggle;
+            }
+            // `KeyBindsList.KeyEntry`'s buttons and `KeyBindsScreen`'s Reset Keys.
+            options::Action::KeyChange(i) => {
+                if let Some(o) = &mut self.options {
+                    o.selected = Some(i);
+                }
+            }
+            options::Action::KeyReset(i) => {
+                self.bindings.0[i] = mc_render::hud::keys::MAPPINGS[i].default;
+            }
+            options::Action::ResetKeys => self.bindings = Default::default(),
+            options::Action::Video(option) => {
+                let old = self.video;
+                self.video.cycle(option);
+                self.apply_video(Some(old));
+            }
+            options::Action::Done => self.options_back(),
+            _ => {}
+        }
+    }
+
+    fn options_drag(&mut self) {
+        let Some(state) = &self.state else { return };
+        let (width, height, Some(mouse)) = state.gui(self.cursor) else {
+            return;
+        };
+        let Some(o) = self.options_view() else { return };
+        match self.drag {
+            Some(Drag::Slider(action)) => {
+                let rect = options::widgets(&o, &self.menu_models.hud, width, height)
+                    .into_iter()
+                    .find(|w| w.action == action)
+                    .map(|w| w.button.rect);
+                if let Some(rect) = rect {
+                    self.set_slider(action, options::slider_at(rect, mouse[0]));
+                }
+            }
+            // `AbstractScrollArea.mouseDragged`: past the list's ends, all the way.
+            Some(Drag::Scrollbar(last)) => {
+                let Some(o) = &mut self.options else { return };
+                let (top, list_height) = options::list_area(height);
+                let max = options::max_scroll(o.page, height);
+                o.scroll = if mouse[1] < top as f32 {
+                    0.0
+                } else if mouse[1] > (top + list_height) as f32 {
+                    max
+                } else {
+                    let dy = (mouse[1] - last) as f64;
+                    let scale = options::scroll_drag_scale(o.page, height);
+                    (o.scroll + dy * scale).clamp(0.0, max)
+                };
+                self.drag = Some(Drag::Scrollbar(mouse[1]));
+            }
+            None => {}
+        }
+    }
+
+    /// `AbstractSliderButton.onRelease`: the click sounds, and the handle settles on the
+    /// option's step.
+    fn options_release(&mut self) {
+        if let Some(Drag::Slider(_)) = self.drag.take() {
+            self.click_sound();
+            if let Some(o) = &mut self.options {
+                o.dragging = None;
+            }
+        }
+    }
+
+    /// `AbstractScrollArea.mouseScrolled`: 12 GUI pixels a notch. With Ctrl held on Video
+    /// Settings, the GUI scale steps instead, through the scales that fit, not to Auto
+    /// (`VideoSettingsScreen.mouseScrolled`).
+    /// `KeyBindsScreen.mouseClicked` and `keyPressed` while a mapping waits for a key: it
+    /// takes the button or key, Esc unbinding it. Whether it was waiting.
+    fn bind_key(&mut self, key: Key) -> bool {
+        let Some(o) = &mut self.options else {
+            return false;
+        };
+        let Some(i) = o.selected.take() else {
+            return false;
+        };
+        self.bindings.0[i] = if key == keys::from_code(winit::keyboard::KeyCode::Escape) {
+            mc_render::hud::keys::UNBOUND
+        } else {
+            key
+        };
+        true
+    }
+
+    fn options_scroll(&mut self, notches: f32) {
+        let Some(state) = &self.state else { return };
+        let height = state.gui(None).1;
+        let Some(o) = self.options_view() else { return };
+        if o.page == options::Page::Video && self.modifiers.control_key() {
+            let max = o.video.gui_scale_max;
+            let current = if o.video.gui_scale == 0 {
+                max + 1
+            } else {
+                o.video.gui_scale
+            };
+            let new = current + notches.signum() as i32;
+            if new != 0 && (1..=max).contains(&new) {
+                let old = self.video;
+                self.video.gui_scale = new;
+                self.apply_video(Some(old));
+                if let Some(o) = &mut self.options {
+                    o.scroll = 0.0;
+                }
+            }
+            return;
+        }
+        if let Some(o) = &mut self.options {
+            let max = options::max_scroll(o.page, height);
+            o.scroll = (o.scroll - notches as f64 * options::SCROLL_RATE).clamp(0.0, max);
         }
     }
 
@@ -1028,43 +2025,33 @@ impl App {
             .is_some_and(walk::Walker::inventory_open)
     }
 
-    /// A key in the open inventory: E or Esc closes it and captures the mouse again; 1 to 9
-    /// and F swap the hovered slot with that hotbar slot or the offhand, and Q throws from
-    /// it (`AbstractContainerScreen.keyPressed`).
+    /// A key in the open inventory: Inventory or Esc closes it and captures the mouse again;
+    /// the hotbar keys and Swap Item With Offhand swap the hovered slot with that hotbar
+    /// slot or the offhand, and Drop throws from it (`AbstractContainerScreen.keyPressed`).
     fn inventory_key(&mut self, event: &winit::event::KeyEvent) {
         use crate::inventory::InventoryKey;
-        use winit::keyboard::{KeyCode as K, PhysicalKey};
         let (Some(state), Some(walker)) = (&self.state, &mut self.walker) else {
             return;
         };
-        let PhysicalKey::Code(code) = event.physical_key else {
+        let winit::keyboard::PhysicalKey::Code(code) = event.physical_key else {
             return;
         };
-        let digits = [
-            K::Digit1,
-            K::Digit2,
-            K::Digit3,
-            K::Digit4,
-            K::Digit5,
-            K::Digit6,
-            K::Digit7,
-            K::Digit8,
-            K::Digit9,
-        ];
-        let key = match code {
-            K::Escape | K::KeyE => {
-                walker.close_inventory();
-                self.captured = state.grab();
-                return;
-            }
-            K::KeyF => InventoryKey::Offhand,
-            K::KeyQ => InventoryKey::Drop {
+        let (b, key) = (&self.bindings, keys::from_code(code));
+        let key = if code == winit::keyboard::KeyCode::Escape || b.is("key.inventory", key) {
+            walker.close_inventory();
+            self.captured = state.grab();
+            self.toggles.restore(&self.bindings);
+            return;
+        } else if let Some(n) = b.hotbar(key) {
+            InventoryKey::Hotbar(n)
+        } else if b.is("key.swapOffhand", key) {
+            InventoryKey::Offhand
+        } else if b.is("key.drop", key) {
+            InventoryKey::Drop {
                 all: self.modifiers.control_key(),
-            },
-            _ => match digits.iter().position(|&d| d == code) {
-                Some(n) => InventoryKey::Hotbar(n as u8),
-                None => return,
-            },
+            }
+        } else {
+            return;
         };
         let (width, height, mouse) = state.gui(self.cursor);
         walker.inventory_key(key, mouse, width, height);
@@ -1089,30 +2076,84 @@ impl App {
             self.chat.close();
             if let Some(state) = &self.state {
                 self.captured = state.grab();
+                self.toggles.restore(&self.bindings);
             }
         }
     }
 
-    fn fly(&mut self, dt: f32) {
-        use winit::keyboard::KeyCode as K;
-        let camera = &mut self.args.camera;
-        let motion = fly_direction(camera.yaw, &self.keys);
-        let speed = if self.keys.contains(&K::ControlLeft) {
-            30.0
-        } else {
-            10.0
+    /// A key or mouse button pressed or let go in the game: it's held while down, and with
+    /// no screen open a press does what its mappings do (`Minecraft.handleKeybinds`):
+    /// Attack, Use and Pick Block click, Inventory opens the inventory, Chat and Command
+    /// open the chat, the latter with a slash, and the hotbar keys select their slot.
+    fn game_input(&mut self, key: Key, down: bool) {
+        if !down {
+            self.keys.remove(&key);
+            self.toggles.set(&self.bindings, key, false);
+            return;
+        }
+        self.keys.insert(key);
+        let b = &self.bindings;
+        let Some(walker) = &mut self.walker else {
+            return;
         };
+        if walker.screen_open() {
+            return;
+        }
+        self.toggles.set(b, key, true);
+        let click = [
+            ("key.attack", walk::Click::Attack),
+            ("key.use", walk::Click::Use),
+            ("key.pickItem", walk::Click::Pick),
+        ];
+        for (name, click) in click {
+            if b.is(name, key) {
+                walker.click(click);
+            }
+        }
+        if let Some(slot) = b.hotbar(key) {
+            walker.select(slot);
+        }
+        let screen = if b.is("key.inventory", key) {
+            walker.open_inventory();
+            walker.inventory_open()
+        } else if b.is("key.chat", key) || b.is("key.command", key) {
+            let prefix = if b.is("key.chat", key) { "" } else { "/" };
+            self.chat.open(prefix);
+            true
+        } else {
+            false
+        };
+        // A screen frees the mouse and lets go of the keys (`KeyMapping.releaseAll`).
+        if screen {
+            if let Some(state) = &self.state {
+                state.release();
+            }
+            self.captured = false;
+            self.keys.clear();
+            self.toggles.release();
+        }
+    }
+
+    fn fly(&mut self, dt: f32) {
+        let camera = &mut self.args.camera;
+        let input = self.bindings.input(&self.keys, &self.toggles);
+        let motion = fly_direction(camera.yaw, input);
+        let speed = if input.sprint { 30.0 } else { 10.0 };
         camera.eye += motion.normalize_or_zero() * speed * dt;
     }
 }
 
 impl winit::application::ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if self.state.is_none()
-            && let Err(e) = self.create_window(event_loop)
-        {
-            eprintln!("could not open a window: {e:#}");
-            event_loop.exit();
+        if self.state.is_none() {
+            match self.create_window(event_loop) {
+                // The options that need the window, such as fullscreen.
+                Ok(()) => self.apply_video(None),
+                Err(e) => {
+                    eprintln!("could not open a window: {e:#}");
+                    event_loop.exit();
+                }
+            }
         }
     }
 
@@ -1122,12 +2163,16 @@ impl winit::application::ApplicationHandler for App {
         _: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) {
+        if let winit::event::DeviceEvent::MouseMotion { .. } = event {
+            self.last_input = Instant::now();
+        }
         if let (true, winit::event::DeviceEvent::MouseMotion { delta: (dx, dy) }) =
             (self.captured, event)
         {
+            let (dx, dy) = self.mouse.turn(dx, dy);
             let camera = &mut self.args.camera;
-            camera.yaw += dx as f32 * 0.15;
-            camera.pitch = (camera.pitch + dy as f32 * 0.15).clamp(-90.0, 90.0);
+            camera.yaw += dx as f32;
+            camera.pitch = (camera.pitch + dy as f32).clamp(-90.0, 90.0);
         }
     }
 
@@ -1138,6 +2183,23 @@ impl winit::application::ApplicationHandler for App {
         event: winit::event::WindowEvent,
     ) {
         use winit::event::{ElementState, WindowEvent};
+        // `FramerateLimitTracker.onInputReceived`.
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::CursorMoved { .. }
+        ) {
+            self.last_input = Instant::now();
+        }
+        if let WindowEvent::MouseInput {
+            state: ElementState::Pressed,
+            ..
+        } = event
+        {
+            self.input_type = Some(InputType::Mouse);
+        }
         let Some(state) = &mut self.state else { return };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -1156,8 +2218,43 @@ impl winit::application::ApplicationHandler for App {
                 {
                     walker.inventory_drag(mouse, width, height);
                 }
+                if self.drag.is_some() {
+                    self.options_drag();
+                }
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } if self.options.as_ref().is_some_and(|o| o.selected.is_some()) => {
+                self.bind_key(keys::from_mouse(button));
+            }
+            WindowEvent::MouseInput {
+                state: pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } if self.options.is_some() => match pressed {
+                ElementState::Pressed => self.options_click(),
+                ElementState::Released => self.options_release(),
+            },
+            WindowEvent::MouseInput { .. } if self.options.is_some() => {}
+            WindowEvent::MouseWheel { delta, .. } if self.options.is_some() => {
+                let notches = self.mouse.scroll(wheel_notches(delta));
+                self.options_scroll(notches as f32);
+            }
+            // Esc closes the screen, as Done does, unless a key mapping waits for a key.
+            WindowEvent::KeyboardInput { event, .. } if self.options.is_some() => {
+                if event.state == ElementState::Pressed
+                    && let winit::keyboard::PhysicalKey::Code(code) = event.physical_key
+                    && !self.bind_key(keys::from_code(code))
+                {
+                    match code {
+                        winit::keyboard::KeyCode::Escape => self.options_back(),
+                        _ => self.options_key(code),
+                    }
+                }
+            }
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
@@ -1213,11 +2310,8 @@ impl winit::application::ApplicationHandler for App {
             }
             // `ChatScreen.mouseScrolled`: seven lines a notch, one with Shift.
             WindowEvent::MouseWheel { delta, .. } if self.chat.is_open() => {
-                let lines = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-                };
-                let shift = self.keys.contains(&winit::keyboard::KeyCode::ShiftLeft);
+                let lines = self.mouse.scroll(wheel_notches(delta)) as f32;
+                let shift = self.modifiers.shift_key();
                 let notches = lines.clamp(-1.0, 1.0) * if shift { 1.0 } else { 7.0 };
                 self.chat.scroll_by(notches as i32);
             }
@@ -1225,10 +2319,12 @@ impl winit::application::ApplicationHandler for App {
             // Esc closes the pause screen (`Screen.shouldCloseOnEsc`), back to the game.
             WindowEvent::KeyboardInput { event, .. } if self.paused => {
                 if event.state == ElementState::Pressed
-                    && event.physical_key
-                        == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape)
+                    && let winit::keyboard::PhysicalKey::Code(code) = event.physical_key
                 {
-                    self.resume();
+                    match code {
+                        winit::keyboard::KeyCode::Escape => self.resume(),
+                        _ => self.pause_key(code),
+                    }
                 }
             }
             // `Minecraft.setWindowActive`: with `pauseOnLostFocus`, losing focus pauses.
@@ -1245,6 +2341,17 @@ impl winit::application::ApplicationHandler for App {
                     self.leave_world(menu::Screen::Title);
                 }
             }
+            // The death screen's buttons by keyboard; Esc and releases go on below.
+            WindowEvent::KeyboardInput { event, .. }
+                if self.walker.as_ref().is_some_and(walk::Walker::screen_open)
+                    && event.state == ElementState::Pressed
+                    && event.physical_key
+                        != winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape) =>
+            {
+                if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
+                    self.death_key(code);
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 ..
@@ -1254,39 +2361,27 @@ impl winit::application::ApplicationHandler for App {
                 && !self.walker.as_ref().is_some_and(walk::Walker::screen_open) =>
             {
                 self.captured = state.grab();
+                self.toggles.restore(&self.bindings);
             }
             WindowEvent::MouseInput {
                 state: pressed,
                 button,
                 ..
-            } => {
-                use winit::event::MouseButton;
-                let down = pressed == ElementState::Pressed;
-                match button {
-                    MouseButton::Left => self.buttons.attack = down,
-                    MouseButton::Right => self.buttons.use_item = down,
-                    _ => {}
-                }
-                let click = match button {
-                    MouseButton::Left => Some(walk::Click::Attack),
-                    MouseButton::Right => Some(walk::Click::Use),
-                    MouseButton::Middle => Some(walk::Click::Pick),
-                    _ => None,
-                };
-                if down && let (Some(click), Some(walker)) = (click, &mut self.walker) {
-                    walker.click(click);
-                }
-            }
+            } => self.game_input(keys::from_mouse(button), pressed == ElementState::Pressed),
             WindowEvent::MouseWheel { delta, .. } if self.captured => {
-                let lines = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-                };
-                // Scrolling down moves right along the hotbar.
+                // `ScrollWheelHandler.onMouseScroll`: whole notches, the rest kept for the
+                // next scroll the same way. Scrolling down moves right along the hotbar.
+                let scrolled = self.mouse.scroll(wheel_notches(delta));
+                if self.wheel != 0.0 && scrolled.signum() != self.wheel.signum() {
+                    self.wheel = 0.0;
+                }
+                self.wheel += scrolled;
+                let notches = self.wheel as i32;
+                self.wheel -= notches as f64;
                 if let Some(walker) = &mut self.walker
-                    && lines != 0.0
+                    && notches != 0
                 {
-                    walker.scroll(if lines < 0.0 { 1 } else { -1 });
+                    walker.scroll(if notches < 0 { 1 } else { -1 });
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1300,60 +2395,12 @@ impl winit::application::ApplicationHandler for App {
                         }
                         return;
                     }
-                    // `Gui.handleKeybinds`: E opens the inventory.
-                    if code == winit::keyboard::KeyCode::KeyE
-                        && event.state == ElementState::Pressed
-                        && let Some(walker) = &mut self.walker
-                        && !walker.screen_open()
-                    {
-                        walker.open_inventory();
-                        if walker.inventory_open() {
-                            state.release();
-                            (self.captured, self.buttons) = (false, Default::default());
-                            self.keys.clear();
-                        }
-                        return;
-                    }
-                    // `Gui.handleKeybinds`: T opens the chat, / opens it with a slash.
-                    let prefix = match code {
-                        winit::keyboard::KeyCode::KeyT => Some(""),
-                        winit::keyboard::KeyCode::Slash => Some("/"),
-                        _ => None,
-                    };
-                    if let Some(prefix) = prefix
-                        && event.state == ElementState::Pressed
-                        && self.walker.as_ref().is_some_and(|w| !w.screen_open())
-                    {
-                        self.chat.open(prefix);
-                        state.release();
-                        (self.captured, self.buttons) = (false, Default::default());
-                        self.keys.clear();
-                        return;
-                    }
-                    let digits = [
-                        winit::keyboard::KeyCode::Digit1,
-                        winit::keyboard::KeyCode::Digit2,
-                        winit::keyboard::KeyCode::Digit3,
-                        winit::keyboard::KeyCode::Digit4,
-                        winit::keyboard::KeyCode::Digit5,
-                        winit::keyboard::KeyCode::Digit6,
-                        winit::keyboard::KeyCode::Digit7,
-                        winit::keyboard::KeyCode::Digit8,
-                        winit::keyboard::KeyCode::Digit9,
-                    ];
-                    if event.state == ElementState::Pressed
-                        && let Some(slot) = digits.iter().position(|&k| k == code)
-                        && let Some(walker) = &mut self.walker
-                    {
-                        walker.select(slot as u8);
-                    }
-                    match event.state {
-                        ElementState::Pressed => self.keys.insert(code),
-                        ElementState::Released => self.keys.remove(&code),
-                    };
+                    let down = event.state == ElementState::Pressed;
+                    self.game_input(keys::from_code(code), down);
                 }
             }
             WindowEvent::RedrawRequested => {
+                self.limit_frame_rate();
                 let now = Instant::now();
                 let elapsed = (now - self.last_frame).as_secs_f32();
                 // The game's own ticks get the real time, and run at most 10 a frame
@@ -1433,6 +2480,21 @@ impl winit::application::ApplicationHandler for App {
                                 walker.blocks(&changes);
                             }
                         }
+                        // `handleStopSoundEvent`, after the sounds queued before it.
+                        stream::Update::Server(mc_protocol::Event::StopSound {
+                            event,
+                            category,
+                        }) => {
+                            if let Some(walker) = &mut self.walker {
+                                for instance in walker.take_sounds() {
+                                    self.sounds.play(instance);
+                                }
+                            }
+                            self.sounds.stop_matching(
+                                event.as_deref(),
+                                category.map(sound::Category::from_id),
+                            );
+                        }
                         stream::Update::Server(mc_protocol::Event::Chat(spans)) => {
                             self.chat
                                 .add(&self.models.hud, &spans, self.view.ticks as i32);
@@ -1459,7 +2521,11 @@ impl winit::application::ApplicationHandler for App {
                     Some(walker) => {
                         let camera = &mut self.args.camera;
                         let (input, buttons) = if self.captured {
-                            (walk::input(&self.keys), self.buttons)
+                            let b = &self.bindings;
+                            (
+                                b.input(&self.keys, &self.toggles),
+                                keys::Bindings::buttons(&self.toggles),
+                            )
                         } else {
                             Default::default()
                         };
@@ -1477,7 +2543,8 @@ impl winit::application::ApplicationHandler for App {
                                 if self.captured {
                                     state.release();
                                     self.captured = false;
-                                    self.buttons = Default::default();
+                                    self.keys.clear();
+                                    self.toggles.release();
                                 }
                                 death.mouse = state.gui(self.cursor).2;
                             }
@@ -1553,13 +2620,26 @@ impl winit::application::ApplicationHandler for App {
                 if let Some(streamer) = &mut self.streamer {
                     streamer.follow(self.args.camera.eye);
                 }
+                self.tick_sounds(dt);
+                let options_view = self.options_view();
                 let Some(state) = &mut self.state else { return };
                 // Dying closes the pause screen for the death screen.
                 if self.walker.as_ref().is_some_and(walk::Walker::screen_open) {
                     self.paused = false;
+                    if self.options.as_ref().is_some_and(|o| o.in_world) {
+                        (self.options, self.drag) = (None, None);
+                    }
                 }
-                let mouse = state.gui(self.cursor).2;
+                let (_, gui_height, mouse) = state.gui(self.cursor);
                 let screen = match &self.menu {
+                    _ if let Some(o) = options_view => {
+                        Some(mc_render::hud::Screen::Options(options::Options {
+                            mouse,
+                            // A smaller window scrolls less far.
+                            scroll: o.scroll.min(options::max_scroll(o.page, gui_height)),
+                            ..o
+                        }))
+                    }
                     Some(m) => Some(mc_render::hud::Screen::Menu(menu::Menu {
                         mouse,
                         // `TextCursorUtils.isCursorVisible`: on for 300 ms, off for 300.
@@ -1570,6 +2650,7 @@ impl winit::application::ApplicationHandler for App {
                         mc_render::hud::pause::Pause {
                             local: self.walker.is_none() || self.singleplayer,
                             mouse,
+                            focused: self.pause_focus,
                         },
                     )),
                     None => self
@@ -1606,25 +2687,67 @@ impl winit::application::ApplicationHandler for App {
     }
 }
 
-/// Which way the held keys fly, before normalising, for a camera turned `yaw` degrees:
-/// W and S along the view's level direction, A and D to its left and right, Space and
-/// Shift up and down.
-fn fly_direction(yaw: f32, keys: &std::collections::HashSet<winit::keyboard::KeyCode>) -> Vec3 {
+/// `InputType`: what was last used for input.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InputType {
+    Mouse,
+    Tab,
+    Arrow,
+}
+
+impl InputType {
+    fn keyboard(self) -> bool {
+        self != InputType::Mouse
+    }
+}
+
+/// `InputWithModifiers.isSelection`: Enter, Space or the keypad's Enter.
+/// `InputWithModifiers.isConfirmation`: Enter.
+fn confirmation(code: winit::keyboard::KeyCode) -> bool {
     use winit::keyboard::KeyCode as K;
+    matches!(code, K::Enter | K::NumpadEnter)
+}
+
+/// `InputConstants.Key.getNumericKeyValue`: a digit key's digit.
+fn digit(code: winit::keyboard::KeyCode) -> Option<usize> {
+    use winit::keyboard::KeyCode as K;
+    [K::Digit0, K::Digit1, K::Digit2, K::Digit3, K::Digit4]
+        .into_iter()
+        .chain([K::Digit5, K::Digit6, K::Digit7, K::Digit8, K::Digit9])
+        .position(|k| k == code)
+}
+
+fn selection(code: winit::keyboard::KeyCode) -> bool {
+    use winit::keyboard::KeyCode as K;
+    matches!(code, K::Enter | K::Space | K::NumpadEnter)
+}
+
+/// How many notches the wheel turned: a line each, or 40 pixels for a touchpad.
+fn wheel_notches(delta: winit::event::MouseScrollDelta) -> f64 {
+    match delta {
+        winit::event::MouseScrollDelta::LineDelta(_, y) => y as f64,
+        winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 40.0,
+    }
+}
+
+/// Which way the held movement keys fly, before normalising, for a camera turned `yaw`
+/// degrees: forward and back along the view's level direction, left and right to its
+/// sides, jump and sneak up and down.
+fn fly_direction(yaw: f32, input: mc_physics::Input) -> Vec3 {
     let yaw = yaw.to_radians();
     let forward = Vec3::new(-yaw.sin(), 0.0, yaw.cos());
     // Forward × up: facing south (+Z), the right hand points west (-X).
     let right = forward.cross(Vec3::Y);
     [
-        (K::KeyW, forward),
-        (K::KeyS, -forward),
-        (K::KeyD, right),
-        (K::KeyA, -right),
-        (K::Space, Vec3::Y),
-        (K::ShiftLeft, -Vec3::Y),
+        (input.forward, forward),
+        (input.backward, -forward),
+        (input.right, right),
+        (input.left, -right),
+        (input.jump, Vec3::Y),
+        (input.sneak, -Vec3::Y),
     ]
     .into_iter()
-    .filter(|(key, _)| keys.contains(key))
+    .filter(|(held, _)| *held)
     .map(|(_, dir)| dir)
     .sum()
 }
@@ -1632,7 +2755,6 @@ fn fly_direction(yaw: f32, keys: &std::collections::HashSet<winit::keyboard::Key
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winit::keyboard::KeyCode as K;
 
     /// D moves toward whatever is on the right of the screen, A toward the left. The
     /// screen's right is worked out from the camera's own view matrix, not from
@@ -1650,9 +2772,20 @@ mod tests {
             let view_proj = camera.view_proj(1.0, 100.0);
             let screen_x = |p: Vec3| view_proj.project_point3(p).x;
             let ahead = camera.forward() * 10.0;
-            let held = |k| std::collections::HashSet::from([k]);
-            let d = fly_direction(yaw, &held(K::KeyD));
-            let a = fly_direction(yaw, &held(K::KeyA));
+            let d = fly_direction(
+                yaw,
+                mc_physics::Input {
+                    right: true,
+                    ..Default::default()
+                },
+            );
+            let a = fly_direction(
+                yaw,
+                mc_physics::Input {
+                    left: true,
+                    ..Default::default()
+                },
+            );
             assert!(screen_x(ahead + d) > 0.0, "yaw {yaw}: D goes left");
             assert!(screen_x(ahead + a) < 0.0, "yaw {yaw}: A goes right");
         }

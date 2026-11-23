@@ -12,8 +12,8 @@ const PANORAMA: &str = "minecraft:gui/title/background/panorama_0";
 const MENU_BACKGROUND: &str = "minecraft:gui/menu_background";
 pub(crate) const LOGO: &str = "minecraft:gui/title/minecraft";
 
-const HEADER_SEPARATOR: &str = "minecraft:gui/header_separator";
-const FOOTER_SEPARATOR: &str = "minecraft:gui/footer_separator";
+pub(crate) const HEADER_SEPARATOR: &str = "minecraft:gui/header_separator";
+pub(crate) const FOOTER_SEPARATOR: &str = "minecraft:gui/footer_separator";
 const TAB_HEADER_BACKGROUND: &str = "minecraft:gui/tab_header_background";
 
 /// The textures the menus draw whole, by their full ids.
@@ -153,8 +153,10 @@ pub enum Screen {
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct Menu {
     pub screen: Screen,
-    /// Direct Connection's server address, which is always focused.
+    /// Direct Connection's server address.
     pub address: Field,
+    /// Select World's search box, which filters the list.
+    pub search: Field,
     /// The cursor is in the visible half of its blink.
     pub cursor_on: bool,
     /// Where the mouse is, in GUI pixels, to highlight what's under it.
@@ -164,12 +166,30 @@ pub struct Menu {
     pub selected: Option<usize>,
     /// What Create New World will create.
     pub new_world: NewWorld,
+    /// What has the focus, highlighted: the widget last clicked or moved to with the
+    /// keyboard.
+    pub focused: Option<Focus>,
+}
+
+/// A menu screen's focused widget (`ContainerEventHandler.getFocused`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    Button(Action),
+    /// The screen's text box: Direct Connection's address, Select World's search, or
+    /// Create New World's name or seed, which takes typing.
+    Box,
+    /// Create New World's tab bar, on its current tab (`TabNavigationBar`).
+    Tabs,
+    /// Select World's list, on its selected world (`ObjectSelectionList`).
+    List,
 }
 
 /// A world in Select World's list, as `WorldSelectionList.WorldListEntry` shows it.
 #[derive(Clone, Default, PartialEq, Debug)]
 pub struct WorldRow {
     pub name: String,
+    /// Its folder in `saves/`, the level id.
+    pub folder: String,
     /// Its folder and, in brackets, when it was last played.
     pub folder_and_date: String,
     pub mode: GameMode,
@@ -262,11 +282,34 @@ impl NewWorld {
         }
     }
 
-    /// The box with the focus: the tab's box, if it has one.
-    pub fn focused(&mut self) -> Option<&mut Field> {
+    /// The tab's box, if it has one.
+    pub fn field(&mut self) -> Option<&mut Field> {
         match self.tab {
             0 => Some(&mut self.name),
             1 => Some(&mut self.seed),
+            _ => None,
+        }
+    }
+}
+
+impl Menu {
+    /// The screen's text box: Direct Connection's address, Select World's search, or the
+    /// Create New World tab's box.
+    pub fn field(&mut self) -> Option<&mut Field> {
+        match self.screen {
+            Screen::DirectConnect => Some(&mut self.address),
+            Screen::SelectWorld => Some(&mut self.search),
+            Screen::CreateWorld => self.new_world.field(),
+            _ => None,
+        }
+    }
+
+    /// Where the screen's text box is, in a GUI `width` × `height`.
+    pub fn field_rect(&self, width: i32, height: i32) -> Option<[i32; 4]> {
+        match self.screen {
+            Screen::DirectConnect => Some(address_rect(width)),
+            Screen::SelectWorld => Some(search_rect(width)),
+            Screen::CreateWorld => new_world_box(self.new_world.tab, width, height),
             _ => None,
         }
     }
@@ -342,14 +385,38 @@ const MORE_GRID: i32 = 3 * 28 - 8;
 const LIST_TOP: i32 = 49;
 const ROW: i32 = 36;
 
-/// The world row under GUI point `mouse`, if any.
+/// The world under GUI point `mouse`, if any, by its index in `menu.worlds`.
 pub fn world_at(menu: &Menu, width: i32, height: i32, [x, y]: [f32; 2]) -> Option<usize> {
     let left = (width / 2 - 135) as f32;
     if x < left || x >= left + 270.0 || y < (LIST_TOP + 4) as f32 {
         return None;
     }
     let row = ((y as i32 - LIST_TOP - 4) / ROW) as usize;
-    (row < visible_rows(height).min(menu.worlds.len())).then_some(row)
+    shown_worlds(menu, height).get(row).copied()
+}
+
+/// The worlds the list shows, as many as fit, by their indices in `menu.worlds`: those
+/// whose name or folder has the search in it (`WorldSelectionList.filterAccepts`).
+pub fn shown_worlds(menu: &Menu, height: i32) -> Vec<usize> {
+    let search = menu.search.value.to_lowercase();
+    let worlds = menu.worlds.iter().enumerate();
+    worlds
+        .filter(|(_, w)| {
+            w.name.to_lowercase().contains(&search) || w.folder.to_lowercase().contains(&search)
+        })
+        .map(|(i, _)| i)
+        .take(visible_rows(height))
+        .collect()
+}
+
+/// Select World's list, across the screen between the header and the footer.
+pub fn list_rect(width: i32, height: i32) -> [i32; 4] {
+    [0, LIST_TOP, width, height - LIST_TOP - 60]
+}
+
+/// Select World's search box, under the title.
+pub fn search_rect(width: i32) -> [i32; 4] {
+    [width / 2 - 100, 22, 200, 20]
 }
 
 /// How many rows fit between the header and the footer.
@@ -402,7 +469,7 @@ pub fn buttons(menu: &Menu, art: &HudArt, width: i32, height: i32) -> Vec<(Actio
                 (
                     Action::Options,
                     button(left, top + 60, 98, "menu.options"),
-                    false,
+                    true,
                 ),
                 (
                     Action::Quit,
@@ -602,6 +669,8 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
         mesh.background(art, w, h);
     }
     let lang = |key: &str| art.lang.get(key).cloned().unwrap_or_else(|| key.to_owned());
+    // `EditBox`: highlighted, with its cursor blinking, while it has the focus.
+    let boxed = m.focused == Some(Focus::Box);
     let centred = |mesh: &mut GuiMesh, text: &str, y: i32, rgb: [f32; 3]| {
         let x = w / 2 - GuiMesh::text_width(art, text) as i32 / 2;
         mesh.shadowed(art, text, x as f32, y as f32, LABEL, 1.0, rgb);
@@ -617,16 +686,37 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
             centred(&mut mesh, &lang("selectServer.direct"), 20, WHITE);
             let label = lang("addServer.enterIp");
             mesh.shadowed(art, &label, (w / 2 - 99) as f32, 100.0, LABEL, 1.0, GREY);
-            mesh.edit_box(art, &m.address, address_rect(w), true, m.cursor_on);
+            mesh.edit_box(art, &m.address, address_rect(w), boxed, m.cursor_on);
         }
         Screen::SelectWorld => {
             centred(&mut mesh, &lang("selectWorld.title"), 8, WHITE);
+            let search = search_rect(w);
+            mesh.edit_box(art, &m.search, search, boxed, m.cursor_on);
+            // `EditBox`'s hint, `SEARCH_HINT_STYLE`: grey and italic, in an empty box
+            // without the focus.
+            if m.search.value.is_empty() && !boxed {
+                let span = mc_protocol::chat::Span {
+                    text: lang("gui.selectWorld.search"),
+                    rgb: [0; 3],
+                    bold: false,
+                    italic: true,
+                };
+                let (x, y) = ((search[0] + 4) as f32, (search[1] + 6) as f32);
+                mesh.styled(art, &span, x, y, LABEL, [170.0 / 255.0; 3], 1.0);
+            }
             let left = w / 2 - 135;
-            for (i, world) in m.worlds.iter().take(visible_rows(h)).enumerate() {
+            for (i, index) in shown_worlds(m, h).into_iter().enumerate() {
+                let world = &m.worlds[index];
                 let top = LIST_TOP + 4 + i as i32 * ROW;
-                // `AbstractSelectionList.renderSelection`: a white outline, black inside.
-                if m.selected == Some(i) {
-                    mesh.rect(art, [left, top, 270, ROW], WIDGET, [255; 4]);
+                // `AbstractSelectionList.extractSelection`: outlined in white while the
+                // list has the focus, grey otherwise; black inside.
+                if m.selected == Some(index) {
+                    let outline = if m.focused == Some(Focus::List) {
+                        [255; 4]
+                    } else {
+                        [128, 128, 128, 255]
+                    };
+                    mesh.rect(art, [left, top, 270, ROW], WIDGET, outline);
                     let inside = [left + 1, top + 1, 268, ROW - 2];
                     mesh.rect(art, inside, WIDGET + 1.0, [0, 0, 0, 255]);
                 }
@@ -655,7 +745,7 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
         }
         Screen::CreateWorld => {
             let new = &m.new_world;
-            mesh.tab_bar(art, w, new.tab, m.mouse);
+            mesh.tab_bar(art, w, new.tab, m.mouse, m.focused == Some(Focus::Tabs));
             // `CreateWorldScreen.extractRenderState`'s footer separator.
             let footer = art.named[FOOTER_SEPARATOR];
             mesh.tiled([0, h - 33 - 2, w, 2], [32, 2], footer, BACKGROUND + 3.0);
@@ -666,9 +756,9 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
                 };
                 let (x, y) = (rect[0] as f32, (rect[1] - 13) as f32);
                 mesh.shadowed(art, &lang(label), x, y, LABEL, 1.0, WHITE);
-                mesh.edit_box(art, field, rect, true, m.cursor_on);
-                // `EditBox`'s hint, in an empty box.
-                if field.value.is_empty() && new.tab == 1 {
+                mesh.edit_box(art, field, rect, boxed, m.cursor_on);
+                // `EditBox`'s hint, in an empty box without the focus.
+                if field.value.is_empty() && new.tab == 1 && !boxed {
                     let (x, y) = ((rect[0] + 4) as f32, (rect[1] + 6) as f32);
                     let hint = lang("selectWorld.seedInfo");
                     mesh.shadowed(art, &hint, x, y, LABEL, 1.0, HINT);
@@ -698,6 +788,7 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
         }
     }
     for (action, button, active) in buttons(m, art, w, h) {
+        let focused = m.focused == Some(Focus::Button(action));
         // `CycleButton`s show their value: "Game Mode: Survival".
         let new = &m.new_world;
         let on_off = |on| lang(if on { "options.on" } else { "options.off" });
@@ -710,22 +801,29 @@ pub fn menu(art: &HudArt, m: &Menu, width: u32, height: u32) -> GuiMesh {
             }
             // Switches show only their value.
             Action::ToggleStructures => {
-                mesh.labelled_button(art, &button, &on_off(new.structures), active, m.mouse);
+                mesh.labelled_button(
+                    art,
+                    &button,
+                    &on_off(new.structures),
+                    active,
+                    m.mouse,
+                    focused,
+                );
                 continue;
             }
             Action::Unavailable if button.label == "selectWorld.bonusItems" => {
-                mesh.labelled_button(art, &button, &on_off(false), active, m.mouse);
+                mesh.labelled_button(art, &button, &on_off(false), active, m.mouse, false);
                 continue;
             }
             _ => {
-                mesh.button(art, &button, active, m.mouse);
+                mesh.button(art, &button, active, m.mouse, focused);
                 continue;
             }
         };
         let label = lang("options.generic_value")
             .replacen("%s", &lang(button.label), 1)
             .replacen("%s", &value, 1);
-        mesh.labelled_button(art, &button, &label, active, m.mouse);
+        mesh.labelled_button(art, &button, &label, active, m.mouse, focused);
     }
     mesh
 }
@@ -810,8 +908,16 @@ impl GuiMesh {
     /// `MenuTabBar.extractWidgetRenderState`: the header separator either side of the tabs,
     /// then each tab: its sprite nine-sliced (130 × 24, 2 at the sides), the menu background
     /// inside the selected one with a line under its title, and the title, 3 lower on the
-    /// others.
-    fn tab_bar(&mut self, art: &HudArt, w: i32, selected: usize, mouse: Option<[f32; 2]>) {
+    /// others. The selected tab is highlighted while the bar has the focus, as any is under
+    /// the mouse.
+    fn tab_bar(
+        &mut self,
+        art: &HudArt,
+        w: i32,
+        selected: usize,
+        mouse: Option<[f32; 2]>,
+        focused: bool,
+    ) {
         let tabs = tab_rects(w);
         let separator = art.named[HEADER_SEPARATOR];
         let first = tabs[0][0];
@@ -823,7 +929,8 @@ impl GuiMesh {
                 mx >= x as f32 && my >= y as f32 && mx < (x + tw) as f32 && my < (y + th) as f32
             });
             let is = i == selected;
-            let [u0, v0, u1, v1] = art.named[TABS[is as usize * 2 + hovered as usize]];
+            let lit = hovered || is && focused;
+            let [u0, v0, u1, v1] = art.named[TABS[is as usize * 2 + lit as usize]];
             let u = |px: i32| u0 + (u1 - u0) * px as f32 / 130.0;
             let mut column = |left: i32, from: i32, width: i32| {
                 let rect = [u(from), v0, u(from + width), v1];
@@ -899,7 +1006,7 @@ impl GuiMesh {
         self.blit(
             x as f32, y as f32, WIDGET, w as f32, h as f32, sprite, [1.0; 4],
         );
-        self.field_text(art, field, rect, cursor, true, FIELD_TEXT);
+        self.field_text(art, field, rect, focused && cursor, true, FIELD_TEXT);
     }
 
     /// A box's text, shadowed or not, with no selection: the text before the cursor, the

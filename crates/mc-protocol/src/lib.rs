@@ -81,8 +81,12 @@ pub enum Event {
         id: i32,
         event: i8,
     },
-    /// An entity was hurt (`ClientboundDamageEventPacket`); only its id is read.
-    Damaged(i32),
+    /// An entity was hurt (`ClientboundDamageEventPacket`): its id and the damage type, such
+    /// as `minecraft:on_fire`; who caused it isn't read.
+    Damaged {
+        id: i32,
+        kind: String,
+    },
     /// An entity was hurt from a direction (`ClientboundHurtAnimationPacket`): its id, and
     /// the direction relative to its yaw, in degrees.
     HurtAnimation {
@@ -230,9 +234,12 @@ pub enum Event {
     /// Particles the server sets off (`ClientboundLevelParticlesPacket`): only types without
     /// options, by name. Each of `count` goes a random distance up to `dist` from `pos`
     /// and moves at up to `speed`, Gaussian unless `alternative` (1, or 2 to scale the
-    /// speed too); none means one moving at `speed × dist`.
+    /// speed too); none means one moving at `speed × dist`. `override_limiter` shows them
+    /// whatever the Particles option, and `always_show` sometimes despite Minimal.
     Particles {
         name: String,
+        override_limiter: bool,
+        always_show: bool,
         pos: [f64; 3],
         dist: [f32; 3],
         speed: [f32; 3],
@@ -249,6 +256,32 @@ pub enum Event {
     Effect {
         effect: String,
         active: bool,
+    },
+    /// A sound to play at a place (`ClientboundSoundPacket`), or following an entity when
+    /// `entity` is set (`ClientboundSoundEntityPacket`): the sound event, its `SoundSource`
+    /// id, position, volume and pitch, and the seed its sound is picked with.
+    Sound {
+        event: String,
+        category: i32,
+        pos: [f64; 3],
+        entity: Option<i32>,
+        volume: f32,
+        pitch: f32,
+        seed: i64,
+    },
+    /// Stop the sounds of an event, a `SoundSource`, both or (with neither) every sound
+    /// (`ClientboundStopSoundPacket`).
+    StopSound {
+        event: Option<String>,
+        category: Option<i32>,
+    },
+    /// Something happened at a block (`ClientboundLevelEventPacket`), such as 2001 for a
+    /// block broken, whose data is its state; `global` ones are heard from any distance.
+    LevelEvent {
+        kind: i32,
+        pos: [i32; 3],
+        data: i32,
+        global: bool,
     },
     /// The connection ended, with the server's reason.
     Disconnected(String),
@@ -435,6 +468,12 @@ impl Outbox {
         use std::sync::atomic::Ordering;
         let offset = self.unacknowledged.swap(0, Ordering::SeqCst);
         self.send("chat", &chat::chat_packet(message, offset)?)
+    }
+
+    /// `Options.broadcastOptions`: tells the server the view distance, in chunks, as the
+    /// client's information again.
+    pub fn send_client_information(&self, view_distance: u8) -> Result<()> {
+        self.send("client_information", &client_information(view_distance))
     }
 
     /// `ClientPacketListener.sendCommand`, unsigned: `command` without its `/`.
@@ -735,6 +774,7 @@ fn play(
 ) -> Result<String> {
     const STATE: State = State::Play;
     let chat_types = chat::chat_types(config.entries("minecraft:chat_type"));
+    let damage_types = config.entries("minecraft:damage_type");
     let lang = english();
     let biomes: Vec<String> = config
         .entries("minecraft:worldgen/biome")
@@ -867,12 +907,14 @@ fn play(
                     )
                 }) {
                     Some(name) => {
-                        let (_override_limiter, _always_show) = (r.bool()?, r.bool()?);
+                        let (override_limiter, always_show) = (r.bool()?, r.bool()?);
                         let pos = [r.f64()?, r.f64()?, r.f64()?];
                         let dist = [r.f32()?, r.f32()?, r.f32()?];
                         let speed = [r.f32()?, r.f32()?, r.f32()?];
                         tx.send(Event::Particles {
                             name: name.to_owned(),
+                            override_limiter,
+                            always_show,
                             pos,
                             dist,
                             speed,
@@ -1056,7 +1098,13 @@ fn play(
                 })
                 .is_ok()
             }
-            "damage_event" => tx.send(Event::Damaged(r.varint()?)).is_ok(),
+            "damage_event" => {
+                let id = r.varint()?;
+                let kind = damage_types
+                    .get(r.count()?)
+                    .map_or_else(String::new, |(name, _)| name.clone());
+                tx.send(Event::Damaged { id, kind }).is_ok()
+            }
             // Its centre, radius and block count, then the push; its particles and sound
             // after that aren't read.
             "explode" => {
@@ -1208,6 +1256,68 @@ fn play(
                 tx.send(Event::Inventory {
                     state_id: None,
                     slots: vec![(menu_slot as u8, item_stack(&mut r, registry)?)],
+                })
+                .is_ok()
+            }
+            name @ ("sound" | "sound_entity") => {
+                // `ByteBufCodecs.holder`: a registry id plus one, or 0 and the event itself.
+                let event = match r.varint()? {
+                    0 => {
+                        let name = r.string()?;
+                        if r.bool()? {
+                            r.f32()?;
+                        }
+                        Some(name)
+                    }
+                    id => registry.sound_event(id as u32 - 1).map(str::to_owned),
+                };
+                let category = r.varint()?;
+                let (pos, entity) = if name == "sound" {
+                    let p = [r.i32()?, r.i32()?, r.i32()?];
+                    (p.map(|c| f64::from(c) / 8.0), None)
+                } else {
+                    ([0.0; 3], Some(r.varint()?))
+                };
+                let (volume, pitch, seed) = (r.f32()?, r.f32()?, r.i64()?);
+                match event {
+                    Some(event) => tx
+                        .send(Event::Sound {
+                            event,
+                            category,
+                            pos,
+                            entity,
+                            volume,
+                            pitch,
+                            seed,
+                        })
+                        .is_ok(),
+                    None => true,
+                }
+            }
+            "stop_sound" => {
+                let flags = r.u8()?;
+                let category = if flags & 1 != 0 {
+                    Some(r.varint()?)
+                } else {
+                    None
+                };
+                let event = if flags & 2 != 0 {
+                    Some(r.string()?)
+                } else {
+                    None
+                };
+                tx.send(Event::StopSound { event, category }).is_ok()
+            }
+            "level_event" => {
+                let kind = r.i32()?;
+                let pos = r.block_pos()?;
+                let data = r.i32()?;
+                let global = r.bool()?;
+                tx.send(Event::LevelEvent {
+                    kind,
+                    pos,
+                    data,
+                    global,
                 })
                 .is_ok()
             }

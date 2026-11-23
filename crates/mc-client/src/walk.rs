@@ -12,6 +12,24 @@ use std::collections::HashMap;
 
 const TICK: f32 = 0.05;
 
+/// Each `Direction`'s step: down, up, north, south, west, east.
+const FACE_OFFSETS: [[i32; 3]; 6] = [
+    [0, -1, 0],
+    [0, 1, 0],
+    [0, 0, -1],
+    [0, 0, 1],
+    [-1, 0, 0],
+    [1, 0, 0],
+];
+
+/// A damage type's `effects` (such as `burning`), from its data file.
+fn damage_effects(kind: &str) -> Option<String> {
+    let res = mc_assets::Resources::new(mc_assets::default_root());
+    let path = res.data_path("damage_type", kind, "json");
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    json["effects"].as_str().map(str::to_owned)
+}
+
 /// The server's chunks' blocks, by chunk, then section y.
 struct Collision {
     chunks: HashMap<(i32, i32), Vec<(i32, Blocks)>>,
@@ -194,8 +212,11 @@ pub enum Click {
 const START_DESTROY_BLOCK: i32 = 0;
 const ABORT_DESTROY_BLOCK: i32 = 2;
 const STOP_DESTROY_BLOCK: i32 = 3;
+const RELEASE_USE_ITEM: i32 = 6;
 
 pub struct Walker {
+    /// The Attack Indicator option.
+    pub attack_indicator_mode: mc_render::hud::options::AttackIndicator,
     player: Player,
     /// Feet at the previous tick, to draw between ticks.
     previous: DVec3,
@@ -236,6 +257,9 @@ pub struct Walker {
     destroying: Option<(IVec3, u8, f32)>,
     destroy_delay: u32,
     right_click_delay: u32,
+    /// `LivingEntity.isUsingItem`, as the server's living flags (data 8) last said: eating,
+    /// drinking, drawing a bow or blocking.
+    using_item: bool,
     miss_time: u32,
     /// Numbers each action the server acknowledges.
     sequence: i32,
@@ -279,8 +303,22 @@ pub struct Walker {
     on_fire: bool,
     /// The player's air supply in ticks (data 1), which the server counts down under water.
     air: i32,
-    /// Items that place a block (`BlockItem`s, named as their block is).
-    block_items: std::collections::HashSet<String>,
+    /// Items that place a block (`BlockItem`s, named as their block is), and the block's id.
+    block_items: HashMap<String, u32>,
+    /// Each state's block id.
+    state_blocks: Vec<u32>,
+    /// Sounds the game plays, waiting for `take_sounds`.
+    sounds: Vec<crate::sound::Instance>,
+    /// `ClientLevel.random` for the sounds the client picks itself.
+    sound_random: mc_render::bake::JavaRandom,
+    /// `ClientLevel.rainSoundTime`.
+    rain_sound_time: i32,
+    /// A block being placed that the server hasn't sent back yet: where it may appear, its
+    /// block id, and ticks to wait for it. Its sound plays once it does, as vanilla plays it
+    /// once its client predicts the placement.
+    placing: Option<([IVec3; 2], u32, u32)>,
+    /// The dimension's `background_music`: default, creative and underwater.
+    music: [Option<crate::sound::Track>; 3],
     /// The time of day and what the sky looks like.
     sky: Sky,
 }
@@ -336,12 +374,13 @@ impl Sky {
     }
 }
 
-/// The open death screen: its message, ticks since it (or its confirmation) opened, and
-/// whether it's asking to confirm leaving.
+/// The open death screen: its message, ticks since it (or its confirmation) opened,
+/// whether it's asking to confirm leaving, and which button has the focus.
 struct Death {
     message: Option<String>,
     ticks: u32,
     confirm: bool,
+    focused: Option<usize>,
 }
 
 /// What a click on the death screen asks the game to do.
@@ -456,12 +495,14 @@ impl Walker {
             destroying: None,
             destroy_delay: 0,
             right_click_delay: 0,
+            using_item: false,
             miss_time: 0,
             hit_entity: None,
             sequence: 0,
             inventory: crate::inventory::Inventory::new(registry),
             others_mining: HashMap::new(),
             entities: crate::entities::Entities::new(registry),
+            attack_indicator_mode: Default::default(),
             skins: crate::skins::Loader::new(),
             skin_slots: [None; mc_render::entity::SKIN_SLOTS],
             clicks: [0; 3],
@@ -518,8 +559,20 @@ impl Walker {
                         .item_info(name)
                         .is_some_and(|i| i.name.starts_with("block."))
                 })
-                .map(str::to_owned)
+                .filter_map(|name| Some((name.to_owned(), registry.block(name)?.id)))
                 .collect(),
+            state_blocks: (0..registry.state_count())
+                .map(|s| registry.block_of_state(s).map_or(0, |b| b.id))
+                .collect(),
+            sounds: Vec::new(),
+            sound_random: mc_render::bake::JavaRandom::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| d.as_nanos() as i64 ^ 0x2545_F491),
+            ),
+            rain_sound_time: 0,
+            placing: None,
+            music: Default::default(),
         })
     }
 
@@ -691,7 +744,210 @@ impl Walker {
     pub fn blocks(&mut self, changes: &[([i32; 3], u32)]) {
         for &(pos, state) in changes {
             self.collision.set(pos, state);
+            // `BlockItem.place`: the block's place sound.
+            if let Some((at, block, _)) = self.placing
+                && at.contains(&IVec3::from(pos))
+                && self.state_blocks.get(state as usize) == Some(&block)
+            {
+                self.placing = None;
+                let t = self.blocks.sound_type(state);
+                let (event, volume, pitch) =
+                    (t.place.clone(), (t.volume + 1.0) / 2.0, t.pitch * 0.8);
+                self.block_sound(&event, volume, pitch, pos);
+            }
         }
+    }
+
+    /// `LevelEventHandler.levelEvent`'s sounds: a block broken (2001), hit while someone
+    /// mines it (2020), and the simple ones `sound::level_event` lists.
+    fn level_event(&mut self, kind: i32, pos: [i32; 3], data: i32) {
+        match kind {
+            2001 => self.break_sound(pos, data as u32),
+            2020 => self.hit_sound(IVec3::from(pos)),
+            _ => {
+                if let Some((event, category, volume, pitch)) =
+                    crate::sound::level_event(kind, data, &mut self.sound_random)
+                {
+                    let seed = self.sound_seed();
+                    self.sounds.push(crate::sound::Instance::at_block(
+                        event, category, volume, pitch, pos, seed,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The sounds to play since the last call.
+    pub fn take_sounds(&mut self) -> Vec<crate::sound::Instance> {
+        std::mem::take(&mut self.sounds)
+    }
+
+    /// Where a sound bound to an entity is: the player's feet, or another entity's.
+    pub fn entity_position(&self, id: i32) -> Option<DVec3> {
+        if id == self.entity_id {
+            Some(self.player.pos)
+        } else {
+            self.entities.position(id)
+        }
+    }
+
+    /// `Minecraft.getSituationalMusic` in a world: the dimension's music, as
+    /// `BackgroundMusic.select` picks it for a creative player or one under water.
+    pub fn music(&self) -> Option<crate::sound::Track> {
+        let [default, creative, underwater] = &self.music;
+        if self.player.under_water && underwater.is_some() {
+            return underwater.clone();
+        }
+        let creative_player = self.instabuild && self.player.may_fly;
+        if creative_player && creative.is_some() {
+            creative.clone()
+        } else {
+            default.clone()
+        }
+    }
+
+    fn sound_seed(&mut self) -> i64 {
+        self.sound_random.next_long()
+    }
+
+    /// `ClientLevel.playLocalSound` at a block's centre.
+    fn block_sound(&mut self, event: &str, volume: f32, pitch: f32, pos: [i32; 3]) {
+        let seed = self.sound_seed();
+        self.sounds.push(crate::sound::Instance::at_block(
+            event,
+            crate::sound::Category::Blocks,
+            volume,
+            pitch,
+            pos,
+            seed,
+        ));
+    }
+
+    /// `LocalPlayer.playSound`: where the player is, as a player's sound.
+    fn player_sound(&mut self, event: &str, volume: f32, pitch: f32) {
+        let seed = self.sound_seed();
+        self.sounds.push(crate::sound::Instance::at(
+            event,
+            crate::sound::Category::Players,
+            volume,
+            pitch,
+            self.player.pos,
+            seed,
+        ));
+    }
+
+    /// `(random.nextFloat() - random.nextFloat()) * scale + 1`, as many sounds' pitches go.
+    fn wobble(&mut self, scale: f32) -> f32 {
+        let r = &mut self.sound_random;
+        (r.next_float() - r.next_float()) * scale + 1.0
+    }
+
+    /// The sounds the player's movement made this tick.
+    fn movement_sounds(&mut self) {
+        for sound in std::mem::take(&mut self.player.sounds) {
+            match sound {
+                mc_physics::MoveSound::Play {
+                    event,
+                    volume,
+                    pitch,
+                } => self.player_sound(&event, volume, pitch),
+                mc_physics::MoveSound::Swim(volume) => {
+                    let pitch = self.wobble(0.4);
+                    self.player_sound("minecraft:entity.player.swim", volume, pitch);
+                }
+                mc_physics::MoveSound::Splash { volume, fast } => {
+                    let pitch = self.wobble(0.4);
+                    let event = if fast {
+                        "minecraft:entity.player.splash.high_speed"
+                    } else {
+                        "minecraft:entity.player.splash"
+                    };
+                    self.player_sound(event, volume, pitch);
+                }
+            }
+        }
+    }
+
+    /// `ClientLevel.addBreakingBlockEffects`'s sound: a hit on the block being mined.
+    fn hit_sound(&mut self, pos: IVec3) {
+        let state = mc_physics::World::state(&self.collision, pos.x, pos.y, pos.z);
+        if self.blocks.is_air(state) {
+            return;
+        }
+        let t = self.blocks.sound_type(state);
+        let (event, volume, pitch) = (t.hit.clone(), (t.volume + 1.0) / 8.0, t.pitch * 0.5);
+        self.block_sound(&event, volume, pitch, pos.to_array());
+    }
+
+    /// `LevelEventHandler`'s 2001 as the player's own `Block.playerWillDestroy` plays it: the
+    /// block breaking.
+    fn break_sound(&mut self, pos: [i32; 3], state: u32) {
+        if self.blocks.is_air(state) {
+            return;
+        }
+        let t = self.blocks.sound_type(state);
+        let (event, volume, pitch) = (t.break_sound.clone(), (t.volume + 1.0) / 2.0, t.pitch * 0.8);
+        self.block_sound(&event, volume, pitch, pos);
+    }
+
+    /// `ClientLevel.tickWeatherEffects`'s sound: rain on the ground near the camera, now and
+    /// then, quieter and lower when it falls on a roof above.
+    fn tick_rain_sound(&mut self) {
+        let rain = self.sky.rain;
+        if rain <= 0.0 {
+            return;
+        }
+        let Some(min_y) = self.sky.environment.as_ref().map(|e| e.min_y) else {
+            return;
+        };
+        use mc_render::weather::Weather;
+        let mut random =
+            mc_render::bake::JavaRandom::new(self.sky.game_time.wrapping_mul(312_987_231));
+        let eye = self.player.pos + DVec3::Y * f64::from(self.camera_eye[1]);
+        let camera = eye.floor().as_ivec3();
+        let radius = mc_render::weather::RADIUS;
+        let diameter = 2 * radius + 1;
+        let count = (0.225 * (diameter * diameter) as f32 * rain * rain) as i32;
+        let mut at = None;
+        for _ in 0..count {
+            let x = camera.x + random.next_int(diameter) - radius;
+            let z = camera.z + random.next_int(diameter) - radius;
+            let y = self.height(x, z);
+            if y > min_y
+                && y <= camera.y + 10
+                && y >= camera.y - 10
+                && self.precipitation([x, y, z]) == mc_render::tint::Precipitation::Rain
+            {
+                at = Some([x, y - 1, z]);
+                // The splash's place in the block, which isn't drawn.
+                random.next_double();
+                random.next_double();
+            }
+        }
+        let Some(at) = at else { return };
+        if random.next_int(3) < self.rain_sound_time {
+            self.rain_sound_time = 0;
+            let roofed = self.height(camera.x, camera.z) > camera.y;
+            if at[1] > camera.y + 1 && roofed {
+                self.weather_sound("minecraft:weather.rain.above", 0.1, 0.5, at);
+            } else {
+                self.weather_sound("minecraft:weather.rain", 0.2, 1.0, at);
+            }
+        } else {
+            self.rain_sound_time += 1;
+        }
+    }
+
+    fn weather_sound(&mut self, event: &str, volume: f32, pitch: f32, pos: [i32; 3]) {
+        let seed = self.sound_seed();
+        self.sounds.push(crate::sound::Instance::at_block(
+            event,
+            crate::sound::Category::Weather,
+            volume,
+            pitch,
+            pos,
+            seed,
+        ));
     }
 
     pub fn server_event(&mut self, event: mc_protocol::Event) {
@@ -702,8 +958,8 @@ impl Walker {
             self.player.velocity = DVec3::from(velocity);
             return;
         }
-        // The player's own shared flags (data 0), where bit 0 is `isOnFire`, and air supply
-        // (data 1).
+        // The player's own shared flags (data 0), where bit 0 is `isOnFire`; air supply
+        // (data 1); and living flags (data 8), where bit 0 is `isUsingItem`.
         if let mc_protocol::Event::EntityData { id, values } = &event
             && *id == self.entity_id
         {
@@ -711,6 +967,7 @@ impl Walker {
                 match (index, value) {
                     (0, mc_protocol::DataValue::Byte(flags)) => self.on_fire = flags & 1 != 0,
                     (1, mc_protocol::DataValue::Int(air)) => self.air = *air,
+                    (8, mc_protocol::DataValue::Byte(flags)) => self.using_item = flags & 1 != 0,
                     _ => {}
                 }
             }
@@ -760,6 +1017,7 @@ impl Walker {
                         }
                     };
                 (self.sky.flat, self.sky.visuals) = (flat, None);
+                self.music = crate::sound::background_music(&res, &dimension);
                 self.sky.sea_level = sea_level;
                 // A new `ClientLevel`, clear until the server says otherwise.
                 (self.sky.rain, self.sky.thunder, self.sky.flash) = (0.0, 0.0, 0);
@@ -807,7 +1065,65 @@ impl Walker {
                     self.effects.remove(&effect);
                 }
             }
-            mc_protocol::Event::Damaged(id) if id == self.entity_id => self.view_bob.hurt(),
+            // `LivingEntity.handleDamageEvent`: the player's own hurt sound, as the damage
+            // type's `effects` say (`DamageEffects`).
+            mc_protocol::Event::Damaged { id, kind } if id == self.entity_id => {
+                self.view_bob.hurt();
+                let event = match damage_effects(&kind).as_deref() {
+                    Some("drowning") => "minecraft:entity.player.hurt_drown",
+                    Some("burning") => "minecraft:entity.player.hurt_on_fire",
+                    Some("poking") => "minecraft:entity.player.hurt_sweet_berry_bush",
+                    Some("freezing") => "minecraft:entity.player.hurt_freeze",
+                    _ => "minecraft:entity.player.hurt",
+                };
+                let pitch = self.wobble(0.2);
+                self.player_sound(event, 1.0, pitch);
+            }
+            // `LivingEntity.handleEntityEvent(3)`: the player's own death sound.
+            mc_protocol::Event::EntityEvent { id, event: 3 } if id == self.entity_id => {
+                let pitch = self.wobble(0.2);
+                self.player_sound("minecraft:entity.player.death", 1.0, pitch);
+            }
+            // `ClientPacketListener.handleSoundEvent` and `handleSoundEntityEvent`.
+            mc_protocol::Event::Sound {
+                event,
+                category,
+                pos,
+                entity,
+                volume,
+                pitch,
+                seed,
+            } => {
+                let category = crate::sound::Category::from_id(category);
+                let instance = match entity {
+                    Some(id) => match self.entity_position(id) {
+                        Some(at) => crate::sound::Instance::following(
+                            &event,
+                            category,
+                            volume,
+                            pitch,
+                            (id, at),
+                            seed,
+                        ),
+                        None => return,
+                    },
+                    None => crate::sound::Instance::at(
+                        &event,
+                        category,
+                        volume,
+                        pitch,
+                        DVec3::from(pos),
+                        seed,
+                    ),
+                };
+                self.sounds.push(instance);
+            }
+            mc_protocol::Event::LevelEvent {
+                kind,
+                pos,
+                data,
+                global: false,
+            } => self.level_event(kind, pos, data),
             // `Entity.pushFromExplosion`.
             mc_protocol::Event::ExplosionPush(push) => self.player.velocity += DVec3::from(push),
             mc_protocol::Event::HurtAnimation { id, yaw } if id == self.entity_id => {
@@ -870,6 +1186,20 @@ impl Walker {
         self.entities.lightning()
     }
 
+    /// `Options.broadcastOptions`, once the options have changed: the view distance.
+    pub fn send_view_distance(&self, chunks: i32) {
+        // One chunk more than drawn, as on joining.
+        let distance = (chunks + 1).clamp(2, 32) as u8;
+        if let Err(e) = self.outbox.send_client_information(distance) {
+            eprintln!("sending the view distance: {e:#}");
+        }
+    }
+
+    /// The Particles option.
+    pub fn set_particle_status(&mut self, status: mc_render::hud::options::Particles) {
+        self.entities.set_particle_status(status);
+    }
+
     /// The particles to draw this frame, between the last tick and the next.
     pub fn particles(&self) -> Vec<mc_render::particle::Particle> {
         self.entities.particles(self.since_tick / TICK, |p| {
@@ -917,6 +1247,7 @@ impl Walker {
             message,
             ticks: 0,
             confirm: false,
+            focused: None,
         });
     }
 
@@ -951,6 +1282,25 @@ impl Walker {
         let Some(pressed) = buttons.iter().position(|b| b.contains(mouse)) else {
             return ScreenAction::None;
         };
+        self.press_screen(pressed)
+    }
+
+    /// The death screen's button `pressed` (by its index in `death_buttons`), clicked or
+    /// chosen with Enter or Space: it takes the focus, as `ContainerEventHandler` gives it.
+    pub fn press_screen(&mut self, pressed: usize) -> ScreenAction {
+        let Some(screen) = self.death_screen() else {
+            return ScreenAction::None;
+        };
+        if !screen.active {
+            return ScreenAction::None;
+        }
+        self.focus_screen(Some(pressed));
+        let seed = self.sound_seed();
+        self.sounds.push(crate::sound::Instance::ui(
+            "minecraft:ui.button.click",
+            1.0,
+            seed,
+        ));
         match (screen.confirm, pressed) {
             // Respawn (or Spectate World): the button stops working until the server
             // respawns the player.
@@ -963,9 +1313,10 @@ impl Walker {
             }
             // Title Screen: hardcore leaves at once; otherwise ask first.
             (false, _) if self.hardcore => ScreenAction::Quit,
+            // `TitleConfirmScreen` opens with nothing focused.
             (false, _) => {
                 if let Some(death) = &mut self.death {
-                    (death.confirm, death.ticks) = (true, 0);
+                    (death.confirm, death.ticks, death.focused) = (true, 0, None);
                 }
                 ScreenAction::None
             }
@@ -1076,7 +1427,14 @@ impl Walker {
         self.open_death_screen(None);
     }
 
-    fn death_screen(&self) -> Option<mc_render::hud::DeathScreen> {
+    /// Moves the death screen's focus to button `focused`, by its index in `death_buttons`.
+    pub fn focus_screen(&mut self, focused: Option<usize>) {
+        if let Some(death) = &mut self.death {
+            death.focused = focused;
+        }
+    }
+
+    pub fn death_screen(&self) -> Option<mc_render::hud::DeathScreen> {
         let death = self.death.as_ref()?;
         Some(mc_render::hud::DeathScreen {
             hardcore: self.hardcore,
@@ -1087,6 +1445,7 @@ impl Walker {
             active: death.ticks >= 20 && !(self.respawning && !death.confirm),
             confirm: death.confirm,
             mouse: None,
+            focused: death.focused,
         })
     }
 
@@ -1120,13 +1479,20 @@ impl Walker {
     }
 
     /// `Hud.extractCrosshair`'s attack indicator: full once recharged while aiming at a
-    /// living entity with a weapon slower than 4 attacks a second, a bar while recharging.
+    /// living entity with a weapon slower than 4 attacks a second, a bar while recharging;
+    /// or with the option at Hotbar, `Hud.extractItemHotbar`'s, only while recharging.
     fn attack_indicator(&self) -> Option<mc_render::hud::AttackIndicator> {
         use mc_render::hud::AttackIndicator;
+        use mc_render::hud::options::AttackIndicator as Mode;
         if self.game_mode == 3 {
             return None;
         }
         let strength = self.hands.attack_strength();
+        match self.attack_indicator_mode {
+            Mode::Off => return None,
+            Mode::Hotbar => return (strength < 1.0).then_some(AttackIndicator::Hotbar(strength)),
+            Mode::Crosshair => {}
+        }
         if strength >= 1.0
             && self.hit_entity.is_some_and(|(_, alive)| alive)
             && self.hands.attack_delay() > 5.0
@@ -1357,6 +1723,30 @@ impl Walker {
             if self.entities.tick(&self.collision, &self.blocks) {
                 self.sky.flash = 2;
             }
+            // `LightningBolt.tick`: heard from anywhere, the impact only nearby.
+            for (pos, thunder, impact) in std::mem::take(&mut self.entities.thunder) {
+                for (event, volume, pitch) in [
+                    ("minecraft:entity.lightning_bolt.thunder", 10000.0, thunder),
+                    ("minecraft:entity.lightning_bolt.impact", 2.0, impact),
+                ] {
+                    let seed = self.sound_seed();
+                    self.sounds.push(crate::sound::Instance::at(
+                        event,
+                        crate::sound::Category::Weather,
+                        volume,
+                        pitch,
+                        pos,
+                        seed,
+                    ));
+                }
+            }
+            self.tick_rain_sound();
+            if let Some((_, _, ticks)) = &mut self.placing {
+                *ticks = ticks.saturating_sub(1);
+                if *ticks == 0 {
+                    self.placing = None;
+                }
+            }
             let dead = self.dead();
             self.view_bob.tick(
                 self.player.velocity,
@@ -1386,6 +1776,7 @@ impl Walker {
             }
             let before = self.player.pos;
             self.player.tick(input, &self.collision, &self.blocks);
+            self.movement_sounds();
             let moved = self.player.pos - before;
             self.view_bob.walked(moved.x.hypot(moved.z) as f32);
             let held = [36 + self.selected as usize, 45].map(|i| {
@@ -1435,13 +1826,24 @@ impl Walker {
     }
 
     /// One tick of `Minecraft.handleKeybinds` for the mouse: clicks start mining, using and
-    /// picking; holding keeps mining, and keeps using every 4 ticks.
+    /// picking; Attack down keeps mining, and Use down keeps using every 4 ticks. While an
+    /// item is in use, the clicks are dropped, and Use let go stops using it
+    /// (`MultiPlayerGameMode.releaseUsingItem`).
     fn tick_hands(&mut self, b: Buttons) -> anyhow::Result<()> {
         self.right_click_delay = self.right_click_delay.saturating_sub(1);
         self.miss_time = self.miss_time.saturating_sub(1);
         self.send_selected_slot()?;
         let hit = self.hit;
         let [attacks, uses, picks] = std::mem::take(&mut self.clicks);
+        // Clicks while an item is in use are dropped.
+        let [attacks, uses, picks] = match self.using_item {
+            true => [0; 3],
+            false => [attacks, uses, picks],
+        };
+        if self.using_item && !b.use_item {
+            self.player_action(RELEASE_USE_ITEM, IVec3::ZERO, 0, false)?;
+            self.using_item = false;
+        }
         for _ in 0..attacks {
             self.start_attack(hit)?;
         }
@@ -1453,11 +1855,19 @@ impl Walker {
             body.put_block_pos(h.pos.to_array()).put_bool(false);
             self.outbox.send("pick_item_from_block", &body)?;
         }
-        if b.use_item && self.right_click_delay == 0 {
+        if b.use_item && self.right_click_delay == 0 && !self.using_item {
             self.start_use(hit)?;
         }
-        // A click shorter than a tick mines for that tick too.
-        self.continue_attack(b.attack || attacks > 0, hit)?;
+        // A click shorter than a tick mines for that tick too; using an item doesn't mine
+        // (`Minecraft.continueAttack`).
+        let held = b.attack || attacks > 0;
+        if self.using_item {
+            if !held {
+                self.miss_time = 0;
+            }
+            return Ok(());
+        }
+        self.continue_attack(held, hit)?;
         Ok(())
     }
 
@@ -1556,6 +1966,7 @@ impl Walker {
     fn start_destroy(&mut self, pos: IVec3, face: u8) -> anyhow::Result<()> {
         if self.instabuild {
             self.destroy_delay = 5;
+            self.creative_break(pos);
             return self.player_action(START_DESTROY_BLOCK, pos, face, true);
         }
         if self.destroying.is_some_and(|(p, ..)| p == pos) {
@@ -1568,6 +1979,11 @@ impl Walker {
         let progress = self.blocks.destroy_progress(state, self.player.on_ground);
         // A block that breaks in one tick breaks on the click; the server agrees.
         self.destroying = (progress < 1.0).then_some((pos, face, 0.0));
+        if progress < 1.0 {
+            self.hit_sound(pos);
+        } else {
+            self.break_sound(pos.to_array(), state);
+        }
         self.player_action(START_DESTROY_BLOCK, pos, face, true)
     }
 
@@ -1579,6 +1995,7 @@ impl Walker {
         }
         if self.instabuild {
             self.destroy_delay = 5;
+            self.creative_break(pos);
             return self.player_action(START_DESTROY_BLOCK, pos, face, true);
         }
         match self.destroying {
@@ -1589,6 +2006,7 @@ impl Walker {
                 if progress >= 1.0 {
                     self.destroying = None;
                     self.destroy_delay = 5;
+                    self.break_sound(pos.to_array(), state);
                     self.player_action(STOP_DESTROY_BLOCK, pos, f, true)
                 } else {
                     self.destroying = Some((p, f, progress));
@@ -1597,6 +2015,12 @@ impl Walker {
             }
             _ => self.start_destroy(pos, face),
         }
+    }
+
+    /// `MultiPlayerGameMode.destroyBlock` in creative: the block breaks, with its sound.
+    fn creative_break(&mut self, pos: IVec3) {
+        let state = mc_physics::World::state(&self.collision, pos.x, pos.y, pos.z);
+        self.break_sound(pos.to_array(), state);
     }
 
     /// `MultiPlayerGameMode.stopDestroyBlock`: letting go stops mining.
@@ -1625,12 +2049,17 @@ impl Walker {
         match hit {
             Some(h) => {
                 let held = &self.inventory.slots[36 + self.selected as usize];
-                if held
+                if let Some(&block) = held
                     .as_ref()
-                    .is_some_and(|(item, _)| self.block_items.contains(item))
+                    .and_then(|(item, _)| self.block_items.get(item))
                 {
                     self.hands.swing(0);
                     self.hands.item_used(0);
+                    // The block lands on the block clicked, if that's replaceable, or
+                    // against its face.
+                    let [dx, dy, dz] = FACE_OFFSETS[h.face as usize];
+                    let next = h.pos + IVec3::new(dx, dy, dz);
+                    self.placing = Some(([h.pos, next], block, 20));
                 }
                 let cursor = h.location - h.pos.as_dvec3();
                 body.put_block_pos(h.pos.to_array())
@@ -1707,20 +2136,6 @@ impl Walker {
         }
         self.sent_status = status;
         out.send("client_tick_end", &[])
-    }
-}
-
-/// The keys held, as vanilla's default bindings read them.
-pub fn input(keys: &std::collections::HashSet<winit::keyboard::KeyCode>) -> Input {
-    use winit::keyboard::KeyCode as K;
-    Input {
-        forward: keys.contains(&K::KeyW),
-        backward: keys.contains(&K::KeyS),
-        left: keys.contains(&K::KeyA),
-        right: keys.contains(&K::KeyD),
-        jump: keys.contains(&K::Space),
-        sneak: keys.contains(&K::ShiftLeft),
-        sprint: keys.contains(&K::ControlLeft),
     }
 }
 

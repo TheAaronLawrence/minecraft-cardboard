@@ -248,3 +248,75 @@ fn swims_in_still_water() {
     );
     assert!(p.swimming && p.pose == Pose::Swimming && p.eye_height() == 0.4);
 }
+
+/// `Entity.applyMovementEmissionAndPlaySound`: a step for each 1/0.6 blocks walked, from the
+/// block underfoot; a snow layer on it sounds over it with the stone muffled; sneaking is
+/// silent; and a fall that hurts thuds, with the block landed on.
+#[test]
+fn movement_sounds() {
+    let (registry, physics, mut world) = setup(|_, _| true);
+    let play = |event: &str, volume: f32, pitch: f32| MoveSound::Play {
+        event: event.into(),
+        volume,
+        pitch,
+    };
+    let walk = |world: &Test, input: Input| {
+        let mut p = Player::new(DVec3::new(0.5, 64.0, 0.5), 0.0, 0.0);
+        run(&mut p, input, 100, world, &physics);
+        let walked = p.pos.z - 0.5;
+        (p.sounds, walked)
+    };
+    let (sounds, walked) = walk(&world, FORWARD);
+    let steps = (walked * 0.6).floor() as usize;
+    assert!(
+        (steps - 1..=steps).contains(&sounds.len()),
+        "{} steps over {walked} blocks",
+        sounds.len()
+    );
+    assert!(
+        sounds
+            .iter()
+            .all(|s| *s == play("minecraft:block.stone.step", 0.15, 1.0))
+    );
+
+    let (sounds, _) = walk(
+        &world,
+        Input {
+            sneak: true,
+            ..FORWARD
+        },
+    );
+    assert!(sounds.is_empty(), "{sounds:?}");
+
+    let snow = registry.block("minecraft:snow").unwrap().default_state;
+    for z in 0..30 {
+        world.blocks.insert([0, 64, z], snow);
+    }
+    let mut p = Player::new(DVec3::new(0.5, 64.125, 0.5), 0.0, 0.0);
+    run(&mut p, FORWARD, 40, &world, &physics);
+    assert_eq!(
+        p.sounds[..2],
+        [
+            play("minecraft:block.snow.step", 0.15, 1.0),
+            play("minecraft:block.stone.step", 0.05, 0.8)
+        ]
+    );
+
+    world.blocks.clear();
+    let still = Input::default();
+    let mut p = Player::new(DVec3::new(0.5, 74.0, 0.5), 0.0, 0.0);
+    run(&mut p, still, 60, &world, &physics);
+    assert_eq!(
+        p.sounds,
+        [
+            play("minecraft:entity.player.big_fall", 1.0, 1.0),
+            play("minecraft:block.stone.fall", 0.5, 0.75)
+        ]
+    );
+    // From 4 blocks it hurts by 1: a small fall. From 3 it doesn't hurt, and is silent.
+    for (height, sounds) in [(4.0, 2), (3.0, 0)] {
+        let mut p = Player::new(DVec3::new(0.5, 64.0 + height, 0.5), 0.0, 0.0);
+        run(&mut p, still, 40, &world, &physics);
+        assert_eq!(p.sounds.len(), sounds, "from {height}: {:?}", p.sounds);
+    }
+}

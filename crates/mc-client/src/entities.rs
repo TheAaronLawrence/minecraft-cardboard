@@ -355,6 +355,9 @@ pub struct Entities {
     /// Lightning bolts, which `LightningBolt.tick` runs on the client too.
     bolts: HashMap<i32, Bolt>,
     random: mc_render::bake::JavaRandom,
+    /// Where bolts struck since this was last taken, with their thunder's and impact's
+    /// pitches (`LightningBolt.tick`).
+    pub thunder: Vec<(DVec3, f32, f32)>,
 }
 
 /// A lightning bolt: where it struck, the ticks it has left to show, the times it'll
@@ -386,6 +389,7 @@ impl Entities {
             particles: Default::default(),
             emitters: Vec::new(),
             bolts: HashMap::new(),
+            thunder: Vec::new(),
             random: mc_render::bake::JavaRandom::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -610,6 +614,8 @@ impl Entities {
             // `handleParticleEvent`.
             Event::Particles {
                 name,
+                override_limiter,
+                always_show,
                 pos,
                 dist,
                 speed,
@@ -628,10 +634,13 @@ impl Entities {
                     DVec3::from(speed.map(f64::from)),
                 );
                 let p = &mut self.particles;
-                if count == 0 {
+                if count == 0 && p.allowed(override_limiter, always_show) {
                     p.crit(kind, pos, speed * dist);
                 }
                 for _ in 0..count {
+                    if !p.allowed(override_limiter, always_show) {
+                        continue;
+                    }
                     if alternative != 0 {
                         let mut r = || f64::from(p.random());
                         let offset = DVec3::new(r(), r(), r()) * dist;
@@ -675,7 +684,7 @@ impl Entities {
             }
             // `LivingEntity.handleDamageEvent` and `animateHurt`: it flashes red. The
             // player's own pass on.
-            Event::Damaged(id) | Event::HurtAnimation { id, .. }
+            Event::Damaged { id, .. } | Event::HurtAnimation { id, .. }
                 if self.tracked.contains_key(&id) =>
             {
                 self.tracked.get_mut(&id).expect("checked").hurt_time = 10;
@@ -717,7 +726,9 @@ impl Entities {
                         height * (0.5 + ya / 4.0),
                         width * za / 4.0,
                     );
-                particles.crit(*kind, at, DVec3::new(xa, ya + 0.2, za));
+                if particles.allowed(false, false) {
+                    particles.crit(*kind, at, DVec3::new(xa, ya + 0.2, za));
+                }
             }
             *left -= 1;
             *left > 0
@@ -740,7 +751,14 @@ impl Entities {
         // to ten ticks with a new shape, and goes once its flashes run out.
         let random = &mut self.random;
         let mut flash = false;
+        let thunder = &mut self.thunder;
         self.bolts.retain(|_, bolt| {
+            // A new bolt thunders as it first ticks.
+            if bolt.life == 2 {
+                let thunder_pitch = 0.8 + random.next_float() * 0.2;
+                let impact_pitch = 0.5 + random.next_float() * 0.2;
+                thunder.push((bolt.pos, thunder_pitch, impact_pitch));
+            }
             bolt.life -= 1;
             if bolt.life < 0 {
                 if bolt.flashes == 0 {
@@ -790,11 +808,21 @@ impl Entities {
     }
 
     /// The lightning bolts to draw (`LightningBoltRenderer`), while each shows.
+    /// Where an entity is now, if it's in view.
+    pub fn position(&self, id: i32) -> Option<DVec3> {
+        self.tracked.get(&id).map(|t| t.now.pos)
+    }
+
     pub fn lightning(&self) -> Vec<mc_render::mesh::Vertex> {
         self.bolts
             .values()
             .flat_map(|bolt| mc_render::weather::lightning(bolt.pos, bolt.seed))
             .collect()
+    }
+
+    /// The Particles option.
+    pub fn set_particle_status(&mut self, status: mc_render::hud::options::Particles) {
+        self.particles.status = status;
     }
 
     /// The particles to draw, `partial` of the way to the next tick, lit by `light`.
@@ -1282,6 +1310,7 @@ mod tests {
             emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
+            thunder: Vec::new(),
         };
         for (id, x) in [(1, 5.0), (2, 2.5), (3, -2.0)] {
             e.event(Event::AddEntity {
@@ -1320,6 +1349,7 @@ mod tests {
             emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
+            thunder: Vec::new(),
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1411,6 +1441,7 @@ mod tests {
             emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
+            thunder: Vec::new(),
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1460,6 +1491,7 @@ mod tests {
             emitters: Vec::new(),
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
+            thunder: Vec::new(),
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1478,7 +1510,13 @@ mod tests {
         };
         let tick = |e: &mut Entities| e.tracked.get_mut(&1).expect("added").tick_living();
         assert!(!hurt(&e));
-        assert!(e.event(Event::Damaged(1)).is_none());
+        assert!(
+            e.event(Event::Damaged {
+                id: 1,
+                kind: String::new()
+            })
+            .is_none()
+        );
         let flashing: Vec<bool> = (0..11)
             .map(|_| {
                 let now = hurt(&e);
@@ -1488,8 +1526,11 @@ mod tests {
             .collect();
         assert_eq!(flashing, [[true; 10].as_slice(), &[false]].concat());
         assert!(matches!(
-            e.event(Event::Damaged(2)),
-            Some(Event::Damaged(2))
+            e.event(Event::Damaged {
+                id: 2,
+                kind: String::new()
+            }),
+            Some(Event::Damaged { id: 2, .. })
         ));
         let values = vec![(HEALTH, DataValue::Float(0.0))];
         e.event(Event::EntityData { id: 1, values });

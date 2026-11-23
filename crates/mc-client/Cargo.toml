@@ -14,6 +14,7 @@ base64 = "0.23"
 glam = "0.34"
 image = { version = "0.25", default-features = false, features = ["png"] }
 mc-assets = { path = "../mc-assets" }
+mc-audio = { path = "../mc-audio" }
 mc-registry = { path = "../mc-registry" }
 mc-render = { path = "../mc-render" }
 mc-physics = { path = "../mc-physics" }

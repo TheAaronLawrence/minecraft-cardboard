@@ -6,7 +6,9 @@
 // which of its faces are sturdy, for swimming, and whether rain stops on it, and how every
 // state affects light: its dampening and emission, and the faces of its occlusion shape as
 // the light engine sees them (`LightEngine.getOcclusionShape`) and as faces are culled against
-// them (`BlockState.getFaceOcclusionShape`, `Block.shouldRenderFace`). `cargo xtask gen-reports`
+// them (`BlockState.getFaceOcclusionShape`, `Block.shouldRenderFace`), and every state's
+// `SoundType`: its break, step, place, hit and fall sound events, volume and pitch, which the
+// client plays as blocks are walked on, placed and mined. `cargo xtask gen-reports`
 // runs it on the unpacked server with `java DumpPhysics.java OUT.json`, which needs a JDK.
 //
 // Shapes are taken at the origin with an empty collision context, as for a block nothing is
@@ -27,6 +29,7 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.IceBlock;
+import net.minecraft.world.level.block.SoundType;
 import net.minecraft.world.level.material.FlowingFluid;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.material.Fluids;
@@ -52,6 +55,9 @@ public class DumpPhysics {
         StringBuilder renderOcclusion = new StringBuilder();
         Map<String, Integer> occlusionIds = new HashMap<>();
         List<String> occlusionFaces = new ArrayList<>();
+        StringBuilder sounds = new StringBuilder();
+        Map<String, Integer> soundTypeIds = new HashMap<>();
+        List<String> soundTypes = new ArrayList<>();
         for (int id = 0; id < Block.BLOCK_STATE_REGISTRY.size(); id++) {
             BlockState state = Block.BLOCK_STATE_REGISTRY.byId(id);
             if (id > 0) {
@@ -62,6 +68,7 @@ public class DumpPhysics {
                 light.append(',');
                 occlusion.append(',');
                 renderOcclusion.append(',');
+                sounds.append(',');
             }
             VoxelShape collision = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
             states.append(shapeId(collision, shapeIds, shapes, edges));
@@ -103,6 +110,15 @@ public class DumpPhysics {
             }
             occlusion.append(state.useShapeForLightOcclusion() ? renderId : 0);
             renderOcclusion.append(renderId);
+            // An index into `sound_types`.
+            SoundType sound = state.getSoundType();
+            String soundKey = "[\"" + sound.getBreakSound().location() + "\",\"" + sound.getStepSound().location()
+                + "\",\"" + sound.getPlaceSound().location() + "\",\"" + sound.getHitSound().location()
+                + "\",\"" + sound.getFallSound().location() + "\"," + sound.getVolume() + "," + sound.getPitch() + "]";
+            sounds.append(soundTypeIds.computeIfAbsent(soundKey, k -> {
+                soundTypes.add(k);
+                return soundTypes.size() - 1;
+            }));
         }
 
         StringBuilder blocks = new StringBuilder();
@@ -146,6 +162,8 @@ public class DumpPhysics {
             out.println("  \"occlusion\": [" + occlusion + "],");
             out.println("  \"render_occlusion\": [" + renderOcclusion + "],");
             out.println("  \"occlusion_faces\": [\n    " + String.join(",\n    ", occlusionFaces) + "\n  ],");
+            out.println("  \"sounds\": [" + sounds + "],");
+            out.println("  \"sound_types\": [\n    " + String.join(",\n    ", soundTypes) + "\n  ],");
             out.println("  \"blocks\": {\n    " + blocks + "\n  },");
             out.println("  \"mining\": {\n    " + mining + "\n  }");
             out.println("}");

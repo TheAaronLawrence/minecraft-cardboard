@@ -325,11 +325,12 @@ impl Clouds {
         )
     }
 
-    /// `CloudRenderer.buildMesh` for fancy clouds `radius` cells around the camera's: each
-    /// face packed for the cloud shader as x and z (relative cells, plus 512), the
-    /// `Direction`'s 3D value, whether it faces in, and whether it takes the top's colour.
-    /// Nearer cells come first.
-    pub fn faces(&self, key: CloudKey, radius: i32) -> Vec<u32> {
+    /// `CloudRenderer.buildMesh` for clouds `radius` cells around the camera's: each face
+    /// packed for the cloud shader as x and z (relative cells, plus 512), the `Direction`'s
+    /// 3D value, whether it faces in, and whether it takes the top's colour. Fancy clouds
+    /// are boxes (`buildExtrudedCell`); fast ones a flat bottom face per cell in the top's
+    /// colour (`buildFlatCell`). Nearer cells come first.
+    pub fn faces(&self, key: CloudKey, radius: i32, fancy: bool) -> Vec<u32> {
         let mut faces = Vec::new();
         let (cx, cz) = key.cell;
         let mut cell = |x: i32, z: i32| {
@@ -337,6 +338,10 @@ impl Clouds {
             let iz = (cz + z).rem_euclid(self.height);
             let data = self.cells[(ix + iz * self.width) as usize];
             if data == 0 {
+                return;
+            }
+            if !fancy {
+                faces.push((x + 512) as u32 | ((z + 512) as u32) << 10 | 1 << 24);
                 return;
             }
             let mut face = |direction: u32, inside: bool| {
@@ -385,9 +390,6 @@ impl Clouds {
         faces
     }
 }
-
-/// The cloud range's cells (`CloudRenderer.prepare`), for vanilla's default of 128 chunks.
-pub const CLOUD_RADIUS: i32 = (128 * 16 + 11) / 12;
 
 /// Vanilla's cloud cell size in blocks, as the shader takes it.
 pub const CLOUD_CELL: [f32; 3] = [CELL, 4.0, CELL];

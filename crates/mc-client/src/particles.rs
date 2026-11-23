@@ -39,6 +39,8 @@ struct Particle {
 pub struct Particles {
     particles: Vec<Particle>,
     seed: u64,
+    /// The Particles option.
+    pub status: mc_render::hud::options::Particles,
 }
 
 impl Default for Particles {
@@ -46,6 +48,7 @@ impl Default for Particles {
         Self {
             particles: Vec::new(),
             seed: 0x2545_F491_4F6C_DD1D,
+            status: Default::default(),
         }
     }
 }
@@ -62,6 +65,25 @@ impl Particles {
         (self.seed >> 40) as f32 / (1u64 << 24) as f32
     }
 
+    /// `ClientLevel.addParticle`'s check, before each particle: with `override_limiter`
+    /// every one shows; otherwise none on Minimal (bar one in ten with `always_show`, which
+    /// then counts as Decreased) and two in three on Decreased
+    /// (`calculateParticleLevel`).
+    pub fn allowed(&mut self, override_limiter: bool, always_show: bool) -> bool {
+        use mc_render::hud::options::Particles as Status;
+        if override_limiter {
+            return true;
+        }
+        let mut status = self.status;
+        if always_show && status == Status::Minimal && self.random() < 0.1 {
+            status = Status::Decreased;
+        }
+        if status == Status::Decreased && self.random() < 1.0 / 3.0 {
+            status = Status::Minimal;
+        }
+        status != Status::Minimal
+    }
+
     /// A standard normal value (Box-Muller), as `RandomSource.nextGaussian`.
     pub fn gaussian(&mut self) -> f64 {
         let (a, b) = (self.random().max(1e-7) as f64, self.random() as f64);
@@ -72,6 +94,9 @@ impl Particles {
     /// box with its feet at `feet`, each set off a little the way it drifts.
     pub fn poof(&mut self, feet: DVec3, [width, height]: [f32; 2]) {
         for _ in 0..20 {
+            if !self.allowed(false, false) {
+                continue;
+            }
             let drift = DVec3::new(self.gaussian(), self.gaussian(), self.gaussian()) * 0.02;
             // `getRandomX(1)`, `getRandomY` and `getRandomZ(1)`.
             let spot = DVec3::new(

@@ -1,6 +1,6 @@
 //! The pause screen, as vanilla's `PauseScreen.createPauseMenu` lays it out over the HUD:
-//! "Game Menu", Back to Game, the buttons for screens this game doesn't have yet (shown
-//! inactive), and Disconnect, or Save and Quit to Title in a world of our own.
+//! "Game Menu", Back to Game, Options, the buttons for screens this game doesn't have yet
+//! (shown inactive), and Disconnect, or Save and Quit to Title in a world of our own.
 
 use super::{Button, GuiMesh, HudArt, SCREEN};
 
@@ -25,12 +25,15 @@ pub struct Pause {
     pub local: bool,
     /// Where the mouse is, in GUI pixels, to highlight what's under it.
     pub mouse: Option<[f32; 2]>,
+    /// The button clicked or moved to with the keyboard, highlighted.
+    pub focused: Option<Action>,
 }
 
 /// What a pause screen button does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     ReturnToGame,
+    Options,
     /// Disconnect, or Save and Quit to Title.
     Leave,
     /// A screen this game doesn't have yet.
@@ -84,9 +87,9 @@ pub fn buttons(
     }
     buttons.extend([
         (
-            Action::None,
+            Action::Options,
             button(4, 122, 98, "menu.options"),
-            false,
+            true,
             None,
         ),
         (
@@ -101,23 +104,29 @@ pub fn buttons(
 }
 
 impl GuiMesh {
-    /// `PauseScreen.extractBackground`'s in-world menu background over the HUD (vanilla
-    /// blurs what's behind it first, which this doesn't), then the title and buttons.
-    pub(crate) fn pause(&mut self, art: &HudArt, p: &Pause, width: i32, height: i32) {
+    /// `Screen.extractMenuBackground` over the world: the in-world menu background tiled.
+    pub(crate) fn inworld_background(&mut self, art: &HudArt, width: i32, height: i32) {
         let tile = art.named[INWORLD_BACKGROUND];
         for y in (0..height).step_by(32) {
             for x in (0..width).step_by(32) {
                 self.blit(x as f32, y as f32, SCREEN, 32.0, 32.0, tile, [1.0; 4]);
             }
         }
+    }
+
+    /// `PauseScreen.extractBackground`'s in-world menu background over the HUD (vanilla
+    /// blurs what's behind it first, which this doesn't), then the title and buttons.
+    pub(crate) fn pause(&mut self, art: &HudArt, p: &Pause, width: i32, height: i32) {
+        self.inworld_background(art, width, height);
         let title = art
             .lang
             .get("menu.game")
             .map_or("menu.game", String::as_str);
         let x = width / 2 - GuiMesh::text_width(art, title) as i32 / 2;
         self.shadowed(art, title, x as f32, 40.0, SCREEN + 2.0, 1.0, [1.0; 3]);
-        for (_, button, active, icon) in buttons(p, width, height) {
-            self.button(art, &button, active, p.mouse);
+        for (action, button, active, icon) in buttons(p, width, height) {
+            let focused = active && p.focused == Some(action);
+            self.button(art, &button, active, p.mouse, focused);
             // `SpriteIconButton.CenteredIcon`: a 15 × 15 sprite in the middle.
             if let Some(icon) = icon {
                 let [bx, by, w, h] = button.rect;

@@ -8,8 +8,11 @@
 
 pub mod chat;
 pub mod inventory;
+pub mod keys;
 pub mod launcher;
 pub mod menu;
+pub mod nav;
+pub mod options;
 pub mod pause;
 
 use crate::atlas::Atlas;
@@ -30,10 +33,12 @@ const FOOD: [&str; 3] = ["hud/food_empty", "hud/food_half", "hud/food_full"];
 const AIR: [&str; 3] = ["hud/air", "hud/air_bursting", "hud/air_empty"];
 /// `Hud`'s attack indicator under the crosshair: full, then the charging bar's background
 /// and progress.
-const ATTACK_INDICATOR: [&str; 3] = [
+const ATTACK_INDICATOR: [&str; 5] = [
     "hud/crosshair_attack_indicator_full",
     "hud/crosshair_attack_indicator_background",
     "hud/crosshair_attack_indicator_progress",
+    "hud/hotbar_attack_indicator_background",
+    "hud/hotbar_attack_indicator_progress",
 ];
 /// `Entity.getMaxAirSupply` for a player: 15 seconds.
 const MAX_AIR: i32 = 300;
@@ -73,6 +78,7 @@ fn named_sprites() -> Vec<String> {
         .chain(menu::TEXT_FIELD)
         .chain(menu::TABS)
         .chain(pause::ICONS)
+        .chain(options::SPRITES)
         .chain(inventory::SPRITES)
         .map(str::to_owned)
         .collect();
@@ -107,6 +113,7 @@ pub(crate) fn sprites() -> Vec<String> {
         .chain(named_sprites().iter().map(|n| gui_sprite(n)))
         .chain(menu::TEXTURES.map(str::to_owned))
         .chain(pause::TEXTURES.map(str::to_owned))
+        .chain(options::TEXTURES.map(str::to_owned))
         .chain(inventory::TEXTURES.map(str::to_owned))
         .collect()
 }
@@ -202,6 +209,7 @@ impl HudArt {
                     menu::TEXTURES
                         .into_iter()
                         .chain(pause::TEXTURES)
+                        .chain(options::TEXTURES)
                         .chain(inventory::TEXTURES)
                         .map(|id| (id.to_owned(), atlas.sprite(id).rect)),
                 )
@@ -230,7 +238,8 @@ pub(crate) fn item_names() -> Result<HashMap<String, (String, String)>> {
         .collect())
 }
 
-/// The English translations of the keys the death screen and the menus use.
+/// The English translations of the keys the death screen, the menus and the key mappings
+/// use.
 fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
     let path = res.asset_path("lang", "minecraft:en_us", "json");
     let lang: HashMap<String, serde_json::Value> = serde_json::from_slice(
@@ -255,6 +264,9 @@ fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
                 "gameMode.",
                 "createWorld.",
                 "generator.",
+                "soundCategory.",
+                "controls.",
+                "key.",
             ]
             .iter()
             .any(|p| k.starts_with(p))
@@ -315,13 +327,16 @@ pub struct Hotbar {
     pub attack_indicator: Option<AttackIndicator>,
 }
 
-/// The attack indicator under the crosshair (`AttackIndicatorStatus.CROSSHAIR`).
+/// The attack indicator under the crosshair (`AttackIndicatorStatus.CROSSHAIR`), or beside
+/// the hotbar (`HOTBAR`).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AttackIndicator {
     /// Recharged, aiming at a living entity, with a weapon slow enough to be worth it.
     Full,
     /// Recharging: how far, 0 to 1.
     Charging(f32),
+    /// Recharging, shown beside the hotbar: how far, 0 to 1.
+    Hotbar(f32),
 }
 
 /// A screen drawn instead of the HUD.
@@ -333,6 +348,8 @@ pub enum Screen {
     /// Drawn over the HUD too.
     Inventory(inventory::Inventory),
     Launcher(launcher::Launcher),
+    /// Over the title screen's background, or over the HUD from the pause screen.
+    Options(options::Options),
 }
 
 /// What the death screen shows.
@@ -349,6 +366,8 @@ pub struct DeathScreen {
     pub confirm: bool,
     /// Where the mouse is, in GUI pixels, to highlight the button under it.
     pub mouse: Option<[f32; 2]>,
+    /// The button with the focus, by its index in `death_buttons`.
+    pub focused: Option<usize>,
 }
 
 /// A button on the death screen: x, y, width and height in GUI pixels, and its label's
@@ -702,6 +721,18 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
                 let rect = [u0, v0, u0 + (u1 - u0) * progress / 16.0, v1];
                 inverted.blit(x, y, BACK + 0.01, progress, 4.0, rect, white);
             }
+            // `Hud.extractItemHotbar`: right of the hotbar for a right-handed player, the
+            // bottom `progress` of 18 filled.
+            AttackIndicator::Hotbar(strength) => {
+                let (x, y) = (((width / 2) as i32 + 91 + 6) as f32, bottom - 20.0);
+                mesh.blit(x, y, BACK, 18.0, 18.0, named(3), white);
+                let progress = (strength * 19.0) as i32 as f32;
+                let [u0, v0, u1, v1] = named(4);
+                let top = v0 + (v1 - v0) * (18.0 - progress) / 18.0;
+                let rect = [u0, top, u1, v1];
+                let y = y + 18.0 - progress;
+                mesh.blit(x, y, BACK + 0.01, 18.0, progress, rect, white);
+            }
         }
         mesh.inverted = inverted.vertices;
     }
@@ -887,16 +918,24 @@ impl GuiMesh {
                 x += width_of(text);
             }
         }
-        for button in death_buttons(d, width, height) {
-            self.button(art, &button, d.active, d.mouse);
+        for (i, button) in death_buttons(d, width, height).iter().enumerate() {
+            self.button(art, button, d.active, d.mouse, d.focused == Some(i));
         }
     }
 
     /// `Button.extractContents`: the nine-sliced sprite, then the label centred on it, grey
     /// when inactive (`AbstractWidget.WithInactiveMessage`).
-    fn button(&mut self, art: &HudArt, b: &Button, active: bool, mouse: Option<[f32; 2]>) {
+    /// A button, highlighted under the mouse or while `focused` (`isHoveredOrFocused`).
+    fn button(
+        &mut self,
+        art: &HudArt,
+        b: &Button,
+        active: bool,
+        mouse: Option<[f32; 2]>,
+        focused: bool,
+    ) {
         let label = art.lang.get(b.label).map_or(b.label, String::as_str);
-        self.labelled_button(art, b, label, active, mouse);
+        self.labelled_button(art, b, label, active, mouse, focused);
     }
 
     /// A button showing `label` as it is, such as a `CycleButton`'s "Game Mode: Survival".
@@ -907,8 +946,22 @@ impl GuiMesh {
         label: &str,
         active: bool,
         mouse: Option<[f32; 2]>,
+        focused: bool,
     ) {
-        let hovered = mouse.is_some_and(|m| b.contains(m));
+        let hovered = mouse.is_some_and(|m| b.contains(m)) || focused;
+        self.button_sprite(art, b, active, hovered);
+        let [x, y, w, h] = b.rect;
+        // `ActiveTextCollector.defaultScrollingHelper` for a label that fits.
+        let text_width = Self::text_width(art, label) as i32;
+        let left = x + w / 2 - text_width / 2;
+        let top = (y + y + h - 9) / 2 + 1;
+        // 0xA0A0A0 when inactive.
+        let rgb = if active { [1.0; 3] } else { [160.0 / 255.0; 3] };
+        self.shadowed(art, label, left as f32, top as f32, SCREEN + 2.0, 1.0, rgb);
+    }
+
+    /// `Button.extractContents`' nine-sliced sprite: plain, inactive or highlighted.
+    fn button_sprite(&mut self, art: &HudArt, b: &Button, active: bool, hovered: bool) {
         let sprite = match (active, hovered) {
             (true, false) => BUTTON[0],
             (false, _) => BUTTON[1],
@@ -943,13 +996,6 @@ impl GuiMesh {
             left += width;
         }
         column(x + w - 3, 197, 3);
-        // `ActiveTextCollector.defaultScrollingHelper` for a label that fits.
-        let text_width = Self::text_width(art, label) as i32;
-        let left = x + w / 2 - text_width / 2;
-        let top = (y + y + h - 9) / 2 + 1;
-        // 0xA0A0A0 when inactive.
-        let rgb = if active { [1.0; 3] } else { [160.0 / 255.0; 3] };
-        self.shadowed(art, label, left as f32, top as f32, SCREEN + 2.0, 1.0, rgb);
     }
 
     /// `GuiGraphicsExtractor.fill`: a rectangle (x, y, width, height) in one colour.

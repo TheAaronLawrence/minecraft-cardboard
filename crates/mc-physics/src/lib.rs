@@ -86,6 +86,32 @@ pub struct BlockPhysics {
     /// Each occlusion shape's faces, by `Direction` ordinal: a bit per sixteenth of the face
     /// it covers, as `DumpPhysics.faceMask` lays them out.
     occlusion_faces: Vec<[[u64; 4]; 6]>,
+    /// Per state id: an index into `sound_types` (`BlockState.getSoundType`).
+    sounds: Vec<u16>,
+    sound_types: Vec<SoundType>,
+    /// States in `#minecraft:inside_step_sound_blocks` and `#combination_step_sound_blocks`,
+    /// which change the step sound.
+    inside_step: Vec<bool>,
+    combination_step: Vec<bool>,
+    /// Air, cave air and void air (`BlockState.isAir`).
+    air: Vec<bool>,
+    /// `#minecraft:fences`, and `#walls` or fence gates, which `Entity.getOnPos` stands on
+    /// at their tops.
+    fences: Vec<bool>,
+    walls_and_gates: Vec<bool>,
+}
+
+/// `SoundType`: the sound events a block plays when broken, walked on, placed, hit while
+/// being mined, and landed on, with the volume and pitch they're played at.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundType {
+    pub break_sound: String,
+    pub step: String,
+    pub place: String,
+    pub hit: String,
+    pub fall: String,
+    pub volume: f32,
+    pub pitch: f32,
 }
 
 impl BlockPhysics {
@@ -258,7 +284,49 @@ impl BlockPhysics {
                 .all(|&i| i as usize <= occlusion_faces.len()),
             "physics.json's occlusion indices don't fit its occlusion_faces"
         );
+        let sound_types = report["sound_types"]
+            .as_array()
+            .context("physics.json has no sound_types; run `cargo xtask gen-reports`")?
+            .iter()
+            .map(|t| {
+                let name = |i: usize| t[i].as_str().map(str::to_owned).context("sound type");
+                Ok(SoundType {
+                    break_sound: name(0)?,
+                    step: name(1)?,
+                    place: name(2)?,
+                    hit: name(3)?,
+                    fall: name(4)?,
+                    volume: t[5].as_f64().context("sound type volume")? as f32,
+                    pitch: t[6].as_f64().context("sound type pitch")? as f32,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sounds = per_state("sounds")?;
+        anyhow::ensure!(
+            sounds.iter().all(|&i| (i as usize) < sound_types.len()),
+            "physics.json's sounds don't fit its sound_types"
+        );
         Ok(Self {
+            sounds,
+            sound_types,
+            inside_step: tagged("minecraft:inside_step_sound_blocks")?,
+            combination_step: tagged("minecraft:combination_step_sound_blocks")?,
+            air: {
+                let mut air = vec![false; n];
+                for name in ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"] {
+                    if let Some(b) = registry.block(name) {
+                        let first = b.first_state as usize;
+                        air[first..first + b.state_count() as usize].fill(true);
+                    }
+                }
+                air
+            },
+            fences: tagged("minecraft:fences")?,
+            walls_and_gates: {
+                let walls = tagged("minecraft:walls")?;
+                let gates = tagged("minecraft:fence_gates")?;
+                walls.iter().zip(gates).map(|(w, g)| *w || g).collect()
+            },
             shapes,
             edges,
             state_shapes,
@@ -277,6 +345,41 @@ impl BlockPhysics {
             render_occlusion,
             occlusion_faces,
         })
+    }
+
+    /// `BlockState.getSoundType`.
+    pub fn sound_type(&self, state: u32) -> &SoundType {
+        let i = self.sounds.get(state as usize).copied().unwrap_or(0);
+        &self.sound_types[i as usize]
+    }
+
+    /// In `#minecraft:inside_step_sound_blocks`: walked through, it's heard instead of the
+    /// block below.
+    pub fn inside_step_sound(&self, state: u32) -> bool {
+        self.inside_step
+            .get(state as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// In `#minecraft:combination_step_sound_blocks`: heard with the block below, muffled.
+    pub fn combination_step_sound(&self, state: u32) -> bool {
+        self.combination_step
+            .get(state as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// `BlockState.isAir`.
+    pub fn is_air(&self, state: u32) -> bool {
+        self.air.get(state as usize).copied().unwrap_or(true)
+    }
+
+    /// Whether `Entity.getOnPos` keeps a supporting block of this state rather than the
+    /// block at the offset: walls and gates always, fences when `low` (within half a block).
+    fn fence_like(&self, state: u32, low: bool) -> bool {
+        let at = |v: &Vec<bool>| v.get(state as usize).copied().unwrap_or(false);
+        at(&self.walls_and_gates) || low && at(&self.fences)
     }
 
     fn shape(&self, state: u32) -> &[Aabb] {
@@ -522,6 +625,36 @@ pub struct Player {
     jump_trigger_time: u32,
     was_jumping: bool,
     fall_distance: f64,
+    /// `Entity.isShiftKeyDown`: sneak was held this tick.
+    shift_key_down: bool,
+    /// `Entity.mainSupportingBlockPos` and `onGroundNoBlocks`.
+    supporting: Option<[i32; 3]>,
+    on_ground_no_blocks: bool,
+    /// `Entity.moveDist` and `nextStep`: how far it has walked, and where the next step
+    /// sounds.
+    move_dist: f32,
+    next_step: f32,
+    /// `Entity.wasTouchingWater` and `firstTick`, for the splash going in.
+    was_touching_water: bool,
+    first_tick: bool,
+    /// The sounds the player made since they were last taken, as `LocalPlayer.playSound`
+    /// plays them where the player is.
+    pub sounds: Vec<MoveSound>,
+}
+
+/// A sound the player's movement makes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MoveSound {
+    /// A sound event at this volume and pitch, such as a block's step sound.
+    Play {
+        event: String,
+        volume: f32,
+        pitch: f32,
+    },
+    /// `Entity.playSwimSound` at this volume, at a random pitch from 0.6 to 1.4.
+    Swim(f32),
+    /// `Entity.doWaterSplashEffect`: going into water, at this volume, fast or not.
+    Splash { volume: f32, fast: bool },
 }
 
 impl Player {
@@ -548,6 +681,14 @@ impl Player {
             jump_trigger_time: 0,
             was_jumping: false,
             fall_distance: 0.0,
+            shift_key_down: false,
+            supporting: None,
+            on_ground_no_blocks: false,
+            move_dist: 0.0,
+            next_step: 1.0,
+            was_touching_water: false,
+            first_tick: true,
+            sounds: Vec::new(),
         }
     }
 
@@ -609,7 +750,18 @@ impl Player {
         self.in_water = self.touching.water_height > 0.0;
         if self.in_water {
             self.fall_distance = 0.0;
+            if !self.was_touching_water && !self.first_tick {
+                // `doWaterSplashEffect`.
+                let v = self.velocity;
+                let speed =
+                    ((v.x * v.x * 0.2 + v.y * v.y + v.z * v.z * 0.2).sqrt() as f32 * 0.2).min(1.0);
+                self.sounds.push(MoveSound::Splash {
+                    volume: speed,
+                    fast: speed >= 0.25,
+                });
+            }
         }
+        self.was_touching_water = self.in_water;
         if pushed {
             if self.in_water {
                 self.velocity += self
@@ -652,6 +804,7 @@ impl Player {
             return;
         }
         let collider = collide::Collider { world, blocks };
+        self.shift_key_down = input.sneak;
 
         // `Player.updateIsUnderwater`, from where the eye was last tick, then
         // `Entity.baseTick`'s fluid update and `Player.updateSwimming`.
@@ -814,6 +967,7 @@ impl Player {
             }
         }
         self.update_pose(input.sneak, &collider);
+        self.first_tick = false;
     }
 
     /// `LivingEntity.travelInFluid`: slow strokes, the fluid's drag, and a little gravity.
@@ -984,14 +1138,19 @@ impl Player {
         self.horizontal_collision = hit_x || hit_z;
         let vertical = wanted.y != moved.y;
         self.on_ground = vertical && wanted.y < 0.0;
+        self.check_supporting_block(moved, c);
         // `LivingEntity.checkFallDamage`: out of water, see whether this move went in.
         if !self.in_water {
             self.update_fluid_interaction(c);
         }
+        if !self.in_water && moved.y < 0.0 {
+            self.fall_distance -= moved.y;
+        }
+        if self.on_ground && self.fall_distance > 0.0 && !self.flying {
+            self.land(c);
+        }
         if self.on_ground || self.flying {
             self.fall_distance = 0.0;
-        } else if !self.in_water && moved.y < 0.0 {
-            self.fall_distance -= moved.y;
         }
 
         // `restituteMovementAfterCollisions`: stop along whatever was hit.
@@ -1004,9 +1163,180 @@ impl Player {
         if vertical {
             self.velocity.y = 0.0;
         }
+        // `Player.getMovementEmission`: flying, or sneaking on the ground, makes no sound.
+        if !(self.flying || self.on_ground && self.shift_key_down) {
+            self.movement_sounds(moved, c);
+        }
         let factor = self.block_factor(c, &c.blocks.speed_factor) as f64;
         self.velocity.x *= factor;
         self.velocity.z *= factor;
+    }
+
+    /// `Entity.checkSupportingBlock`: the block the player stands on, found under its box,
+    /// or under where it was before this move.
+    fn check_supporting_block(&mut self, moved: DVec3, c: &collide::Collider<impl World>) {
+        if !self.on_ground {
+            (self.supporting, self.on_ground_no_blocks) = (None, false);
+            return;
+        }
+        let b = self.bounding_box();
+        let area = Aabb::new(
+            DVec3::new(b.min.x, b.min.y - 1.0e-6, b.min.z),
+            DVec3::new(b.max.x, b.min.y, b.max.z),
+        );
+        let mut found = c.supporting_block(&area, self.pos);
+        if found.is_some() || self.on_ground_no_blocks {
+            self.supporting = found;
+        } else {
+            let back = DVec3::new(-moved.x, 0.0, -moved.z);
+            found = c.supporting_block(&area.offset(back), self.pos);
+            self.supporting = found;
+        }
+        self.on_ground_no_blocks = found.is_none();
+    }
+
+    /// `Entity.getOnPos(offset)`: the supporting block, moved down to `offset` below the
+    /// feet unless it's a fence, wall or gate, whose tops stand higher.
+    fn on_pos(&self, offset: f64, c: &collide::Collider<impl World>) -> [i32; 3] {
+        let y = (self.pos.y - offset).floor() as i32;
+        match self.supporting {
+            Some(p) if offset > 1.0e-5 => {
+                let state = c.world.state(p[0], p[1], p[2]);
+                if c.blocks.fence_like(state, offset <= 0.5) {
+                    p
+                } else {
+                    [p[0], y, p[2]]
+                }
+            }
+            Some(p) => p,
+            None => [self.pos.x.floor() as i32, y, self.pos.z.floor() as i32],
+        }
+    }
+
+    /// `LivingEntity.causeFallDamage` as the client runs it: a fall that hurts thuds, and
+    /// the block landed on sounds. A player who may fly takes no fall damage.
+    fn land(&mut self, c: &collide::Collider<impl World>) {
+        // `calculateFallDamage`, with `safe_fall_distance` 3.
+        let damage = (self.fall_distance + 1.0e-6 - 3.0).floor();
+        if self.may_fly || damage <= 0.0 {
+            return;
+        }
+        let event = if damage > 4.0 {
+            "minecraft:entity.player.big_fall"
+        } else {
+            "minecraft:entity.player.small_fall"
+        };
+        self.play(event, 1.0, 1.0);
+        // `playBlockFallSound`.
+        let (x, y, z) = (
+            self.pos.x.floor() as i32,
+            (self.pos.y - 0.2f32 as f64).floor() as i32,
+            self.pos.z.floor() as i32,
+        );
+        let state = c.world.state(x, y, z);
+        if !c.blocks.is_air(state) {
+            let t = c.blocks.sound_type(state);
+            let (event, volume, pitch) = (t.fall.clone(), t.volume * 0.5, t.pitch * 0.75);
+            self.play(&event, volume, pitch);
+        }
+    }
+
+    fn play(&mut self, event: &str, volume: f32, pitch: f32) {
+        self.sounds.push(MoveSound::Play {
+            event: event.to_owned(),
+            volume,
+            pitch,
+        });
+    }
+
+    /// `Entity.applyMovementEmissionAndPlaySound`: a step sounds each block walked (or
+    /// climbed), from the block stood on, or a stroke in water.
+    fn movement_sounds(&mut self, moved: DVec3, c: &collide::Collider<impl World>) {
+        let effect_pos = self.on_pos(0.2f32 as f64, c);
+        let supporting_pos = self.on_pos(1.0e-5f32 as f64, c);
+        let state_at = |[x, y, z]: [i32; 3]| c.world.state(x, y, z);
+        let supporting = state_at(supporting_pos);
+        let climbing = c.blocks.climbable[supporting as usize];
+        let horizontal = (moved.x * moved.x + moved.z * moved.z).sqrt();
+        self.move_dist += if climbing {
+            (moved.length() * 0.6f32 as f64) as f32
+        } else {
+            (horizontal * 0.6f32 as f64) as f32
+        };
+        if self.move_dist <= self.next_step || c.blocks.is_air(supporting) {
+            return;
+        }
+        let only_effect = supporting_pos == effect_pos;
+        let mut produced = self.step_from_block(effect_pos, true, moved, c);
+        if !only_effect {
+            produced |= self.step_from_block(supporting_pos, false, moved, c);
+        }
+        if produced {
+            self.next_step = self.move_dist.trunc() + 1.0;
+        } else if self.in_water {
+            self.next_step = self.move_dist.trunc() + 1.0;
+            self.water_swim_sound();
+        }
+    }
+
+    /// `Entity.vibrationAndSoundEffectsFromBlock`: whether the block makes a step, with its
+    /// sound when `sound`.
+    fn step_from_block(
+        &mut self,
+        pos: [i32; 3],
+        sound: bool,
+        moved: DVec3,
+        c: &collide::Collider<impl World>,
+    ) -> bool {
+        let state = c.world.state(pos[0], pos[1], pos[2]);
+        if c.blocks.is_air(state) {
+            return false;
+        }
+        let climbable = c.blocks.climbable[state as usize];
+        let crouching = self.pose == Pose::Crouching;
+        if !((self.on_ground || climbable || crouching && moved.y == 0.0) && !self.swimming) {
+            return false;
+        }
+        if sound {
+            self.step_sound(pos, state, c);
+        }
+        true
+    }
+
+    /// `Player.playStepSound`: in water a stroke and the block muffled; otherwise a carpet,
+    /// snow layer or the like on the block sounds instead of it, or with it.
+    fn step_sound(&mut self, pos: [i32; 3], state: u32, c: &collide::Collider<impl World>) {
+        let b = c.blocks;
+        if self.in_water {
+            self.water_swim_sound();
+            self.muffled_step(state, b);
+            return;
+        }
+        let above = [pos[0], pos[1] + 1, pos[2]];
+        let above_state = c.world.state(above[0], above[1], above[2]);
+        if b.inside_step_sound(above_state) || b.combination_step_sound(above_state) {
+            let t = b.sound_type(above_state).clone();
+            self.play(&t.step, t.volume * 0.15, t.pitch);
+            if b.combination_step_sound(above_state) {
+                self.muffled_step(state, b);
+            }
+        } else {
+            let t = b.sound_type(state).clone();
+            self.play(&t.step, t.volume * 0.15, t.pitch);
+        }
+    }
+
+    /// `Entity.playMuffledStepSound`.
+    fn muffled_step(&mut self, state: u32, b: &BlockPhysics) {
+        let t = b.sound_type(state).clone();
+        self.play(&t.step, t.volume * 0.05, t.pitch * 0.8);
+    }
+
+    /// `Entity.waterSwimSound`: louder the faster it moves.
+    fn water_swim_sound(&mut self) {
+        let v = self.velocity;
+        let speed = ((v.x * v.x * 0.2 + v.y * v.y + v.z * v.z * 0.2).sqrt() as f32 * 0.35).min(1.0);
+        self.sounds.push(MoveSound::Swim(speed));
     }
 
     /// `Player.maybeBackOffFromEdge`: sneaking stops short of an edge you'd fall off.

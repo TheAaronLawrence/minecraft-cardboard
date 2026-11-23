@@ -167,7 +167,8 @@ impl GuiMesh {
             let mut x = 4;
             for span in &line.spans {
                 let rgb = span.rgb.map(|c| c as f32 / 255.0);
-                self.styled(art, span, x as f32, (entry_bottom - 8) as f32, rgb, alpha);
+                let y = (entry_bottom - 8) as f32;
+                self.styled(art, span, x as f32, y, TEXT, rgb, alpha);
                 x += span
                     .text
                     .chars()
@@ -214,10 +215,20 @@ impl GuiMesh {
     }
 
     /// A span with its shadow, faded to `alpha`: bold draws it twice, a pixel apart, and
-    /// italic slants it (`BakedGlyph`).
-    fn styled(&mut self, art: &HudArt, span: &Span, x: f32, y: f32, rgb: [f32; 3], alpha: f32) {
+    /// italic slants it (`BakedGlyph`). At depth `z`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn styled(
+        &mut self,
+        art: &HudArt,
+        span: &Span,
+        x: f32,
+        y: f32,
+        z: f32,
+        rgb: [f32; 3],
+        alpha: f32,
+    ) {
         let shadow = rgb.map(|c| c * 0.25);
-        for (dx, rgb, z) in [(1.0, shadow, TEXT), (0.0, rgb, TEXT + 0.5)] {
+        for (dx, rgb, z) in [(1.0, shadow, z), (0.0, rgb, z + 0.5)] {
             let mut pen = x + dx;
             for c in span.text.chars() {
                 let Some(&(cell, a)) = art.glyphs.get(&c) else {

@@ -58,6 +58,9 @@ pub struct Streamer {
     eye: Sender<Vec3>,
     updates: Receiver<Update>,
     last: (i32, i32),
+    last_eye: Vec3,
+    /// The render distance in chunks, which the thread reads as it goes.
+    distance: Arc<std::sync::atomic::AtomicI32>,
 }
 
 /// The chunk a position is in.
@@ -81,21 +84,34 @@ impl Streamer {
     /// Starts streaming the chunks within `distance` chunks of `eye` (vanilla's render
     /// distance, measured square).
     pub fn spawn(sources: Sources, distance: i32, eye: Vec3) -> Self {
+        let distance = Arc::new(std::sync::atomic::AtomicI32::new(distance));
+        let shared = distance.clone();
         let (eye_tx, eye_rx) = std::sync::mpsc::channel();
         let (update_tx, updates) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("chunk streaming".into())
-            .spawn(move || work(sources, distance, eye, &eye_rx, &update_tx))
+            .spawn(move || work(sources, &distance, eye, &eye_rx, &update_tx))
             .expect("spawning the chunk streaming thread");
         Self {
             eye: eye_tx,
             updates,
             last: chunk_of(eye),
+            last_eye: eye,
+            distance: shared,
         }
+    }
+
+    /// The Render Distance option changed: chunks load and go for the new distance.
+    pub fn set_distance(&mut self, distance: i32) {
+        self.distance
+            .store(distance, std::sync::atomic::Ordering::Relaxed);
+        // Wakes the thread, which waits for the camera to move on a save.
+        let _ = self.eye.send(self.last_eye);
     }
 
     /// Tells the thread where the camera is, when it has moved into another chunk.
     pub fn follow(&mut self, eye: Vec3) {
+        self.last_eye = eye;
         let chunk = chunk_of(eye);
         if chunk != self.last {
             self.last = chunk;
@@ -111,7 +127,7 @@ impl Streamer {
 
 fn work(
     sources: Sources,
-    distance: i32,
+    distance: &std::sync::atomic::AtomicI32,
     mut eye: Vec3,
     eye_rx: &Receiver<Vec3>,
     tx: &Sender<Update>,
@@ -165,6 +181,7 @@ fn work(
                 Err(TryRecvError::Disconnected) => return,
             }
         }
+        let distance = distance.load(std::sync::atomic::Ordering::Relaxed);
         let center = chunk_of(eye);
         let ring = |(x, z): (i32, i32)| (x - center.0).abs().max((z - center.1).abs());
         let square = |(x, z): (i32, i32)| (x - center.0).pow(2) + (z - center.1).pow(2);

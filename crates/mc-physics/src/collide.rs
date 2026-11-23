@@ -113,6 +113,37 @@ impl<W: World + ?Sized> Collider<'_, W> {
         out
     }
 
+    /// `CollisionGetter.findSupportingBlock`: of the blocks whose collision overlaps `area`,
+    /// the one whose centre is nearest `feet`; on a tie, the greater by `Vec3i.compareTo`
+    /// (y, then z, then x).
+    pub fn supporting_block(&self, area: &Aabb, feet: DVec3) -> Option<[i32; 3]> {
+        let lo = (area.min - DVec3::splat(EPS)).floor().as_ivec3() - 1;
+        let hi = (area.max + DVec3::splat(EPS)).floor().as_ivec3() + 1;
+        let mut best: Option<([i32; 3], f64)> = None;
+        for x in lo.x..=hi.x {
+            for z in lo.z..=hi.z {
+                if !self.world.loaded(x, z) {
+                    continue;
+                }
+                for y in lo.y..=hi.y {
+                    let origin = DVec3::new(x as f64, y as f64, z as f64);
+                    let shape = self.blocks.shape(self.world.state(x, y, z));
+                    if !shape.iter().any(|b| b.offset(origin).intersects(area)) {
+                        continue;
+                    }
+                    let d = (origin + 0.5).distance_squared(feet);
+                    let key = |[x, y, z]: [i32; 3]| (y, z, x);
+                    let better =
+                        best.is_none_or(|(p, bd)| d < bd || d == bd && key(p) < key([x, y, z]));
+                    if better {
+                        best = Some(([x, y, z], d));
+                    }
+                }
+            }
+        }
+        best.map(|(p, _)| p)
+    }
+
     pub fn no_collision(&self, area: &Aabb) -> bool {
         self.boxes(area).is_empty()
     }
