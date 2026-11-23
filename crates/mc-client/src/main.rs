@@ -2539,6 +2539,11 @@ impl winit::application::ApplicationHandler for App {
                         if let Some(state) = &mut self.state {
                             let mut hotbar = walker.hotbar();
                             hotbar.chat = self.chat.view(self.view.ticks as i32);
+                            if walker.player_inventory_open()
+                                && mc_render::hud::inventory::shows_effects(state.gui(None).0)
+                            {
+                                hotbar.effects.clear();
+                            }
                             // A screen the server opens frees the mouse, as `Gui.setScreen`
                             // does, and the server closing it takes the mouse back.
                             if walker.inventory_open() && self.captured {
@@ -2582,11 +2587,18 @@ impl winit::application::ApplicationHandler for App {
                                 self.view.hud,
                                 &entities,
                             );
-                            meshes.cutout.extend(mc_render::particle::vertices(
-                                &self.models.atlas,
-                                camera,
-                                &walker.particles(),
-                            ));
+                            let (translucent, cutout): (Vec<_>, Vec<_>) =
+                                walker.particles().into_iter().partition(|p| p.translucent);
+                            for (out, particles) in [
+                                (&mut meshes.cutout, cutout),
+                                (&mut meshes.particles, translucent),
+                            ] {
+                                out.extend(mc_render::particle::vertices(
+                                    &self.models.atlas,
+                                    camera,
+                                    &particles,
+                                ));
+                            }
                             meshes.lightning = walker.lightning();
                             for (pos, state, open, light) in walker.chest_lids() {
                                 if let Some(lid) = self

@@ -860,7 +860,11 @@ impl Inventory {
 
     /// What the screen draws: during a drag over more than one slot, each slot with its
     /// share and the cursor with what's left (`extractSlot`, `recalculateQuickCraftRemaining`).
-    pub fn view(&self, mouse: Option<[f32; 2]>) -> mc_render::hud::inventory::Inventory {
+    pub fn view(
+        &self,
+        mouse: Option<[f32; 2]>,
+        effects: Vec<mc_render::hud::ActiveEffect>,
+    ) -> mc_render::hud::inventory::Inventory {
         let mut slots: Vec<Stack> = (0..self.len()).map(|i| self.get(i).clone()).collect();
         let mut carried = self.carried.clone();
         let mut dragged = Vec::new();
@@ -900,6 +904,7 @@ impl Inventory {
             } else {
                 0.0
             },
+            effects,
         }
     }
 }

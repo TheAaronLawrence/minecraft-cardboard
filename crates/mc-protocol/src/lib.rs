@@ -277,11 +277,13 @@ pub enum Event {
         id: i32,
         values: Vec<(u8, DataValue)>,
     },
-    /// The player gained a mob effect, such as `minecraft:fire_resistance`, or lost it.
-    /// Other entities' effects aren't passed on.
+    /// The player gained a mob effect, such as `minecraft:fire_resistance`, at an
+    /// amplifier (0 for level I) for a duration in ticks (-1 for ever) with these flags
+    /// (1 ambient, 2 visible particles, 4 a HUD icon), or lost it (`None`). Other
+    /// entities' effects aren't passed on.
     Effect {
         effect: String,
-        active: bool,
+        update: Option<(i32, i32, u8)>,
     },
     /// A sound to play at a place (`ClientboundSoundPacket`), or following an entity when
     /// `entity` is set (`ClientboundSoundEntityPacket`): the sound event, its `SoundSource`
@@ -341,6 +343,9 @@ pub enum DataValue {
     Item(Option<(String, i32)>),
     /// A cow, pig or chicken variant, by name, such as `minecraft:warm`.
     Variant(String),
+    /// A living entity's effect particles (`DATA_EFFECT_PARTICLES`): the ARGB colour of
+    /// each potion swirl (`entity_effect`) among them.
+    Effects(Vec<u32>),
 }
 
 /// An item an entity holds or wears: its name, and its `dyed_color` if it has one.
@@ -1032,11 +1037,16 @@ fn play(
             // entity, then the effect's id; the amplifier, duration and flags follow an update.
             name @ ("update_mob_effect" | "remove_mob_effect") => {
                 let (id, effect) = (r.varint()?, r.count()? as u32);
+                let update = if name == "update_mob_effect" {
+                    Some((r.varint()?, r.varint()?, r.u8()?))
+                } else {
+                    None
+                };
                 match registry.mob_effect(effect) {
                     Some(effect) if id == own_id => tx
                         .send(Event::Effect {
                             effect: effect.to_owned(),
-                            active: name == "update_mob_effect",
+                            update,
                         })
                         .is_ok(),
                     _ => true,
@@ -1613,8 +1623,28 @@ fn entity_data(r: &mut Reader, registry: &Registry, config: &Config) -> Vec<(u8,
                     continue;
                 }
                 14 | 15 => DataValue::Int(r.varint()?),
-                // An empty particle list, as most entities have.
-                17 if r.count()? == 0 => continue,
+                // A particle list: potion swirls carry a colour; the other particles mob
+                // effects show carry nothing.
+                17 => {
+                    let mut colors = Vec::new();
+                    for _ in 0..r.count()? {
+                        match registry.particle_type(r.varint()? as u32) {
+                            Some("minecraft:entity_effect") => {
+                                colors.push(u32::from_be_bytes(r.take(4)?.try_into()?))
+                            }
+                            Some(
+                                "minecraft:infested"
+                                | "minecraft:item_slime"
+                                | "minecraft:item_cobweb"
+                                | "minecraft:small_gust"
+                                | "minecraft:raid_omen"
+                                | "minecraft:trial_omen",
+                            ) => {}
+                            other => bail!("can't read particle {other:?}"),
+                        }
+                    }
+                    DataValue::Effects(colors)
+                }
                 // A villager's type, profession and level.
                 18 => {
                     for _ in 0..3 {

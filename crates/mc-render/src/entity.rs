@@ -19,7 +19,10 @@ use std::f32::consts::PI;
 
 /// The textures these models use, so the atlas loads them. Players' default skins are
 /// loaded with the player heads' (`entity_model::sprites`).
-pub const SPRITES: [&str; 17] = [
+pub const SPRITES: [&str; 20] = [
+    ARROW[0],
+    ARROW[1],
+    ARROW[2],
     ZOMBIE,
     SPIDER_EYES,
     SHEEP_UNDERCOAT,
@@ -52,6 +55,13 @@ pub(crate) fn skin_slots() -> impl Iterator<Item = (String, image::RgbaImage)> {
     (0..SKIN_SLOTS).map(|i| (skin_slot(i), image::RgbaImage::new(64, 64)))
 }
 
+/// `TippableArrowRenderer`'s and `SpectralArrowRenderer`'s textures: plain, tipped and
+/// spectral.
+pub const ARROW: [&str; 3] = [
+    "minecraft:entity/projectiles/arrow",
+    "minecraft:entity/projectiles/arrow_tipped",
+    "minecraft:entity/projectiles/arrow_spectral",
+];
 pub const ZOMBIE: &str = "minecraft:entity/zombie/zombie";
 pub const SKELETON: &str = "minecraft:entity/skeleton/skeleton";
 pub const CREEPER: &str = "minecraft:entity/creeper/creeper";
@@ -284,6 +294,32 @@ pub struct Dropped {
 pub enum Entity {
     Living(Living),
     Item(Dropped),
+    Arrow(Arrow),
+    Thrown(Thrown),
+}
+
+/// An arrow (`ArrowRenderState`), already interpolated to the frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arrow {
+    pub pos: Vec3,
+    /// `yRot` and `xRot` as arrows keep them: the way it flies, `atan2(x, z)`, and how
+    /// steeply it climbs, in degrees.
+    pub yaw: f32,
+    pub pitch: f32,
+    /// `shakeTime - partialTicks`: it quivers for 7 ticks after it sticks.
+    pub shake: f32,
+    /// One of [`ARROW`].
+    pub texture: &'static str,
+}
+
+/// A thrown item, such as a snowball or ender pearl (`ThrownItemRenderState`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Thrown {
+    /// The item it shows, such as `minecraft:snowball`.
+    pub item: String,
+    pub pos: Vec3,
+    /// Ticks since it was added; it's hidden for two while it's near the camera.
+    pub age: u32,
 }
 
 /// An entity and the sky and block light (0 to 15) where it is.
@@ -305,6 +341,9 @@ pub struct Meshes {
     /// Lightning bolts (from `weather::lightning`), added to what's behind them
     /// (`RenderPipelines.LIGHTNING`).
     pub lightning: Vec<Vertex>,
+    /// Translucent particles such as potion swirls (`TRANSLUCENT_PARTICLE`), blended over
+    /// the world without writing depth.
+    pub particles: Vec<Vertex>,
 }
 
 /// Quads for these entities as seen from `camera`, with their name tags unless the HUD is
@@ -346,6 +385,21 @@ pub fn vertices(
                 }
                 if let Some(size) = l.burning {
                     flames(fire, l.pos, size, camera.yaw, *light, &mut out.cutout);
+                }
+            }
+            Entity::Arrow(a) => arrow(atlas, a, camera, *light, &mut out.cutout),
+            // `ThrowableProjectile.shouldRenderAtSqrDistance`: not in the thrower's face as
+            // it leaves their hand.
+            Entity::Thrown(t) if t.age < 2 && t.pos.distance_squared(camera.eye) < 12.25 => {}
+            Entity::Thrown(t) => {
+                if let Some(icon) = art.items.get(&t.item) {
+                    // `ThrownItemRenderer.submit`: turned to face the camera, then placed as
+                    // an item on the ground is.
+                    let m = Mat4::from_quat(camera.rotation()) * ground_transform(icon);
+                    for (corners, uv, tint) in item_quads(atlas, icon) {
+                        let pos = corners.map(|c| m.transform_point3(c));
+                        emit_quad(pos, uv, t.pos, tint, *light, &mut out.cutout);
+                    }
                 }
             }
             Entity::Item(d) => {
@@ -1571,8 +1625,9 @@ fn item_quads(atlas: &Atlas, icon: &ItemIcon) -> Vec<ItemQuad> {
     quads
 }
 
-fn dropped(atlas: &Atlas, icon: &ItemIcon, d: &Dropped, light: [u8; 2], out: &mut Vec<Vertex>) {
-    let quads = item_quads(atlas, icon);
+/// The item's `ground` transform (`ItemTransform.apply`), then the model centred: a flat
+/// item's is `item/generated`'s.
+fn ground_transform(icon: &ItemIcon) -> Mat4 {
     let (translation, rotation, scale) = match icon {
         ItemIcon::Flat { .. } => (Vec3::new(0.0, 2.0, 0.0), Quat::IDENTITY, Vec3::splat(0.5)),
         ItemIcon::Model { ground, .. } => {
@@ -1584,11 +1639,79 @@ fn dropped(atlas: &Atlas, icon: &ItemIcon, d: &Dropped, light: [u8; 2], out: &mu
             )
         }
     };
-    // `ItemTransform.apply`, then the model centred.
-    let transform = Mat4::from_translation(translation / 16.0)
+    Mat4::from_translation(translation / 16.0)
         * Mat4::from_quat(rotation)
         * Mat4::from_scale(scale)
-        * Mat4::from_translation(Vec3::splat(-0.5));
+        * Mat4::from_translation(Vec3::splat(-0.5))
+}
+
+/// `ArrowRenderer.submit`: `ArrowModel` turned to fly along `yaw` and climb at `pitch`,
+/// quivering about its tip's axis as it sticks (`setupAnim`). Its planes are drawn only
+/// from the side facing the camera (`RenderTypes.entityCutoutCull`).
+fn arrow(
+    atlas: &Atlas,
+    a: &Arrow,
+    camera: &crate::gpu::Camera,
+    light: [u8; 2],
+    out: &mut Vec<Vertex>,
+) {
+    // `ArrowModel.createBodyLayer`: two crossed planes 16 pixels long and the fletching's
+    // square at the back, the whole mesh scaled by 0.9 (`mesh.transformed`); the planes'
+    // texture is 0.8 as tall (`addBox`'s texture scale).
+    const BACK: &[Cube] = &[cube([0.0, -2.5, -2.5], [0.0, 5.0, 5.0], [0.0, 0.0])];
+    const CROSS: &[Cube] = &[cube([-12.0, -2.0, 0.0], [16.0, 4.0, 0.0], [0.0, 0.0])];
+    let shake = if a.shake > 0.0 {
+        -(a.shake * 3.0).sin() * a.shake
+    } else {
+        0.0
+    };
+    let root = Mat4::from_rotation_y((a.yaw - 90.0).to_radians())
+        * Mat4::from_rotation_z(a.pitch.to_radians())
+        * Mat4::from_rotation_z(shake.to_radians())
+        * Mat4::from_scale(Vec3::splat(0.9));
+    let sprite = atlas.sprite(a.texture);
+    let node = |cubes| Node {
+        parent: None,
+        pose: [0.0; 6],
+        cubes,
+    };
+    let mut back = Builder {
+        quads: Vec::new(),
+        sprite,
+        tex_size: [32.0, 32.0],
+        tint: -1,
+    };
+    back.nodes(
+        root * Mat4::from_translation(Vec3::new(-11.0 / 16.0, 0.0, 0.0))
+            * Mat4::from_rotation_x(PI / 4.0)
+            * Mat4::from_scale(Vec3::splat(0.8)),
+        &[node(BACK)],
+    );
+    let mut cross = Builder {
+        quads: Vec::new(),
+        sprite,
+        tex_size: [32.0, 32.0 * 0.8],
+        tint: -1,
+    };
+    for turn in [PI / 4.0, PI * 3.0 / 4.0] {
+        cross.nodes(root * Mat4::from_rotation_x(turn), &[node(CROSS)]);
+    }
+    let to_camera = camera.eye - a.pos;
+    let facing: Vec<Quad> = back
+        .quads
+        .into_iter()
+        .chain(cross.quads)
+        .filter(|q| {
+            let normal = (q.pos[1] - q.pos[0]).cross(q.pos[2] - q.pos[0]);
+            normal.dot(to_camera - q.pos[0]) > 0.0
+        })
+        .collect();
+    emit(&facing, a.pos, [1.0; 3], light, out);
+}
+
+fn dropped(atlas: &Atlas, icon: &ItemIcon, d: &Dropped, light: [u8; 2], out: &mut Vec<Vertex>) {
+    let quads = item_quads(atlas, icon);
+    let transform = ground_transform(icon);
     let min_y = quads
         .iter()
         .flat_map(|(corners, _, _)| corners.iter().map(|&c| transform.transform_point3(c).y))

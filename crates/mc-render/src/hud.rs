@@ -27,6 +27,8 @@ use std::sync::Arc;
 const HOTBAR: &str = "minecraft:gui/sprites/hud/hotbar";
 const SELECTION: &str = "minecraft:gui/sprites/hud/hotbar_selection";
 const FONT: &str = "minecraft:font/ascii";
+/// The default font's sheet of other European letters and symbols, 16 cells across.
+const FONT_EXTRA: &str = "minecraft:font/nonlatin_european";
 const XP_BACKGROUND: &str = "hud/experience_bar_background";
 const XP_PROGRESS: &str = "hud/experience_bar_progress";
 const FOOD: [&str; 3] = ["hud/food_empty", "hud/food_half", "hud/food_full"];
@@ -60,6 +62,106 @@ fn heart(container: bool, hardcore: bool, half: bool, blink: bool) -> String {
     }
 }
 
+/// `MobEffects`: each effect, whether it's beneficial (`MobEffectCategory.BENEFICIAL`;
+/// neutral ones count as harmful), and its colour, which orders their icons.
+pub const EFFECTS: [(&str, bool, u32); 40] = [
+    ("speed", true, 0x33EBFF),
+    ("slowness", false, 0x8BAFE0),
+    ("haste", true, 0xD9C043),
+    ("mining_fatigue", false, 0x4A4217),
+    ("strength", true, 0xFFC700),
+    ("instant_health", true, 0xF82423),
+    ("instant_damage", false, 0xA9656A),
+    ("jump_boost", true, 0xFDFF84),
+    ("nausea", false, 0x551D4A),
+    ("regeneration", true, 0xCD5CAB),
+    ("resistance", true, 0x9146F0),
+    ("fire_resistance", true, 0xFF9900),
+    ("water_breathing", true, 0x98DAC0),
+    ("invisibility", true, 0xF6F6F6),
+    ("blindness", false, 0x1F1F23),
+    ("night_vision", true, 0xC2FF66),
+    ("hunger", false, 0x587653),
+    ("weakness", false, 0x484D48),
+    ("poison", false, 0x87A363),
+    ("wither", false, 0x736156),
+    ("health_boost", true, 0xF87D23),
+    ("absorption", true, 0x2552A5),
+    ("saturation", true, 0xF82423),
+    ("glowing", false, 0x94A061),
+    ("levitation", false, 0xCEFFFF),
+    ("luck", true, 0x59C106),
+    ("unluck", false, 0xC0A44D),
+    ("slow_falling", true, 0xF3CFB9),
+    ("conduit_power", true, 0x1DC2D1),
+    ("dolphins_grace", true, 0x88A3BE),
+    ("bad_omen", false, 0x0B6138),
+    ("hero_of_the_village", true, 0x44FF44),
+    ("darkness", false, 0x292721),
+    ("trial_omen", false, 0x16A6A6),
+    ("raid_omen", false, 0xDE4058),
+    ("wind_charged", false, 0xBDC9FF),
+    ("weaving", false, 0x78695A),
+    ("oozing", false, 0x99FFA3),
+    ("infested", false, 0x8C9B8C),
+    ("breath_of_the_nautilus", true, 0x00FFEE),
+];
+
+/// `Hud.EFFECT_BACKGROUND_SPRITE` and `EFFECT_BACKGROUND_AMBIENT_SPRITE`.
+const EFFECT_BACKGROUND: [&str; 2] = ["hud/effect_background", "hud/effect_background_ambient"];
+
+/// One of the player's effects: the effect, such as `minecraft:speed`; its amplifier
+/// (0 for level I); its duration left in ticks, -1 for ever; whether it's ambient, as a
+/// beacon's is; and whether the HUD shows its icon (`MobEffectInstance.showIcon`).
+#[derive(Clone, PartialEq, Debug)]
+pub struct ActiveEffect {
+    pub effect: String,
+    pub amplifier: i32,
+    pub duration: i32,
+    pub ambient: bool,
+    pub icon: bool,
+}
+
+impl ActiveEffect {
+    /// Its `MobEffects` entry: whether it's beneficial, and its colour.
+    fn kind(&self) -> (bool, u32) {
+        let name = self
+            .effect
+            .strip_prefix("minecraft:")
+            .unwrap_or(&self.effect);
+        EFFECTS
+            .iter()
+            .find(|e| e.0 == name)
+            .map_or((false, 0), |&(_, beneficial, color)| (beneficial, color))
+    }
+
+    /// Its sprite's name, as `Hud.getMobEffectSprite` makes it.
+    fn sprite(&self) -> String {
+        let name = self
+            .effect
+            .strip_prefix("minecraft:")
+            .unwrap_or(&self.effect);
+        format!("mob_effect/{name}")
+    }
+
+    /// `MobEffectInstance.compareTo`: unless both are ambient or both last more than
+    /// 32147 ticks, non-ambient first, then finite, then shortest, then by colour;
+    /// otherwise non-ambient first, then by colour.
+    fn order(&self, other: &Self) -> std::cmp::Ordering {
+        let (a, b) = (self, other);
+        let colors = a.kind().1.cmp(&b.kind().1);
+        if (a.duration <= 32147 || b.duration <= 32147) && !(a.ambient && b.ambient) {
+            a.ambient
+                .cmp(&b.ambient)
+                .then((a.duration == -1).cmp(&(b.duration == -1)))
+                .then(a.duration.cmp(&b.duration))
+                .then(colors)
+        } else {
+            a.ambient.cmp(&b.ambient).then(colors)
+        }
+    }
+}
+
 /// `AbstractButton.SPRITES`: enabled, disabled and highlighted.
 const BUTTON: [&str; 3] = [
     "widget/button",
@@ -84,7 +186,9 @@ fn named_sprites() -> Vec<String> {
         .chain(pause::ICONS)
         .chain(options::SPRITES)
         .chain(inventory::SPRITES)
+        .chain(EFFECT_BACKGROUND)
         .map(str::to_owned)
+        .chain(EFFECTS.iter().map(|e| format!("mob_effect/{}", e.0)))
         .collect();
     for i in 0..16 {
         let bit = |b: u32| i & 1 << b != 0;
@@ -95,8 +199,14 @@ fn named_sprites() -> Vec<String> {
     names
 }
 
+/// A GUI sprite's texture: `atlases/gui.json` takes `mob_effect/` sprites from
+/// `textures/mob_effect` and the rest from `textures/gui/sprites`.
 fn gui_sprite(name: &str) -> String {
-    format!("minecraft:gui/sprites/{name}")
+    if name.starts_with("mob_effect/") {
+        format!("minecraft:{name}")
+    } else {
+        format!("minecraft:gui/sprites/{name}")
+    }
 }
 
 /// Depths in GUI pixels toward the viewer: sprites behind the items, which sit around 0,
@@ -110,7 +220,7 @@ fn crack_sprite(stage: u8) -> String {
 
 /// The HUD's sprites, for the atlas.
 pub(crate) fn sprites() -> Vec<String> {
-    [HOTBAR, SELECTION, FONT]
+    [HOTBAR, SELECTION, FONT, FONT_EXTRA]
         .map(str::to_owned)
         .into_iter()
         .chain((0..10).map(crack_sprite))
@@ -131,8 +241,10 @@ pub struct HudArt {
     hotbar: [f32; 4],
     selection: [f32; 4],
     font: [f32; 4],
-    /// Each character's cell in `font/ascii.png` (16 × 16 cells of 8 × 8) and advance.
-    glyphs: HashMap<char, (u8, u8)>,
+    font_extra: [f32; 4],
+    /// Each character's cell and advance: cells below 256 are in `font/ascii.png` (16 ×
+    /// 16 cells of 8 × 8), the rest in `font/nonlatin_european.png` from 256.
+    glyphs: HashMap<char, (u16, u8)>,
     cracks: [[f32; 4]; 10],
     /// The GUI sprites drawn by name, by vanilla's name for them, and the menus' textures
     /// by their full ids.
@@ -147,9 +259,12 @@ pub struct HudArt {
 
 impl HudArt {
     /// A font cell's rect in the atlas.
-    fn glyph_rect(&self, cell: u8) -> [f32; 4] {
-        let [u0, v0, u1, v1] = self.font;
-        let (du, dv) = ((u1 - u0) / 16.0, (v1 - v0) / 16.0);
+    fn glyph_rect(&self, cell: u16) -> [f32; 4] {
+        let ([u0, v0, u1, v1], rows, cell) = match cell.checked_sub(256) {
+            None => (self.font, 16.0, cell),
+            Some(cell) => (self.font_extra, NONLATIN_ROWS as f32, cell),
+        };
+        let (du, dv) = ((u1 - u0) / 16.0, (v1 - v0) / rows);
         let (col, row) = ((cell % 16) as f32, (cell / 16) as f32);
         [
             u0 + du * col,
@@ -204,6 +319,7 @@ impl HudArt {
             hotbar: atlas.sprite(HOTBAR).rect,
             selection: atlas.sprite(SELECTION).rect,
             font: atlas.sprite(FONT).rect,
+            font_extra: atlas.sprite(FONT_EXTRA).rect,
             glyphs: glyphs(res)?,
             cracks: std::array::from_fn(|i| atlas.sprite(&crack_sprite(i as u8)).rect),
             named: named_sprites()
@@ -274,6 +390,8 @@ fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
                 "soundCategory.",
                 "controls.",
                 "key.",
+                "effect.",
+                "enchantment.level.",
             ]
             .iter()
             .any(|p| k.starts_with(p))
@@ -282,38 +400,45 @@ fn gui_lang(res: &mc_assets::Resources) -> Result<HashMap<String, String>> {
         .collect())
 }
 
-/// The default font's `ascii.png` glyphs: which character each cell holds, from the font's
-/// provider list, and its advance, `BitmapProvider`'s width of its rightmost non-clear column
-/// plus one.
-fn glyphs(res: &mc_assets::Resources) -> Result<HashMap<char, (u8, u8)>> {
+/// Rows of cells in `font/nonlatin_european.png`.
+const NONLATIN_ROWS: u16 = 67;
+
+/// The default font's glyphs from `ascii.png`, then from `nonlatin_european.png` for
+/// what that lacks, such as `∞`: which character each cell holds, from the font's provider
+/// list, and its advance, `BitmapProvider`'s width of its rightmost non-clear column plus
+/// one.
+fn glyphs(res: &mc_assets::Resources) -> Result<HashMap<char, (u16, u8)>> {
     let path = res.asset_path("font", "minecraft:include/default", "json");
     let json: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&path).with_context(|| format!("{}", path.display()))?,
     )?;
-    let provider = json["providers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|p| p["file"].as_str() == Some("minecraft:font/ascii.png"))
-        .context("the default font has no ascii.png")?;
-    let image = image::open(res.asset_path("textures", FONT, "png"))?.to_rgba8();
     let mut glyphs = HashMap::new();
-    for (row, chars) in provider["chars"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        for (col, c) in chars.as_str().unwrap_or_default().chars().enumerate() {
-            if c == '\0' {
-                continue;
+    for (sheet, first) in [(FONT, 0), (FONT_EXTRA, 256)] {
+        let file = format!("{sheet}.png");
+        let provider = json["providers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|p| p["file"].as_str() == Some(file.as_str()))
+            .with_context(|| format!("the default font has no {file}"))?;
+        let image = image::open(res.asset_path("textures", sheet, "png"))?.to_rgba8();
+        for (row, chars) in provider["chars"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (col, c) in chars.as_str().unwrap_or_default().chars().enumerate() {
+                if c == '\0' || glyphs.contains_key(&c) {
+                    continue;
+                }
+                let (x0, y0) = (col as u32 * 8, row as u32 * 8);
+                let width = (0..8)
+                    .rev()
+                    .find(|&x| (0..8).any(|y| image.get_pixel(x0 + x, y0 + y)[3] != 0))
+                    .map_or(0, |x| x + 1);
+                glyphs.insert(c, (first + (row * 16 + col) as u16, width as u8 + 1));
             }
-            let (x0, y0) = (col as u32 * 8, row as u32 * 8);
-            let width = (0..8)
-                .rev()
-                .find(|&x| (0..8).any(|y| image.get_pixel(x0 + x, y0 + y)[3] != 0))
-                .map_or(0, |x| x + 1);
-            glyphs.insert(c, ((row * 16 + col) as u8, width as u8 + 1));
         }
     }
     // The space provider's.
@@ -334,6 +459,8 @@ pub struct Hotbar {
     pub death: Option<DeathScreen>,
     pub chat: chat::Chat,
     pub attack_indicator: Option<AttackIndicator>,
+    /// The player's effects, unless the open screen lists them itself.
+    pub effects: Vec<ActiveEffect>,
 }
 
 /// The attack indicator under the crosshair (`AttackIndicatorStatus.CROSSHAIR`), or beside
@@ -770,6 +897,7 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
     if let Some(vitals) = &hotbar.vitals {
         mesh.vitals(art, vitals, width as i32, height as i32);
     }
+    mesh.effects(art, &hotbar.effects, width as i32);
     mesh.chat(art, &hotbar.chat, width as i32, height as i32);
     if let Some(death) = &hotbar.death {
         mesh.death_screen(art, death, width as i32, height as i32);
@@ -778,6 +906,42 @@ pub fn hotbar(art: &HudArt, hotbar: &Hotbar, width: u32, height: u32) -> GuiMesh
 }
 
 impl GuiMesh {
+    /// `Hud.extractEffects`: in the top right corner, beneficial effects in a row and the
+    /// rest in a row below, each on its background, longest-lasting first from the right.
+    /// One running out (in 10 seconds or less) flickers, faster and fainter toward the end.
+    fn effects(&mut self, art: &HudArt, effects: &[ActiveEffect], width: i32) {
+        let mut sorted: Vec<&ActiveEffect> = effects.iter().filter(|e| e.icon).collect();
+        sorted.sort_by(|a, b| b.order(a));
+        let (mut beneficial, mut harmful) = (0, 0);
+        let mut z = BACK + 3.0;
+        for e in sorted {
+            let (x, y) = if e.kind().0 {
+                beneficial += 1;
+                (width - 25 * beneficial, 1)
+            } else {
+                harmful += 1;
+                (width - 25 * harmful, 27)
+            };
+            let mut alpha = 1.0f32;
+            if !e.ambient && e.duration != -1 && e.duration <= 200 {
+                let used = (10 - e.duration / 20) as f32;
+                let d = e.duration as f32;
+                alpha = (d / 10.0 / 5.0 * 0.5).clamp(0.0, 0.5)
+                    + (d * std::f32::consts::PI / 5.0).cos()
+                        * (used / 10.0 * 0.25).clamp(0.0, 0.25);
+                alpha = alpha.clamp(0.0, 1.0);
+            }
+            let background = EFFECT_BACKGROUND[usize::from(e.ambient)];
+            let (x, y) = (x as f32, y as f32);
+            self.blit(x, y, z, 24.0, 24.0, art.named[background], [1.0; 4]);
+            if let Some(&rect) = art.named.get(&e.sprite()) {
+                let color = [1.0, 1.0, 1.0, alpha];
+                self.blit(x + 3.0, y + 3.0, z + 0.01, 18.0, 18.0, rect, color);
+            }
+            z += 0.02;
+        }
+    }
+
     /// `Hud.extractHearts`, `extractFood` and `extractAirBubbles` (without absorption,
     /// armour or effects),
     /// then `ExperienceBar.extractBackground` and `ContextualBar.extractExperienceLevel`, for

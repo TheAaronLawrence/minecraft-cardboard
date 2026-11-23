@@ -39,13 +39,31 @@ pub fn pick(
     from: DVec3,
     to: DVec3,
 ) -> Option<BlockHit> {
+    clip(from, to, |pos| {
+        blocks.outline(world.state(pos.x, pos.y, pos.z))
+    })
+}
+
+/// `Level.clip` with `ClipContext.Block.COLLIDER` and no fluids, as projectiles move: the
+/// first block whose collision shape the segment from `from` to `to` passes through.
+pub fn clip_collider(
+    world: &(impl World + ?Sized),
+    blocks: &BlockPhysics,
+    from: DVec3,
+    to: DVec3,
+) -> Option<BlockHit> {
+    clip(from, to, |pos| {
+        blocks.shape(world.state(pos.x, pos.y, pos.z))
+    })
+}
+
+/// `BlockGetter.clip`: walks the blocks along the segment, clipping it against each one's
+/// boxes as `shape` gives them.
+fn clip<'a>(from: DVec3, to: DVec3, shape: impl Fn(IVec3) -> &'a [Aabb]) -> Option<BlockHit> {
     if from == to {
         return None;
     }
-    let clip_at = |pos: IVec3| {
-        let shape = blocks.outline(world.state(pos.x, pos.y, pos.z));
-        clip_shape(shape, from, to, pos)
-    };
+    let clip_at = |pos: IVec3| clip_shape(shape(pos), from, to, pos);
     // Both ends pulled a hair inward, so a ray ending exactly on a block edge doesn't visit
     // the block beyond it.
     let end = to.lerp(from, -1.0e-7);

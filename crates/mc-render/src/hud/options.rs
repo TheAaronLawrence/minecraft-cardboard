@@ -1438,7 +1438,7 @@ impl GuiMesh {
 
     /// `GuiGraphicsExtractor.blitNineSlicedSprite` for a sprite `size` big with the same
     /// `border` all round: the corners and edges as they are, the edges and middle tiled.
-    fn nine_slice_tiled(
+    pub(super) fn nine_slice_tiled(
         &mut self,
         art: &HudArt,
         sprite: &str,

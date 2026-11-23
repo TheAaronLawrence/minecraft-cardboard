@@ -33,7 +33,16 @@ const EMPTY_ICONS: [&str; 5] = [
 ];
 
 /// The GUI sprites this screen draws by name.
-pub(crate) const SPRITES: [&str; 11] = [
+/// `EffectsInInventory.EFFECT_BACKGROUND_SPRITE` and `EFFECT_BACKGROUND_AMBIENT_SPRITE`:
+/// 32 × 32, sliced with a 4-pixel border.
+const EFFECT_BACKGROUND: [&str; 2] = [
+    "container/inventory/effect_background",
+    "container/inventory/effect_background_ambient",
+];
+
+pub(crate) const SPRITES: [&str; 13] = [
+    EFFECT_BACKGROUND[0],
+    EFFECT_BACKGROUND[1],
     LIT_PROGRESS,
     BURN_PROGRESS,
     HIGHLIGHT_BACK,
@@ -154,6 +163,16 @@ pub struct Inventory {
     /// A furnace's fuel left (0 to 1) while it burns, and how far its cooking has got.
     pub lit: Option<f32>,
     pub burn: f32,
+    /// The player's effects, which the player's own inventory lists beside it.
+    pub effects: Vec<super::ActiveEffect>,
+}
+
+/// `EffectsInInventory.canSeeEffects`: whether the player's inventory, in a GUI `width`
+/// wide, has room beside it to list the effects, so the HUD leaves them out
+/// (`InventoryScreen.showsActiveEffects`).
+pub fn shows_effects(width: i32) -> bool {
+    let (left, _) = origin(Menu::Player, width, 0);
+    width - (left + IMAGE.0 + 2) >= 32
 }
 
 /// The screen's top left (`AbstractContainerScreen.init`'s `leftPos` and `topPos`).
@@ -338,38 +357,136 @@ impl GuiMesh {
             self.slot_item(art, name, *count, x, y, CARRIED, CARRIED + 20.0);
         }
         // `extractTooltip`: the hovered item's name, with nothing on the cursor.
-        if let (Some(i), None, Some([mx, my])) = (hovered, &inv.carried, inv.mouse)
+        let mut tooltip = None;
+        if let (Some(i), None) = (hovered, &inv.carried)
             && let Some((name, _)) = &inv.slots[i]
             && let Some((key, rarity)) = art.item_names.get(name)
         {
             let text = art.lang.get(key).map_or(key.as_str(), String::as_str);
-            self.tooltip(
-                art,
-                text,
-                rarity_rgb(rarity),
-                mx as i32,
-                my as i32,
-                width,
-                height,
-            );
+            tooltip = Some(vec![(text.to_owned(), rarity_rgb(rarity))]);
+        }
+        if menu == Menu::Player
+            && let Some(lines) = self.effect_list(art, inv, width, height)
+        {
+            tooltip = Some(lines);
+        }
+        if let (Some(lines), Some([mx, my])) = (tooltip, inv.mouse) {
+            self.tooltip(art, &lines, mx as i32, my as i32, width, height);
         }
     }
 
-    /// `GuiGraphicsExtractor.tooltip` for one line of text, placed by
+    /// `EffectsInInventory.extractRenderState`: the player's effects in a column right of
+    /// the inventory, if there's room, each on a background as wide as its name and time
+    /// need (narrow, just the icon, with too little room, or the name cut short), soonest
+    /// to end at the top. Returns the tooltip of the one under the mouse whose name doesn't
+    /// fit.
+    fn effect_list(
+        &mut self,
+        art: &HudArt,
+        inv: &Inventory,
+        width: i32,
+        height: i32,
+    ) -> Option<Vec<(String, [f32; 3])>> {
+        let (left, top) = origin(Menu::Player, width, height);
+        let x0 = left + IMAGE.0 + 2;
+        let available = width - x0;
+        if inv.effects.is_empty() || available < 32 {
+            return None;
+        }
+        let max_width = if available >= 120 { available - 7 } else { 32 };
+        let n = inv.effects.len() as i32;
+        let step = if n > 5 { 132 / (n - 1) } else { 33 };
+        let mut sorted: Vec<&super::ActiveEffect> = inv.effects.iter().collect();
+        sorted.sort_by(|a, b| a.order(b));
+        let lang = |key: &str| art.lang.get(key).map_or(key, String::as_str).to_owned();
+        let width_of = |text: &str| Self::text_width(art, text) as i32;
+        let mut tooltip = None;
+        for (i, e) in sorted.into_iter().enumerate() {
+            let y0 = top + i as i32 * step;
+            // Each a step in front of the one above, which its background covers.
+            let z = DIM + 1.0 + i as f32;
+            // `getEffectName`: levels II to X are spelled out.
+            let mut name = lang(&format!("effect.{}", e.effect.replacen(':', ".", 1)));
+            if (1..=9).contains(&e.amplifier) {
+                name = format!(
+                    "{name} {}",
+                    lang(&format!("enchantment.level.{}", e.amplifier + 1))
+                );
+            }
+            // `MobEffectUtil.formatDuration` and `StringUtil.formatTickDuration`.
+            let duration = if e.duration == -1 {
+                lang("effect.duration.infinite")
+            } else {
+                let s = e.duration / 20;
+                let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+                if h > 0 {
+                    format!("{h:02}:{m:02}:{s:02}")
+                } else {
+                    format!("{m:02}:{s:02}")
+                }
+            };
+            let w = (32 + width_of(&name).max(width_of(&duration)) + 7).min(max_width);
+            let background = EFFECT_BACKGROUND[usize::from(e.ambient)];
+            self.nine_slice_tiled(art, background, [32, 32], 4, [x0, y0, w, 32], z);
+            let (text_x, text_y) = ((x0 + 32) as f32, (y0 + 7) as f32);
+            let room = w - 32 - 7;
+            let compact = if room > 0 {
+                let clip = width_of(&name) > room;
+                let shown = if clip {
+                    // `ComponentRenderUtils.clipText`: as much as fits with "..." after.
+                    let limit = room - width_of("...");
+                    let mut cut = String::new();
+                    for c in name.chars() {
+                        cut.push(c);
+                        if width_of(&cut) > limit {
+                            cut.pop();
+                            break;
+                        }
+                    }
+                    cut + "..."
+                } else {
+                    name.clone()
+                };
+                self.shadowed(art, &shown, text_x, text_y, z + 0.1, 1.0, [1.0; 3]);
+                let grey = [128.0 / 255.0; 3];
+                self.shadowed(art, &duration, text_x, text_y + 9.0, z + 0.1, 1.0, grey);
+                clip
+            } else {
+                true
+            };
+            if compact
+                && let Some([mx, my]) = inv.mouse
+                && (x0..=x0 + w).contains(&(mx as i32))
+                && (y0..=y0 + step).contains(&(my as i32))
+            {
+                tooltip = Some(vec![(name, [1.0; 3]), (duration, [1.0; 3])]);
+            }
+            if let Some(&rect) = art.named.get(&e.sprite()) {
+                let (x, y) = ((x0 + 7) as f32, (y0 + 7) as f32);
+                self.blit(x, y, z + 0.8, 18.0, 18.0, rect, [1.0; 4]);
+            }
+        }
+        tooltip
+    }
+
+    /// `GuiGraphicsExtractor.tooltip` for lines of text, each in its colour, placed by
     /// `DefaultTooltipPositioner` and framed by `TooltipRenderUtil`.
-    #[allow(clippy::too_many_arguments)]
     fn tooltip(
         &mut self,
         art: &HudArt,
-        text: &str,
-        rgb: [f32; 3],
+        lines: &[(String, [f32; 3])],
         mx: i32,
         my: i32,
         width: i32,
         height: i32,
     ) {
-        // One line is 10 high, less the 2 below the last.
-        let (w, h) = (Self::text_width(art, text) as i32, 8);
+        // Each line is 10 high, less the 2 below the last.
+        let w = lines
+            .iter()
+            .map(|(text, _)| Self::text_width(art, text) as i32)
+            .max()
+            .unwrap_or(0);
+        let h = lines.len() as i32 * 10 - 2;
         let (mut x, mut y) = (mx + 12, my - 12);
         if x + w > width {
             x = (x - 24 - w).max(4);
@@ -380,7 +497,10 @@ impl GuiMesh {
         let rect = [x - 12, y - 12, w + 24, h + 24];
         self.nine_slice(art.named[TOOLTIP_BACKGROUND], rect, 9, TOOLTIP);
         self.nine_slice(art.named[TOOLTIP_FRAME], rect, 10, TOOLTIP + 1.0);
-        self.shadowed(art, text, x as f32, y as f32, TOOLTIP + 2.0, 1.0, rgb);
+        for (i, (text, rgb)) in lines.iter().enumerate() {
+            let y = (y + i as i32 * 10) as f32;
+            self.shadowed(art, text, x as f32, y, TOOLTIP + 2.0, 1.0, *rgb);
+        }
     }
 
     /// `blitNineSlicedSprite` for a 100 × 100 sprite with a `border`: corners as they are,

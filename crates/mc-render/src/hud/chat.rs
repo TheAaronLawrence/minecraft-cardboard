@@ -275,6 +275,7 @@ mod tests {
             hotbar: [0.0; 4],
             selection: [0.0; 4],
             font: [0.0; 4],
+            font_extra: [0.0; 4],
             glyphs: super::super::glyphs(&res).unwrap(),
             cracks: [[0.0; 4]; 10],
             named: Default::default(),

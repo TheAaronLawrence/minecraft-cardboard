@@ -230,8 +230,10 @@ pub struct Walker {
     /// Each chunk's biomes by section, for the water fog, and the biomes' attributes.
     biomes: HashMap<(i32, i32), Vec<crate::stream::SectionBiomes>>,
     biome_data: std::sync::Arc<mc_render::tint::Biomes>,
-    /// The mob effects the player has, such as `minecraft:fire_resistance`.
-    effects: std::collections::HashSet<String>,
+    /// The mob effects the player has, such as `minecraft:fire_resistance`: each one's
+    /// amplifier, the ticks it has left (-1 for ever) and its flags (1 ambient, 4 shows an
+    /// icon).
+    effects: HashMap<String, (i32, i32, u8)>,
     blocks: BlockPhysics,
     outbox: mc_protocol::Outbox,
     entity_id: i32,
@@ -313,6 +315,9 @@ pub struct Walker {
     view_bob: crate::hands::ViewBob,
     /// The server says the player is on fire.
     on_fire: bool,
+    /// The player's own effect swirls' colours (data 10), whether its effects are all
+    /// ambient (data 11), and whether it's invisible (shared flag 5).
+    swirls: (Vec<u32>, bool, bool),
     /// The player's air supply in ticks (data 1), which the server counts down under water.
     air: i32,
     /// Items that place a block (`BlockItem`s, named as their block is), and the block's id.
@@ -552,7 +557,7 @@ impl Walker {
                 })
                 .collect(),
             use_animations: crate::hands::use_animations(registry),
-            item_icons,
+            item_icons: item_icons.clone(),
             fov_modifier: [1.0; 2],
             miss_time: 0,
             hit_entity: None,
@@ -560,7 +565,7 @@ impl Walker {
             inventory: crate::inventory::Inventory::new(registry),
             others_mining: HashMap::new(),
             chest_lids: HashMap::new(),
-            entities: crate::entities::Entities::new(registry),
+            entities: crate::entities::Entities::new(registry, item_icons),
             attack_indicator_mode: Default::default(),
             skins: crate::skins::Loader::new(),
             skin_slots: [None; mc_render::entity::SKIN_SLOTS],
@@ -610,6 +615,7 @@ impl Walker {
             hands: Default::default(),
             view_bob: Default::default(),
             on_fire: false,
+            swirls: Default::default(),
             air: 300,
             block_items: (0..registry.item_count())
                 .filter_map(|id| registry.item_name(id))
@@ -1028,7 +1034,14 @@ impl Walker {
         {
             for (index, value) in values {
                 match (index, value) {
-                    (0, mc_protocol::DataValue::Byte(flags)) => self.on_fire = flags & 1 != 0,
+                    (0, mc_protocol::DataValue::Byte(flags)) => {
+                        self.on_fire = flags & 1 != 0;
+                        self.swirls.2 = flags & 0x20 != 0;
+                    }
+                    (10, mc_protocol::DataValue::Effects(colors)) => {
+                        self.swirls.0 = colors.clone();
+                    }
+                    (11, mc_protocol::DataValue::Bool(ambient)) => self.swirls.1 = *ambient,
                     (1, mc_protocol::DataValue::Int(air)) => self.air = *air,
                     // `LocalPlayer.onSyncedDataUpdated`: the server starts or stops it.
                     (8, mc_protocol::DataValue::Byte(flags)) => {
@@ -1129,13 +1142,14 @@ impl Walker {
                 self.using = None;
             }
             mc_protocol::Event::GameMode(mode) => self.game_mode = mode,
-            mc_protocol::Event::Effect { effect, active } => {
-                if active {
-                    self.effects.insert(effect);
-                } else {
+            mc_protocol::Event::Effect { effect, update } => match update {
+                Some(update) => {
+                    self.effects.insert(effect, update);
+                }
+                None => {
                     self.effects.remove(&effect);
                 }
-            }
+            },
             // `LivingEntity.handleDamageEvent`: the player's own hurt sound, as the damage
             // type's `effects` say (`DamageEffects`).
             mc_protocol::Event::Damaged { id, kind } if id == self.entity_id => {
@@ -1555,7 +1569,7 @@ impl Walker {
     }
 
     pub fn inventory_view(&self, mouse: Option<[f32; 2]>) -> mc_render::hud::inventory::Inventory {
-        self.inventory.view(mouse)
+        self.inventory.view(mouse, self.active_effects())
     }
 
     /// `ChatScreen.handleChatInput`: a `/` command, or else a chat message.
@@ -1636,7 +1650,29 @@ impl Walker {
             death: self.death_screen(),
             chat: Default::default(),
             attack_indicator: self.attack_indicator(),
+            effects: self.active_effects(),
         }
+    }
+
+    /// The player's effects, for the HUD and the inventory.
+    fn active_effects(&self) -> Vec<mc_render::hud::ActiveEffect> {
+        self.effects
+            .iter()
+            .map(
+                |(effect, &(amplifier, duration, flags))| mc_render::hud::ActiveEffect {
+                    effect: effect.clone(),
+                    amplifier,
+                    duration,
+                    ambient: flags & 1 != 0,
+                    icon: flags & 4 != 0,
+                },
+            )
+            .collect()
+    }
+
+    /// Whether the player's own inventory is open, rather than a container's.
+    pub fn player_inventory_open(&self) -> bool {
+        self.inventory.is_open() && self.inventory.menu() == mc_render::hud::inventory::Menu::Player
     }
 
     /// `Hud.extractCrosshair`'s attack indicator: full once recharged while aiming at a
@@ -1711,7 +1747,7 @@ impl Walker {
             }
             // Fire resistance sees 5 blocks into lava instead of 1.
             FluidKind::Lava => {
-                let resistant = self.effects.contains("minecraft:fire_resistance");
+                let resistant = self.effects.contains_key("minecraft:fire_resistance");
                 mc_render::gpu::InFluid {
                     fog_color: rgb(0x991A00),
                     fog_start: if resistant { 0.0 } else { 0.25 },
@@ -1908,6 +1944,17 @@ impl Walker {
             if self.entities.tick(&self.collision, &self.blocks) {
                 self.sky.flash = 2;
             }
+            // `MobEffectInstance.tickClient`: the time left counts down until the server
+            // takes the effect away.
+            for (_, duration, _) in self.effects.values_mut() {
+                if *duration > 0 {
+                    *duration -= 1;
+                }
+            }
+            let (colors, ambient, invisible) = &self.swirls;
+            let size = [0.6, self.player.height() as f32];
+            self.entities
+                .own_effects(colors, *invisible, *ambient, self.player.pos, size);
             // `LightningBolt.tick`: heard from anywhere, the impact only nearby.
             for (pos, thunder, impact) in std::mem::take(&mut self.entities.thunder) {
                 for (event, volume, pitch) in [
@@ -2393,10 +2440,7 @@ impl Walker {
         };
         // `ItemStackRenderState.pickParticleMaterial`: a generated model's particle is its
         // first layer.
-        let sprite = match self.item_icons.get(item) {
-            Some(mc_render::item::ItemIcon::Flat { layers, .. }) => layers.first().map(|l| l.0),
-            _ => None,
-        };
+        let sprite = crate::particles::item_sprite(&self.item_icons, item);
         if let Some(rect) = sprite.filter(|_| c.has_consume_particles) {
             let eye = self.player.pos + DVec3::Y * self.player.eye_height();
             let (yaw, pitch) = (self.player.yaw, self.player.pitch);

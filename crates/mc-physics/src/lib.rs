@@ -38,7 +38,7 @@ pub fn collide_box(
 }
 use glam::DVec3;
 use mc_registry::Registry;
-pub use pick::{BlockHit, pick, view_vector};
+pub use pick::{BlockHit, clip_collider, pick, view_vector};
 use std::collections::HashSet;
 
 /// What movement needs to know about the world.
@@ -398,7 +398,8 @@ impl BlockPhysics {
         at(&self.walls_and_gates) || low && at(&self.fences)
     }
 
-    fn shape(&self, state: u32) -> &[Aabb] {
+    /// The block's collision boxes (`BlockState.getCollisionShape`), in block units.
+    pub fn shape(&self, state: u32) -> &[Aabb] {
         self.state_shapes
             .get(state as usize)
             .map_or(&[], |&i| &self.shapes[i as usize])
@@ -728,6 +729,11 @@ impl Player {
 
     pub fn eye_height(&self) -> f64 {
         self.pose.size().1
+    }
+
+    /// Its box's height in its pose.
+    pub fn height(&self) -> f64 {
+        self.pose.size().0
     }
 
     /// Where the server put the player; any motion stops.

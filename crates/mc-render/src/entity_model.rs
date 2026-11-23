@@ -115,6 +115,7 @@ pub fn sprites(res: &Resources) -> Vec<String> {
     out.extend(DEFAULT_SKINS.map(str::to_owned));
     out.extend(crate::entity::SPRITES.map(str::to_owned));
     out.extend(crate::particle::POOF.map(str::to_owned));
+    out.extend(crate::particle::EFFECT.map(str::to_owned));
     out.extend(
         [
             crate::particle::CRIT,

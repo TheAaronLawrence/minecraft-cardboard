@@ -1,6 +1,7 @@
 //! The particles in the world, moved each tick: `Particle.tick` and `move`, for the poofs
 //! of smoke dying mobs leave (`ExplodeParticle`), the sparks and dark hearts of hits
-//! (`CritParticle`), and the crumbs of food being eaten (`BreakingItemParticle`).
+//! (`CritParticle`), the crumbs of food being eaten (`BreakingItemParticle`), and potion
+//! swirls (`SpellParticle`).
 
 use glam::DVec3;
 
@@ -16,6 +17,9 @@ pub enum Kind {
     Damage,
     /// `ParticleTypes.ITEM`: a quarter of an item's sprite, the part in `rect`.
     Item,
+    /// `ParticleTypes.ENTITY_EFFECT` (`SpellParticle`): a potion's swirl, tinted its
+    /// colour, rising.
+    Effect,
 }
 
 /// A particle: where it is now and last tick, its motion, and how far through its life.
@@ -31,6 +35,7 @@ struct Particle {
     lifetime: u32,
     size: f32,
     color: [f32; 3],
+    alpha: f32,
     /// An item particle's part of its sprite, in atlas coordinates.
     rect: Option<[f32; 4]>,
     /// `Particle.gravity`, `friction` and `hasPhysics`.
@@ -54,6 +59,18 @@ impl Default for Particles {
             seed: 0x2545_F491_4F6C_DD1D,
             status: Default::default(),
         }
+    }
+}
+
+/// `ItemStackRenderState.pickParticleMaterial`: the sprite an item's particles are cut
+/// from, a generated model's first layer.
+pub fn item_sprite(
+    icons: &std::collections::HashMap<String, mc_render::item::ItemIcon>,
+    item: &str,
+) -> Option<[f32; 4]> {
+    match icons.get(item)? {
+        mc_render::item::ItemIcon::Flat { layers, .. } => layers.first().map(|l| l.0),
+        _ => None,
     }
 }
 
@@ -130,6 +147,7 @@ impl Particles {
                 size,
                 color: [grey; 3],
                 rect: None,
+                alpha: 1.0,
                 // Smoke rises.
                 gravity: -0.1,
                 friction: 0.9,
@@ -175,6 +193,7 @@ impl Particles {
             size,
             color: [grey; 3],
             rect: None,
+            alpha: 1.0,
             gravity: 0.5,
             friction: 0.7,
             physics: false,
@@ -215,40 +234,126 @@ impl Particles {
             let p = DVec3::new((self.random() as f64 - 0.5) * 0.3, y, 0.6);
             let pos = eye + turn(p);
             // `ClientLevel.addParticle`, which the Particles option limits.
-            if !self.allowed(false, false) {
-                continue;
+            if self.allowed(false, false) {
+                self.item(sprite, pos, d + DVec3::Y * 0.05);
             }
-            // `Particle`, `SingleQuadParticle` and `BreakingItemParticle`'s constructors:
-            // its own motion is none, so it moves as tossed; half the usual size; and a
-            // random quarter of the sprite, flipped across.
-            let lifetime = (4.0 / (self.random() * 0.9 + 0.1)) as u32;
-            let size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 / 2.0;
-            let (uo, vo) = (self.random() * 3.0, self.random() * 3.0);
-            let [u0, v0, u1, v1] = sprite;
-            let u = |f: f32| u0 + (u1 - u0) * f;
-            let v = |f: f32| v0 + (v1 - v0) * f;
-            self.particles.push(Particle {
-                kind: Kind::Item,
-                old: pos,
-                pos,
-                velocity: d + DVec3::Y * 0.05,
-                on_ground: false,
-                stopped: false,
-                age: 0,
-                lifetime,
-                size,
-                color: [1.0; 3],
-                rect: Some([
-                    u((uo + 1.0) / 4.0),
-                    v(vo / 4.0),
-                    u(uo / 4.0),
-                    v((vo + 1.0) / 4.0),
-                ]),
-                gravity: 1.0,
-                friction: 0.98,
-                physics: true,
-            });
         }
+    }
+
+    /// `BreakingItemParticle`: a random quarter of the item sprite `sprite` (atlas
+    /// coordinates), flipped across, half the usual size, at `pos` moving at `velocity`
+    /// (its own motion is none), falling.
+    pub fn item(&mut self, sprite: [f32; 4], pos: DVec3, velocity: DVec3) {
+        let lifetime = (4.0 / (self.random() * 0.9 + 0.1)) as u32;
+        let size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 / 2.0;
+        let (uo, vo) = (self.random() * 3.0, self.random() * 3.0);
+        let [u0, v0, u1, v1] = sprite;
+        let u = |f: f32| u0 + (u1 - u0) * f;
+        let v = |f: f32| v0 + (v1 - v0) * f;
+        self.particles.push(Particle {
+            kind: Kind::Item,
+            old: pos,
+            pos,
+            velocity,
+            on_ground: false,
+            stopped: false,
+            age: 0,
+            lifetime,
+            size,
+            color: [1.0; 3],
+            rect: Some([
+                u((uo + 1.0) / 4.0),
+                v(vo / 4.0),
+                u(uo / 4.0),
+                v((vo + 1.0) / 4.0),
+            ]),
+            alpha: 1.0,
+            gravity: 1.0,
+            friction: 0.98,
+            physics: true,
+        });
+    }
+
+    /// `getRandomX(0.5)`, `getRandomY` and `getRandomZ(0.5)`: somewhere in a `width` ×
+    /// `height` box with its bottom middle at `feet`.
+    pub fn in_box(&mut self, feet: DVec3, [width, height]: [f32; 2]) -> DVec3 {
+        let (x, y, z) = (self.random(), self.random(), self.random());
+        let [width, height] = [width, height].map(f64::from);
+        feet + DVec3::new(
+            (2.0 * x as f64 - 1.0) * width * 0.5,
+            y as f64 * height,
+            (2.0 * z as f64 - 1.0) * width * 0.5,
+        )
+    }
+
+    /// `LivingEntity.tickEffects` on the client: one time in 4 (in 15 if it's invisible,
+    /// five times as rarely if its effects are all ambient, as a beacon's are) a swirl of
+    /// one of its effects' `colors`, somewhere in its box, rising.
+    pub fn mob_effects(
+        &mut self,
+        colors: &[u32],
+        invisible: bool,
+        ambient: bool,
+        feet: DVec3,
+        size: [f32; 2],
+    ) {
+        if colors.is_empty() {
+            return;
+        }
+        let bound = if invisible { 15 } else { 4 } * if ambient { 5 } else { 1 };
+        if (self.random() * bound as f32) as u32 != 0 {
+            return;
+        }
+        let color = colors[(self.random() * colors.len() as f32) as usize % colors.len()];
+        let at = self.in_box(feet, size);
+        if self.allowed(false, false) {
+            self.effect(at, DVec3::ONE, color);
+        }
+    }
+
+    /// `SpellParticle.MobEffectProvider`: a swirl at `pos` tinted `argb`, its motion a
+    /// random sideways drift and `aux`'s height; with no sideways `aux` it barely drifts.
+    pub fn effect(&mut self, pos: DVec3, aux: DVec3, argb: u32) {
+        let xa = 0.5 - self.random() as f64;
+        let za = 0.5 - self.random() as f64;
+        // `Particle`'s constructors: its lifetime (replaced below), then a direction
+        // about the one given at a random speed, a little upward.
+        self.random();
+        let mut d = DVec3::new(
+            xa + ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+            aux.y + ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+            za + ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+        );
+        let speed = ((self.random() + self.random() + 1.0) * 0.15) as f64;
+        d = d / d.length() * speed * f64::from(0.4f32);
+        d.y += f64::from(0.1f32);
+        // `SingleQuadParticle`, then `SpellParticle`: rising slowly, three quarters the
+        // size.
+        let size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 * 0.75;
+        d.y *= f64::from(0.2f32);
+        if aux.x == 0.0 && aux.z == 0.0 {
+            d.x *= f64::from(0.1f32);
+            d.z *= f64::from(0.1f32);
+        }
+        let lifetime = (8.0 / (self.random() as f64 * 0.8 + 0.2)) as u32;
+        let channel = |shift: u32| ((argb >> shift) & 0xff) as f32 / 255.0;
+        self.particles.push(Particle {
+            kind: Kind::Effect,
+            old: pos,
+            pos,
+            velocity: d,
+            on_ground: false,
+            stopped: false,
+            age: 0,
+            lifetime,
+            size,
+            color: [channel(16), channel(8), channel(0)],
+            alpha: channel(24),
+            rect: None,
+            gravity: -0.1,
+            friction: 0.96,
+            physics: false,
+        });
     }
 
     /// `Particle.tick` for each, and gone once it's lived its life.
@@ -264,7 +369,7 @@ impl Particles {
         pt: f32,
         light: impl Fn(DVec3) -> [u8; 2],
     ) -> Vec<mc_render::particle::Particle> {
-        use mc_render::particle::{CRIT, DAMAGE, ENCHANTED_HIT, POOF};
+        use mc_render::particle::{CRIT, DAMAGE, EFFECT, ENCHANTED_HIT, POOF};
         self.particles
             .iter()
             .map(|p| mc_render::particle::Particle {
@@ -277,9 +382,14 @@ impl Particles {
                     Kind::EnchantedHit => ENCHANTED_HIT,
                     Kind::Damage => DAMAGE,
                     Kind::Item => "",
+                    Kind::Effect => {
+                        EFFECT[(p.age as usize * (EFFECT.len() - 1)) / p.lifetime as usize]
+                    }
                 },
                 rect: p.rect,
                 color: p.color,
+                alpha: p.alpha,
+                translucent: p.kind == Kind::Effect,
                 light: light(p.pos),
             })
             .collect()
@@ -315,6 +425,11 @@ impl Particle {
             }
             Some(_) => {}
             None => self.pos += self.velocity,
+        }
+        // `speedUpWhenYMotionIsBlocked`.
+        if self.kind == Kind::Effect && self.pos.y == self.old.y {
+            self.velocity.x *= 1.1;
+            self.velocity.z *= 1.1;
         }
         self.velocity *= self.friction;
         if self.on_ground {

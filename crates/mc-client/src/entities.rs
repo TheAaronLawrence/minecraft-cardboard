@@ -192,6 +192,16 @@ enum Sort {
     /// Another player: its body follows `LivingEntity.tickHeadTurn`.
     Player,
     Item,
+    /// An arrow (`AbstractArrow`), spectral or not.
+    Arrow {
+        spectral: bool,
+    },
+    /// A thrown item (`ThrowableItemProjectile`): the item it shows when the server names
+    /// none (`getDefaultItem`), and how fast it falls (`getDefaultGravity`).
+    Thrown {
+        item: &'static str,
+        gravity: f64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -249,6 +259,22 @@ struct Tracked {
     /// The item it's using (`useItem`): its hand (0 main, 1 off), the item, and the ticks
     /// left (`useItemRemaining`).
     using: Option<(u8, String, i32)>,
+    /// An arrow's `shakeTime` and whether it's stuck in a block (`IN_GROUND`).
+    shake: i32,
+    in_ground: bool,
+    /// `AbstractArrow.inGroundTime`: ticks it's been stuck.
+    in_ground_time: i32,
+}
+
+/// `Projectile.lerpRotation`: a fifth of the way from `old` to `new`, the short way round.
+fn lerp_rotation(mut old: f32, new: f32) -> f32 {
+    while new - old < -180.0 {
+        old -= 360.0;
+    }
+    while new - old >= 180.0 {
+        old += 360.0;
+    }
+    old + (new - old) * 0.2
 }
 
 /// `PlayerInfo.getSkin`: a player's downloaded skin once it's arrived, else the default
@@ -323,13 +349,23 @@ impl SwingState {
 /// `SynchedEntityData` indices: `Entity` has 8, `LivingEntity` 7, `Mob` 1 (its flags),
 /// `AgeableMob` and `Zombie` start with the baby flag, then each type's own.
 const SHARED_FLAGS: u8 = 0;
+/// `Entity.DATA_NO_GRAVITY`.
+const NO_GRAVITY: u8 = 5;
 const POSE: u8 = 6;
 const HEALTH: u8 = 9;
+/// `LivingEntity.DATA_EFFECT_PARTICLES` and `DATA_EFFECT_AMBIENCE_ID`.
+const EFFECT_PARTICLES: u8 = 10;
+const EFFECT_AMBIENCE: u8 = 11;
 /// `Avatar.DATA_PLAYER_MAIN_HAND`: `HumanoidArm`'s id, left 0 or right 1.
 const MAIN_HAND: u8 = 15;
 /// `Pose.CROUCHING`'s id.
 const CROUCHING: i32 = 5;
 const ITEM: u8 = 8;
+/// `AbstractArrow`'s flags (1 a critical hit, 2 no physics), `IN_GROUND`, and
+/// `Arrow.ID_EFFECT_COLOR` (-1 for none).
+const ARROW_FLAGS: u8 = 8;
+const IN_GROUND: u8 = 10;
+const ARROW_COLOR: u8 = 11;
 /// `LivingEntity.DATA_LIVING_ENTITY_FLAGS`: 1 using an item, 2 in the off hand.
 const LIVING_FLAGS: u8 = 8;
 const MOB_FLAGS: u8 = 15;
@@ -349,6 +385,8 @@ pub struct Entities {
     names: HashMap<u128, String>,
     /// Each wearable item's equipment asset (`equippable`'s `asset_id`), by item.
     armor: HashMap<String, String>,
+    /// Item icons, whose sprites thrown items break into.
+    icons: std::sync::Arc<HashMap<String, mc_render::item::ItemIcon>>,
     /// What using each item looks like and how long it lasts, by item.
     uses: HashMap<String, (mc_render::entity::UseAnim, i32)>,
     tracked: HashMap<i32, Tracked>,
@@ -377,7 +415,10 @@ struct Bolt {
 }
 
 impl Entities {
-    pub fn new(registry: &mc_registry::Registry) -> Self {
+    pub fn new(
+        registry: &mc_registry::Registry,
+        icons: std::sync::Arc<HashMap<String, mc_render::item::ItemIcon>>,
+    ) -> Self {
         Self {
             types: (0..)
                 .map_while(|i| registry.entity_type(i).map(str::to_owned))
@@ -392,6 +433,7 @@ impl Entities {
                 })
                 .collect(),
             uses: crate::hands::use_animations(registry),
+            icons,
             tracked: HashMap::new(),
             seed: 0x5DEECE66D,
             particles: Default::default(),
@@ -467,6 +509,32 @@ impl Entities {
                     Some("pig") => Sort::Mob(MobType::Pig),
                     Some("sheep") => Sort::Mob(MobType::Sheep),
                     Some("chicken") => Sort::Mob(MobType::Chicken),
+                    Some("arrow") => Sort::Arrow { spectral: false },
+                    Some("spectral_arrow") => Sort::Arrow { spectral: true },
+                    Some("snowball") => Sort::Thrown {
+                        item: "minecraft:snowball",
+                        gravity: 0.03,
+                    },
+                    Some("egg") => Sort::Thrown {
+                        item: "minecraft:egg",
+                        gravity: 0.03,
+                    },
+                    Some("ender_pearl") => Sort::Thrown {
+                        item: "minecraft:ender_pearl",
+                        gravity: 0.03,
+                    },
+                    Some("experience_bottle") => Sort::Thrown {
+                        item: "minecraft:experience_bottle",
+                        gravity: 0.07,
+                    },
+                    Some("splash_potion") => Sort::Thrown {
+                        item: "minecraft:splash_potion",
+                        gravity: 0.05,
+                    },
+                    Some("lingering_potion") => Sort::Thrown {
+                        item: "minecraft:lingering_potion",
+                        gravity: 0.05,
+                    },
                     // Not drawn yet; tracking it would do nothing.
                     _ => return None,
                 };
@@ -518,6 +586,9 @@ impl Entities {
                         hurt_time: 0,
                         death_time: 0,
                         using: None,
+                        shake: 0,
+                        in_ground: false,
+                        in_ground_time: 0,
                     },
                 );
             }
@@ -607,6 +678,10 @@ impl Entities {
             Event::EntityMotion { id, velocity } => {
                 if let Some(e) = self.tracked.get_mut(&id) {
                     e.velocity = DVec3::from(velocity);
+                    // `AbstractArrow.lerpMotion`: set moving, it's no longer stuck.
+                    if matches!(e.sort, Sort::Arrow { .. }) && e.velocity != DVec3::ZERO {
+                        e.in_ground = false;
+                    }
                 }
             }
             // `handleAnimate`: `createTrackingEmitter`, which bursts once at once.
@@ -688,7 +763,47 @@ impl Entities {
             }
             Event::EntityData { id, values } => {
                 if let Some(e) = self.tracked.get_mut(&id) {
+                    // `AbstractArrow.onSyncedDataUpdated`: stuck after its first tick, it
+                    // quivers.
+                    for (index, value) in &values {
+                        if let (IN_GROUND, DataValue::Bool(stuck), Sort::Arrow { .. }) =
+                            (*index, value, e.sort)
+                        {
+                            if *stuck && e.age > 0 && e.shake <= 0 {
+                                e.shake = 7;
+                            }
+                            e.in_ground = *stuck;
+                        }
+                    }
                     e.data.extend(values);
+                }
+            }
+            // `Snowball` and `ThrownEgg.handleEntityEvent(3)`: it breaks into 8 bits of its
+            // item, a snowball's dropping and an egg's scattering a little.
+            Event::EntityEvent { id, event: 3 }
+                if self
+                    .tracked
+                    .get(&id)
+                    .is_some_and(|e| matches!(e.sort, Sort::Thrown { .. })) =>
+            {
+                let e = &self.tracked[&id];
+                let item = e.item_shown();
+                let egg = item == "minecraft:egg";
+                if !egg && item != "minecraft:snowball" {
+                    return None;
+                }
+                let rect = crate::particles::item_sprite(&self.icons, &item)?;
+                let p = &mut self.particles;
+                for _ in 0..8 {
+                    let mut r = || f64::from(p.random() - 0.5) * 0.08;
+                    let velocity = if egg {
+                        DVec3::new(r(), r(), r())
+                    } else {
+                        DVec3::ZERO
+                    };
+                    if p.allowed(false, false) {
+                        p.item(rect, e.now.pos, velocity);
+                    }
                 }
             }
             // `LivingEntity.handleDamageEvent` and `animateHurt`: it flashes red. The
@@ -700,6 +815,24 @@ impl Entities {
             }
             // `LivingEntity.handleEntityEvent(60)`: the mob's gone in a poof, just before
             // the server removes it.
+            // `Arrow.handleEntityEvent(0)`: a tipped arrow's potion has worn off, in a
+            // burst of 20 swirls.
+            Event::EntityEvent { id, event: 0 }
+                if self
+                    .tracked
+                    .get(&id)
+                    .is_some_and(|e| e.sort == Sort::Arrow { spectral: false }) =>
+            {
+                let e = &self.tracked[&id];
+                if let Some(color) = e.arrow_color() {
+                    for _ in 0..20 {
+                        let at = e.random_point(&mut self.particles);
+                        if self.particles.allowed(false, false) {
+                            self.particles.effect(at, DVec3::ZERO, color | 0xff00_0000);
+                        }
+                    }
+                }
+            }
             Event::EntityEvent { id, event: 60 } => {
                 if let Some(e) = self.tracked.get(&id) {
                     let baby = matches!(e.data.get(&BABY), Some(DataValue::Bool(true)));
@@ -752,7 +885,7 @@ impl Entities {
         blocks: &mc_physics::BlockPhysics,
     ) -> bool {
         for e in self.tracked.values_mut() {
-            e.tick(world, blocks, &self.uses);
+            e.tick(world, blocks, &self.uses, &mut self.particles);
         }
         self.particles.tick(world, blocks);
         self.emit();
@@ -834,6 +967,20 @@ impl Entities {
         self.particles.status = status;
     }
 
+    /// `LivingEntity.tickEffects` for the player itself, with the effect colours, ambience
+    /// and invisibility the server gave it, its feet at `feet` and its box `size`.
+    pub fn own_effects(
+        &mut self,
+        colors: &[u32],
+        invisible: bool,
+        ambient: bool,
+        feet: DVec3,
+        size: [f32; 2],
+    ) {
+        self.particles
+            .mob_effects(colors, invisible, ambient, feet, size);
+    }
+
     /// The particles to draw, `partial` of the way to the next tick, lit by `light`.
     pub fn particles(
         &self,
@@ -855,6 +1002,8 @@ impl Entities {
                 let (feet, baby) = match &entity {
                     Entity::Living(l) => (l.pos, l.baby),
                     Entity::Item(d) => (d.pos, false),
+                    Entity::Arrow(a) => (a.pos, false),
+                    Entity::Thrown(t) => (t.pos, false),
                 };
                 let eye = e.eye_height() * if baby { 0.5 } else { 1.0 };
                 let [sky, mut block] = light(feet.as_dvec3() + DVec3::Y * eye);
@@ -881,7 +1030,8 @@ impl Tracked {
                 2 => 0.2,
                 _ => 1.62,
             },
-            Sort::Item => 0.2125,
+            Sort::Item | Sort::Thrown { .. } => 0.2125,
+            Sort::Arrow { .. } => 0.13,
             Sort::Mob(mob) => match mob {
                 MobType::Zombie | MobType::Skeleton => 1.74,
                 MobType::Creeper => 1.7 * 0.85,
@@ -912,7 +1062,8 @@ impl Tracked {
                 _ => [0.6, 1.8],
             },
             // `EntityTypes`' sizes, and each type's `BABY_DIMENSIONS`.
-            Sort::Item => [0.25, 0.25],
+            Sort::Item | Sort::Thrown { .. } => [0.25, 0.25],
+            Sort::Arrow { .. } => [0.5, 0.5],
             Sort::Mob(mob) => match (mob, baby) {
                 (MobType::Zombie, false) => [0.6, 1.95],
                 (MobType::Zombie, true) => [0.49, 0.98],
@@ -932,7 +1083,7 @@ impl Tracked {
     }
 
     fn living(&self) -> bool {
-        self.sort != Sort::Item
+        matches!(self.sort, Sort::Player | Sort::Mob(_))
     }
 
     /// `Entity.moveOrInterpolateTo`: living entities glide there, others jump.
@@ -961,6 +1112,7 @@ impl Tracked {
         world: &impl mc_physics::World,
         blocks: &mc_physics::BlockPhysics,
         uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>,
+        particles: &mut crate::particles::Particles,
     ) {
         // `Entity.commonTick`.
         self.old = self.now;
@@ -974,10 +1126,56 @@ impl Tracked {
         self.age += 1;
         match self.sort {
             Sort::Item => self.tick_item(world, blocks),
+            Sort::Arrow { .. } => self.tick_arrow(world, blocks, particles),
+            Sort::Thrown { gravity, .. } => self.tick_thrown(world, blocks, gravity),
             Sort::Player | Sort::Mob(_) => {
                 self.tick_living();
+                self.tick_effects(particles);
                 self.tick_using(uses);
             }
+        }
+        // `Arrow.tick` on the client: a tipped arrow trails two swirls a tick in flight, and
+        // one every five ticks once stuck.
+        if self.sort == (Sort::Arrow { spectral: false })
+            && let Some(color) = self.arrow_color()
+        {
+            let count = match self.in_ground {
+                true if self.in_ground_time % 5 == 0 => 1,
+                true => 0,
+                false => 2,
+            };
+            for _ in 0..count {
+                let at = self.random_point(particles);
+                if particles.allowed(false, false) {
+                    particles.effect(at, DVec3::ZERO, color);
+                }
+            }
+        }
+    }
+
+    /// `LivingEntity.tickEffects` on the client, from its effects' particles (data 10),
+    /// whether they're all ambient (data 11) and whether it's invisible (shared flag 5).
+    fn tick_effects(&self, particles: &mut crate::particles::Particles) {
+        let Some(DataValue::Effects(colors)) = self.data.get(&EFFECT_PARTICLES) else {
+            return;
+        };
+        let invisible =
+            matches!(self.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 0x20 != 0);
+        let ambient = matches!(self.data.get(&EFFECT_AMBIENCE), Some(DataValue::Bool(true)));
+        let baby = matches!(self.data.get(&BABY), Some(DataValue::Bool(true)));
+        particles.mob_effects(colors, invisible, ambient, self.now.pos, self.size(baby));
+    }
+
+    /// Somewhere in its box (`getRandomX(0.5)`, `getRandomY` and `getRandomZ(0.5)`).
+    fn random_point(&self, particles: &mut crate::particles::Particles) -> DVec3 {
+        particles.in_box(self.now.pos, self.size(false))
+    }
+
+    /// `Arrow.getColor`: a tipped arrow's potion colour (`ID_EFFECT_COLOR`), or none.
+    fn arrow_color(&self) -> Option<u32> {
+        match self.data.get(&ARROW_COLOR) {
+            Some(DataValue::Int(c)) if *c != -1 => Some(*c as u32),
+            _ => None,
         }
     }
 
@@ -1085,6 +1283,123 @@ impl Tracked {
         }
     }
 
+    /// `AbstractArrow.tick` on the client: stuck once it's inside a block's collision
+    /// shape; otherwise it turns a fifth of the way to where it's heading, sheds sparks if
+    /// it's a critical hit, flies until it meets a block, where it sticks a little short
+    /// with a quiver (`onHitBlock`), and slows and falls. The server hits entities.
+    fn tick_arrow(
+        &mut self,
+        world: &impl mc_physics::World,
+        blocks: &mc_physics::BlockPhysics,
+        particles: &mut crate::particles::Particles,
+    ) {
+        let flags = match self.data.get(&ARROW_FLAGS) {
+            Some(DataValue::Byte(f)) => *f,
+            _ => 0,
+        };
+        let physics = flags & 2 == 0;
+        let pos = self.now.pos;
+        let block = pos.floor().as_ivec3();
+        let state = world.state(block.x, block.y, block.z);
+        if physics
+            && blocks
+                .shape(state)
+                .iter()
+                .any(|b| b.offset(block.as_dvec3()).contains(pos))
+        {
+            self.velocity = DVec3::ZERO;
+            self.in_ground = true;
+        }
+        self.shake = (self.shake - 1).max(0);
+        if self.in_ground && physics {
+            self.in_ground_time += 1;
+            return;
+        }
+        self.in_ground_time = 0;
+        // `isInWater`, as the block it's in.
+        let in_water = mc_physics::fluid::fluid_at(world, blocks, block.to_array())
+            .is_some_and(|f| f.kind == mc_physics::fluid::FluidKind::Water);
+        if in_water {
+            // `getWaterInertia`.
+            self.velocity *= f64::from(0.6f32);
+        }
+        let movement = self.velocity;
+        if flags & 1 != 0 {
+            for i in 0..4 {
+                let at = pos + movement * (i as f64 / 4.0);
+                if particles.allowed(false, false) {
+                    let aux = DVec3::new(-movement.x, -movement.y + 0.2, -movement.z);
+                    particles.crit(crate::particles::Kind::Crit, at, aux);
+                }
+            }
+        }
+        let sign = if physics { 1.0 } else { -1.0 };
+        let yaw = (sign * movement.x).atan2(sign * movement.z).to_degrees() as f32;
+        let horizontal = movement.x.hypot(movement.z);
+        let pitch = movement.y.atan2(horizontal).to_degrees() as f32;
+        self.now.pitch = lerp_rotation(self.now.pitch, pitch);
+        self.now.yaw = lerp_rotation(self.now.yaw, yaw);
+        if physics {
+            match mc_physics::clip_collider(world, blocks, pos, pos + movement) {
+                Some(hit) => {
+                    let back = DVec3::new(
+                        movement.x.signum(),
+                        movement.y.signum(),
+                        movement.z.signum(),
+                    ) * f64::from(0.05f32);
+                    self.now.pos = hit.location - back;
+                    self.velocity = DVec3::ZERO;
+                    self.in_ground = true;
+                    self.shake = 7;
+                }
+                None => self.now.pos = pos + movement,
+            }
+        } else {
+            self.now.pos = pos + movement;
+        }
+        if !in_water {
+            self.velocity *= f64::from(0.99f32);
+        }
+        if physics && !self.in_ground {
+            self.velocity.y -= self.gravity(0.05);
+        }
+    }
+
+    /// `ThrowableProjectile.tick` on the client: it falls, slows (more in water), and flies
+    /// on until it meets a block. The server hits entities and breaks it.
+    fn tick_thrown(
+        &mut self,
+        world: &impl mc_physics::World,
+        blocks: &mc_physics::BlockPhysics,
+        gravity: f64,
+    ) {
+        self.velocity.y -= self.gravity(gravity);
+        let block = self.now.pos.floor().as_ivec3();
+        let in_water = mc_physics::fluid::fluid_at(world, blocks, block.to_array())
+            .is_some_and(|f| f.kind == mc_physics::fluid::FluidKind::Water);
+        self.velocity *= f64::from(if in_water { 0.8f32 } else { 0.99 });
+        let (from, to) = (self.now.pos, self.now.pos + self.velocity);
+        self.now.pos =
+            mc_physics::clip_collider(world, blocks, from, to).map_or(to, |h| h.location);
+    }
+
+    /// `Entity.getGravity`: `default`, or none if the server says so.
+    fn gravity(&self, default: f64) -> f64 {
+        match self.data.get(&NO_GRAVITY) {
+            Some(DataValue::Bool(true)) => 0.0,
+            _ => default,
+        }
+    }
+
+    /// The item a thrown item shows: the server's, or its type's own.
+    fn item_shown(&self) -> String {
+        match (self.data.get(&ITEM), self.sort) {
+            (Some(DataValue::Item(Some((item, _)))), _) => item.clone(),
+            (_, Sort::Thrown { item, .. }) => item.to_owned(),
+            _ => String::new(),
+        }
+    }
+
     /// `ItemEntity.tick` on the client: gravity, sliding with block friction, and bouncing.
     fn tick_item(&mut self, world: &impl mc_physics::World, blocks: &mc_physics::BlockPhysics) {
         self.velocity.y -= 0.04;
@@ -1128,6 +1443,31 @@ impl Tracked {
     ) -> Option<Entity> {
         let pos = self.old.pos.lerp(self.now.pos, pt as f64).as_vec3();
         let age = self.age as f32 + pt;
+        match self.sort {
+            // `ArrowRenderer.extractRenderState`: its rotation lerped plainly.
+            Sort::Arrow { spectral } => {
+                let tipped =
+                    matches!(self.data.get(&ARROW_COLOR), Some(DataValue::Int(c)) if *c > 0);
+                let texture =
+                    mc_render::entity::ARROW[if spectral { 2 } else { usize::from(tipped) }];
+                let lerp = |a: f32, b: f32| a + (b - a) * pt;
+                return Some(Entity::Arrow(mc_render::entity::Arrow {
+                    pos,
+                    yaw: lerp(self.old.yaw, self.now.yaw),
+                    pitch: lerp(self.old.pitch, self.now.pitch),
+                    shake: self.shake as f32 - pt,
+                    texture,
+                }));
+            }
+            Sort::Thrown { .. } => {
+                return Some(Entity::Thrown(mc_render::entity::Thrown {
+                    item: self.item_shown(),
+                    pos,
+                    age: self.age,
+                }));
+            }
+            _ => {}
+        }
         if self.sort == Sort::Item {
             let Some(DataValue::Item(Some((item, _)))) = self.data.get(&ITEM) else {
                 return None;
@@ -1183,7 +1523,9 @@ impl Tracked {
                     (kind, mc_render::entity::SHEEP.into())
                 }
             },
-            Sort::Item => unreachable!("handled above"),
+            Sort::Item | Sort::Arrow { .. } | Sort::Thrown { .. } => {
+                unreachable!("handled above")
+            }
         };
         // `LivingEntityRenderer.extractRenderState`.
         let body_yaw = rot_lerp(pt, self.old_body_yaw, self.body_yaw);
@@ -1367,6 +1709,7 @@ mod tests {
             names: HashMap::new(),
             armor: HashMap::new(),
             uses: HashMap::new(),
+            icons: Default::default(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),
@@ -1407,6 +1750,7 @@ mod tests {
             names: HashMap::new(),
             armor: HashMap::new(),
             uses: HashMap::new(),
+            icons: Default::default(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),
@@ -1500,6 +1844,7 @@ mod tests {
             names: HashMap::new(),
             armor: HashMap::new(),
             uses: HashMap::new(),
+            icons: Default::default(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),
@@ -1551,6 +1896,7 @@ mod tests {
             names: HashMap::new(),
             armor: HashMap::new(),
             uses: HashMap::new(),
+            icons: Default::default(),
             seed: 1,
             particles: Default::default(),
             emitters: Vec::new(),

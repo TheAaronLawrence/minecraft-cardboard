@@ -271,6 +271,7 @@ pub struct Renderer {
     vignette_bind_group: wgpu::BindGroup,
     lightning: wgpu::RenderPipeline,
     lightning_vertices: Option<(wgpu::Buffer, u32)>,
+    particle_vertices: Option<(wgpu::Buffer, u32)>,
     bind_group: wgpu::BindGroup,
     /// The same bindings, with the uniforms the hand is drawn with.
     hand_bind_group: wgpu::BindGroup,
@@ -1005,6 +1006,7 @@ impl Renderer {
             vignette_bind_group,
             lightning,
             lightning_vertices: None,
+            particle_vertices: None,
             bind_group,
             hand_bind_group,
             hand_uniforms,
@@ -1104,6 +1106,7 @@ impl Renderer {
         self.see_through_vertices = self.quads_buffer("name tags behind", &meshes.see_through);
         self.tag_vertices = self.quads_buffer("name tags", &meshes.tags);
         self.lightning_vertices = self.quads_buffer("lightning", &meshes.lightning);
+        self.particle_vertices = self.quads_buffer("translucent particles", &meshes.particles);
     }
 
     /// Draws these quads (from `entity::first_person`), the player's own hands, over the
@@ -1676,6 +1679,12 @@ impl Renderer {
                             }
                         }
                     }
+                }
+                // `ParticleEngine`'s translucent layer, after the translucent blocks.
+                if let Some((buffer, count)) = &self.particle_vertices {
+                    pass.set_pipeline(&self.translucent);
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw_indexed(0..*count, 0, 0..1);
                 }
                 if let Some((buffer, count)) = &self.lightning_vertices {
                     pass.set_pipeline(&self.lightning);
