@@ -878,6 +878,16 @@ impl Walker {
     fn level_event(&mut self, kind: i32, pos: [i32; 3], data: i32) {
         match kind {
             2001 => self.break_sound(pos, data as u32),
+            // An enderman teleported from `pos` (`data` packs how far it went, each axis
+            // offset by 127): portal specks along the way, about its box.
+            2018 => {
+                let to = IVec3::from(pos)
+                    + IVec3::new(data >> 16 & 0xff, data >> 8 & 0xff, data & 0xff)
+                    - 127;
+                let size = [f64::from(0.6f32), f64::from(2.9f32)];
+                let (from, to) = (IVec3::from(pos).as_dvec3(), to.as_dvec3());
+                self.entities.particles.teleport(to, from, size, false);
+            }
             // `ClientLevel.addBreakingBlockEffects`: another player mining; every fourth
             // tick with a sound.
             2019 | 2020 => {
@@ -1346,9 +1356,26 @@ impl Walker {
                 let pitch = self.wobble(0.2);
                 self.player_sound(event, 1.0, pitch);
             }
+            // `Ravager.applyRoarKnockbackClient`: its roar throws the player back.
+            mc_protocol::Event::EntityEvent { id, event: 69 } => {
+                let size = [0.6, self.player.height()];
+                if self.death.is_none()
+                    && let Some(push) = self.entities.roar_push(id, self.player.pos, size)
+                {
+                    self.player.velocity += push;
+                }
+            }
             // `Player.handleEntityEvent(9)`: the server finished the item's use.
             mc_protocol::Event::EntityEvent { id, event: 9 } if id == self.entity_id => {
                 self.complete_using();
+            }
+            // `LivingEntity.handleEntityEvent(46)`: the player teleported (chorus fruit), in
+            // a burst of portal specks. The teleport came first and moved the old position
+            // too, so they're all about where it landed.
+            mc_protocol::Event::EntityEvent { id, event: 46 } if id == self.entity_id => {
+                let size = [0.6, self.player.height()];
+                let (from, to) = (self.previous, self.player.pos);
+                self.entities.particles.teleport(from, to, size, true);
             }
             // `LivingEntity.handleEntityEvent(3)`: the player's own death sound.
             mc_protocol::Event::EntityEvent { id, event: 3 } if id == self.entity_id => {
@@ -1515,6 +1542,7 @@ impl Walker {
 
     /// Hands this tick's player to `Entities::tick_own`, for the third-person views.
     fn tick_own(&mut self) {
+        self.entities.spectator = self.game_mode == 3;
         let p = &self.player;
         let flags = u8::from(self.on_fire)
             | u8::from(p.crouching) << 1
@@ -2119,9 +2147,14 @@ impl Walker {
                 ticks: duration - u.remaining,
             })
         });
-        let hands = self
-            .hands
-            .view(pt, yaw, pitch, self.entities.skin(self.uuid), using);
+        let hands = self.hands.view(
+            pt,
+            yaw,
+            pitch,
+            self.entities.skin(self.uuid),
+            using,
+            self.swirls.2,
+        );
         Some((hands, self.light.at(eye.floor().as_ivec3().to_array())))
     }
 
@@ -2307,6 +2340,17 @@ impl Walker {
                         seed,
                     ));
                 }
+            }
+            for (event, pos, pitch) in std::mem::take(&mut self.entities.hostile_sounds) {
+                let seed = self.sound_seed();
+                self.sounds.push(crate::sound::Instance::at(
+                    event,
+                    crate::sound::Category::Hostile,
+                    1.0,
+                    pitch,
+                    pos,
+                    seed,
+                ));
             }
             self.tick_rain_sound();
             if let Some((_, _, ticks)) = &mut self.placing {

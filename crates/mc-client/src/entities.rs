@@ -202,6 +202,8 @@ enum Sort {
         item: &'static str,
         gravity: f64,
     },
+    /// An evoker's fangs (`EvokerFangs`).
+    Fangs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -252,6 +254,20 @@ enum MobType {
     Frog,
     Camel,
     Armadillo,
+    Sniffer,
+    Warden,
+    Creaking,
+    Breeze,
+    CopperGolem,
+    Nautilus,
+    ZombieNautilus,
+    Axolotl,
+    Pillager,
+    Vindicator,
+    Evoker,
+    Illusioner,
+    Vex,
+    Ravager,
 }
 
 struct Tracked {
@@ -331,8 +347,18 @@ struct MobAnim {
     lie: [f32; 2],
     lie_tail: [f32; 2],
     relax: [f32; 2],
-    /// Ticks a piglin has been charging its crossbow.
+    /// Ticks a piglin or pillager has been charging its crossbow.
     crossbow: i32,
+    /// A ravager's `stunnedTick` and `roarTick`.
+    stun: i32,
+    roar: i32,
+    /// An evoker's fangs' `lifeTicks`, once their bite has started
+    /// (`clientSideAttackStarted`).
+    fangs_life: Option<i32>,
+    /// An illusioner's `clientSideIllusionTicks`, and its `clientSideIllusionOffsets`:
+    /// where its copies were and are going.
+    illusion_ticks: i32,
+    illusions: [[DVec3; 4]; 2],
     /// `PolarBear.clientSideStandAnimation`, 0 to 6.
     stand: [f32; 2],
     /// `Fox`'s `crouchAmount` and `interestedAngle`.
@@ -341,8 +367,24 @@ struct MobAnim {
     /// The ticks its `AnimationState`s started, while they run: `Bat`'s fly and rest; a
     /// rabbit's hop and idle head tilt; a frog's jump, croak, tongue and swim idle; a
     /// camel's sit, sit pose, sit up, idle and dash; an armadillo's roll out, roll up and
-    /// peek.
-    started: [Option<i64>; 5],
+    /// peek; a sniffer's dig, long sniff, stand up, happy and sniff sniff; a warden's
+    /// attack, sonic boom, dig, emerge, roar and sniff; a baby axolotl's seven.
+    started: [Option<i64>; 7],
+    /// An adult axolotl's `playingDeadAnimator`, `inWaterAnimator`, `onGroundAnimator` and
+    /// `movingAnimator`: their ticks, 0 to 10, last tick and now.
+    axolotl: [[u8; 2]; 4],
+    /// A creaking's `attackAnimationRemainingTicks` and
+    /// `invulnerabilityAnimationRemainingTicks`, whether its eyes glow as it's torn down
+    /// (`eyesGlowing`), and when they next flicker (`nextFlickerTime`).
+    creaking_attack: i32,
+    creaking_invulnerable: i32,
+    eyes_glowing: bool,
+    next_flicker: u32,
+    /// A copper golem's `idleAnimationStartTick`: the tick its head next spins, or 0.
+    idle_start: u32,
+    /// A warden's `tendrilAnimation` and `heartAnimation`, last tick and now.
+    tendril: [f32; 2],
+    heart: [f32; 2],
     /// Whether a frog is in water (`isInWater`), where it swims.
     in_water: bool,
     /// `Armadillo.inStateTicks`, and whether it peeked since (`peekReceivedClient`).
@@ -459,9 +501,27 @@ const SITTING: i32 = 10;
 /// `Camel.DASH` and `LAST_POSE_CHANGE_TICK`, after `AbstractHorse.DATA_ID_FLAGS`.
 const CAMEL_DASH: u8 = 19;
 const CAMEL_POSE_TICK: u8 = 20;
-/// `Armadillo.ARMADILLO_STATE` (0 idle, 1 rolling, 2 scared, 3 unrolling), after
-/// `AgeableMob`'s two.
+/// `Armadillo.ARMADILLO_STATE` (0 idle, 1 rolling, 2 scared, 3 unrolling) and
+/// `Sniffer.DATA_STATE` (0 idling, 1 feeling happy, 2 scenting, 3 sniffing, 4 searching,
+/// 5 digging, 6 rising), after `AgeableMob`'s two.
 const MONSTER_STATE: u8 = 18;
+/// `Creaking.CAN_MOVE`, `IS_ACTIVE` and `IS_TEARING_DOWN`, after `Mob`'s flags.
+const CREAKING_CAN_MOVE: u8 = 16;
+const CREAKING_ACTIVE: u8 = 17;
+const CREAKING_TEARING_DOWN: u8 = 18;
+/// `CopperGolem.DATA_WEATHER_STATE` (`WeatherState`'s id, 0 unaffected to 3 oxidized)
+/// and `COPPER_GOLEM_STATE` (0 idle, 1 getting an item, 2 getting none, 3 dropping one,
+/// 4 dropping none), after `Mob`'s flags.
+const COPPER_WEATHER: u8 = 16;
+const COPPER_GOLEM_STATE: u8 = 17;
+/// `ZombieNautilus.DATA_VARIANT_ID`, after `AgeableMob`'s two, `TamableAnimal`'s two and
+/// `AbstractNautilus.DASH`.
+const ZOMBIE_NAUTILUS_VARIANT: u8 = 21;
+/// `Axolotl.DATA_VARIANT` and `DATA_PLAYING_DEAD`, after `AgeableMob`'s two.
+const AXOLOTL_VARIANT: u8 = 18;
+const AXOLOTL_PLAYING_DEAD: u8 = 19;
+/// `Warden.CLIENT_ANGER_LEVEL`, after `Mob`'s flags.
+const WARDEN_ANGER: u8 = 16;
 /// `Entity.DATA_NO_GRAVITY`.
 const NO_GRAVITY: u8 = 5;
 const POSE: u8 = 6;
@@ -535,6 +595,11 @@ const PIGLIN_CHARGING: u8 = 18;
 const PIGLIN_DANCING: u8 = 19;
 /// `Strider.DATA_SUFFOCATING`, after `AgeableMob`'s two and its boost time.
 const STRIDER_COLD: u8 = 19;
+/// `Raider.IS_CELEBRATING`, then `Pillager.IS_CHARGING_CROSSBOW` and
+/// `SpellcasterIllager.DATA_SPELL_CASTING_ID` (the `IllagerSpell` being cast, 0 none).
+const RAIDER_CELEBRATING: u8 = 16;
+const PILLAGER_CHARGING: u8 = 17;
+const SPELL: u8 = 17;
 
 pub struct Entities {
     /// Entity type names by protocol id.
@@ -566,8 +631,14 @@ pub struct Entities {
     /// Where bolts struck since this was last taken, with their thunder's and impact's
     /// pitches (`LightningBolt.tick`).
     pub thunder: Vec<(DVec3, f32, f32)>,
+    /// Hostile mobs' sounds the client plays itself (`playLocalSound`) since this was last
+    /// taken: the event, where, and its pitch.
+    pub hostile_sounds: Vec<(&'static str, DVec3, f32)>,
     /// The level's game time, which a wolf's anger lasts until (`NeutralMob.isAngry`).
     pub game_time: i64,
+    /// Whether the player's a spectator, who sees invisible entities faintly
+    /// (`Entity.isInvisibleTo`).
+    pub spectator: bool,
     /// A carved pumpkin's default state, which a snow golem wears.
     pumpkin: u32,
     /// Items with the `tool` component (`AbstractPiglin.isHoldingMeleeWeapon`): the
@@ -631,7 +702,9 @@ impl Entities {
             emitters: Vec::new(),
             bolts: HashMap::new(),
             thunder: Vec::new(),
+            hostile_sounds: Vec::new(),
             game_time: 0,
+            spectator: false,
             random: mc_render::bake::JavaRandom::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -739,6 +812,21 @@ impl Entities {
                     Some("frog") => Sort::Mob(MobType::Frog),
                     Some("camel") => Sort::Mob(MobType::Camel),
                     Some("armadillo") => Sort::Mob(MobType::Armadillo),
+                    Some("sniffer") => Sort::Mob(MobType::Sniffer),
+                    Some("warden") => Sort::Mob(MobType::Warden),
+                    Some("creaking") => Sort::Mob(MobType::Creaking),
+                    Some("breeze") => Sort::Mob(MobType::Breeze),
+                    Some("copper_golem") => Sort::Mob(MobType::CopperGolem),
+                    Some("nautilus") => Sort::Mob(MobType::Nautilus),
+                    Some("zombie_nautilus") => Sort::Mob(MobType::ZombieNautilus),
+                    Some("axolotl") => Sort::Mob(MobType::Axolotl),
+                    Some("pillager") => Sort::Mob(MobType::Pillager),
+                    Some("vindicator") => Sort::Mob(MobType::Vindicator),
+                    Some("evoker") => Sort::Mob(MobType::Evoker),
+                    Some("illusioner") => Sort::Mob(MobType::Illusioner),
+                    Some("vex") => Sort::Mob(MobType::Vex),
+                    Some("ravager") => Sort::Mob(MobType::Ravager),
+                    Some("evoker_fangs") => Sort::Fangs,
                     Some("arrow") => Sort::Arrow { spectral: false },
                     Some("spectral_arrow") => Sort::Arrow { spectral: true },
                     Some("snowball") => Sort::Thrown {
@@ -1060,12 +1148,18 @@ impl Entities {
                     }
                 }
             }
-            // `IronGolem.handleEntityEvent(4)`: its arms come down in an attack.
+            // `IronGolem.handleEntityEvent(4)`: its arms come down in an attack; and
+            // `Ravager`'s: it bites.
             Event::EntityEvent { id, event: 4 }
                 if self.tracked.get(&id).is_some_and(|e| {
                     matches!(
                         e.sort,
-                        Sort::Mob(MobType::IronGolem | MobType::Hoglin | MobType::Zoglin)
+                        Sort::Mob(
+                            MobType::IronGolem
+                                | MobType::Hoglin
+                                | MobType::Zoglin
+                                | MobType::Ravager
+                        )
                     )
                 }) =>
             {
@@ -1074,6 +1168,39 @@ impl Entities {
                     .expect("checked")
                     .anim
                     .golem_attack = 10;
+            }
+            // `Creaking.handleEntityEvent`: 66 shrugs off a hit; 4 attacks.
+            Event::EntityEvent {
+                id,
+                event: event @ (4 | 66),
+            } if self
+                .tracked
+                .get(&id)
+                .is_some_and(|e| e.sort == Sort::Mob(MobType::Creaking)) =>
+            {
+                let a = &mut self.tracked.get_mut(&id).expect("checked").anim;
+                match event {
+                    66 => a.creaking_invulnerable = 8,
+                    _ => a.creaking_attack = 15,
+                }
+            }
+            // `Warden.handleEntityEvent`: 4 attacks, cutting a roar short; 61 twitches its
+            // tendrils; 62 starts a sonic boom.
+            Event::EntityEvent {
+                id,
+                event: event @ (4 | 61 | 62),
+            } if self
+                .tracked
+                .get(&id)
+                .is_some_and(|e| e.sort == Sort::Mob(MobType::Warden)) =>
+            {
+                let e = self.tracked.get_mut(&id).expect("checked");
+                let age = Some(i64::from(e.age));
+                match event {
+                    4 => (e.anim.started[4], e.anim.started[0]) = (None, age),
+                    61 => e.anim.tendril[1] = 10.0,
+                    _ => e.anim.started[1] = age,
+                }
             }
             // `Rabbit.handleEntityEvent(1)`: a hop starts, kicking up dust.
             Event::EntityEvent { id, event: 1 }
@@ -1105,6 +1232,56 @@ impl Entities {
                     .expect("checked")
                     .anim
                     .tentacle_movement = 0.0;
+            }
+            // `Ravager.handleEntityEvent(39)`: it's stunned, its attack blocked by a shield.
+            Event::EntityEvent { id, event: 39 }
+                if self
+                    .tracked
+                    .get(&id)
+                    .is_some_and(|e| e.sort == Sort::Mob(MobType::Ravager)) =>
+            {
+                self.tracked.get_mut(&id).expect("checked").anim.stun = 40;
+            }
+            // `Ravager.handleEntityEvent(69)`: it roars, in a burst of smoke from its middle.
+            // The knockback it gives the player passes on.
+            Event::EntityEvent { id, event: 69 }
+                if self
+                    .tracked
+                    .get(&id)
+                    .is_some_and(|e| e.sort == Sort::Mob(MobType::Ravager)) =>
+            {
+                let e = &self.tracked[&id];
+                let center = e.now.pos + DVec3::Y * f64::from(e.size(false)[1]) * 0.5;
+                let p = &mut self.particles;
+                for _ in 0..40 {
+                    let velocity = DVec3::new(p.gaussian(), p.gaussian(), p.gaussian()) * 0.2;
+                    if p.allowed(false, false) {
+                        p.explode(center, velocity);
+                    }
+                }
+                return Some(event);
+            }
+            // `LivingEntity.handleEntityEvent(46)`: it teleported (`randomTeleport`), in a
+            // trail of portal specks from where it was.
+            Event::EntityEvent { id, event: 46 }
+                if self.tracked.get(&id).is_some_and(|e| e.living()) =>
+            {
+                let e = &self.tracked[&id];
+                let size = e.size(e.baby()).map(f64::from);
+                self.particles.teleport(e.old.pos, e.now.pos, size, true);
+            }
+            // `EvokerFangs.handleEntityEvent(4)`: they bite, with a snap.
+            Event::EntityEvent { id, event: 4 }
+                if self.tracked.get(&id).is_some_and(|e| e.sort == Sort::Fangs) =>
+            {
+                let e = self.tracked.get_mut(&id).expect("checked");
+                e.anim.fangs_life = Some(22);
+                let pitch = self.random.next_float() * 0.2 + 0.85;
+                self.hostile_sounds.push((
+                    "minecraft:entity.evoker_fangs.attack",
+                    e.now.pos,
+                    pitch,
+                ));
             }
             Event::EntityEvent { id, event: 60 } => {
                 if let Some(e) = self.tracked.get(&id) {
@@ -1163,6 +1340,7 @@ impl Entities {
                 blocks,
                 &self.uses,
                 &mut self.particles,
+                &mut self.hostile_sounds,
                 self.game_time,
             );
         }
@@ -1230,6 +1408,29 @@ impl Entities {
 
     /// The lightning bolts to draw (`LightningBoltRenderer`), while each shows.
     /// Where an entity is now, if it's in view.
+    /// `Ravager.applyRoarKnockbackClient` and `strongKnockback`: the push ravager `id`'s
+    /// roar gives a living thing whose box (`size` wide and high) stands at `feet`, if
+    /// that's within four blocks of the ravager's box.
+    pub fn roar_push(&self, id: i32, feet: DVec3, [width, height]: [f64; 2]) -> Option<DVec3> {
+        let e = self.tracked.get(&id)?;
+        let [w, h] = e.size(false).map(f64::from);
+        let (lo, hi) = (
+            e.now.pos - DVec3::new(w / 2.0 + 4.0, 4.0, w / 2.0 + 4.0),
+            e.now.pos + DVec3::new(w / 2.0 + 4.0, h + 4.0, w / 2.0 + 4.0),
+        );
+        let (min, max) = (
+            feet - DVec3::new(width / 2.0, 0.0, width / 2.0),
+            feet + DVec3::new(width / 2.0, height, width / 2.0),
+        );
+        if min.cmplt(hi).all() && max.cmpgt(lo).all() {
+            let (xd, zd) = (feet.x - e.now.pos.x, feet.z - e.now.pos.z);
+            let dd = (xd * xd + zd * zd).max(0.001);
+            Some(DVec3::new(xd / dd * 4.0, 0.2, zd / dd * 4.0))
+        } else {
+            None
+        }
+    }
+
     pub fn position(&self, id: i32) -> Option<DVec3> {
         self.tracked.get(&id).map(|t| t.now.pos)
     }
@@ -1325,6 +1526,7 @@ impl Entities {
             Entity::Item(d) => (d.pos, false),
             Entity::Arrow(a) => (a.pos, false),
             Entity::Thrown(t) => (t.pos, false),
+            Entity::Fangs(f) => (f.pos, false),
         };
         let eye = e.eye_height() * if baby { 0.5 } else { 1.0 };
         let [sky, mut block] = light(feet.as_dvec3() + DVec3::Y * eye);
@@ -1333,7 +1535,11 @@ impl Entities {
             block = 15;
         }
         // `BlazeRenderer` and `MagmaCubeRenderer.getBlockLightLevel`.
-        if matches!(e.sort, Sort::Mob(MobType::Blaze | MobType::MagmaCube)) {
+        // `VexRenderer.getBlockLightLevel` too.
+        if matches!(
+            e.sort,
+            Sort::Mob(MobType::Blaze | MobType::MagmaCube | MobType::Vex)
+        ) {
             block = 15;
         }
         // `GlowSquidRenderer.getBlockLightLevel`: it glows at 15, dimming for ten ticks
@@ -1486,6 +1692,36 @@ impl Tracked {
         }
     }
 
+    /// `Creaking.isTearingDown`.
+    fn torn_down(&self) -> bool {
+        self.sort == Sort::Mob(MobType::Creaking)
+            && matches!(
+                self.data.get(&CREAKING_TEARING_DOWN),
+                Some(DataValue::Bool(true))
+            )
+    }
+
+    /// `Mob.getMaxHeadYRot`: how far its head turns from its body before the body follows.
+    fn max_head_turn(&self) -> f32 {
+        match self.sort {
+            Sort::Mob(MobType::Camel) => 30.0,
+            Sort::Mob(MobType::Goat) => 15.0,
+            // `isScared`.
+            Sort::Mob(MobType::Armadillo)
+                if matches!(self.data.get(&MONSTER_STATE), Some(DataValue::Int(2))) =>
+            {
+                0.0
+            }
+            Sort::Mob(MobType::Armadillo) => 32.0,
+            Sort::Mob(MobType::Frog) => 5.0,
+            Sort::Mob(MobType::Sniffer) => 50.0,
+            Sort::Mob(MobType::Breeze) => 30.0,
+            Sort::Mob(MobType::Axolotl) => 1.0,
+            Sort::Mob(MobType::Ravager) => 45.0,
+            _ => 75.0,
+        }
+    }
+
     /// `EntityType`'s eye height, where light is read; types that don't set one have 85%
     /// of their height.
     fn eye_height(&self) -> f64 {
@@ -1499,6 +1735,7 @@ impl Tracked {
                 _ => 1.62,
             },
             Sort::Item | Sort::Thrown { .. } => 0.2125,
+            Sort::Fangs => 0.8 * 0.85,
             Sort::Arrow { .. } => 0.13,
             Sort::Mob(mob) => match mob {
                 MobType::Zombie
@@ -1533,6 +1770,20 @@ impl Tracked {
                 MobType::Camel if self.pose() == SITTING => 0.845,
                 MobType::Camel => 2.275,
                 MobType::Armadillo => 0.26,
+                MobType::Sniffer => 1.05,
+                MobType::Warden => 2.9 * 0.85,
+                MobType::Creaking => 2.3,
+                MobType::Breeze => 1.3452,
+                MobType::CopperGolem => 0.8125,
+                MobType::Nautilus | MobType::ZombieNautilus => 0.2751,
+                // `Axolotl.BABY_DIMENSIONS`' own eye height, before the baby's halving.
+                MobType::Axolotl if self.baby() => 0.1875,
+                MobType::Axolotl => 0.2751,
+                MobType::Pillager | MobType::Vindicator | MobType::Evoker | MobType::Illusioner => {
+                    1.95 * 0.85
+                }
+                MobType::Vex => 0.51875,
+                MobType::Ravager => 2.2 * 0.85,
                 MobType::Enderman => 2.55,
                 MobType::Slime => 0.325 * f64::from(self.slime_size()),
                 MobType::Villager | MobType::Witch => 1.62,
@@ -1564,7 +1815,9 @@ impl Tracked {
                 | MobType::ZombifiedPiglin
                 | MobType::Zoglin
                 | MobType::Strider
-                | MobType::WitherSkeleton,
+                | MobType::WitherSkeleton
+                | MobType::Warden
+                | MobType::Vex,
             ) => false,
             _ => byte(SHARED_FLAGS) & 1 != 0,
         };
@@ -1583,6 +1836,7 @@ impl Tracked {
             },
             // `EntityTypes`' sizes, and each type's `BABY_DIMENSIONS`.
             Sort::Item | Sort::Thrown { .. } => [0.25, 0.25],
+            Sort::Fangs => [0.5, 0.8],
             Sort::Arrow { .. } => [0.5, 0.5],
             Sort::Mob(mob) => match (mob, baby) {
                 (
@@ -1632,6 +1886,26 @@ impl Tracked {
                 (MobType::Camel, true) => [0.95, 1.4],
                 (MobType::Armadillo, false) => [0.7, 0.65],
                 (MobType::Armadillo, true) => [0.7 * 0.6, 0.65 * 0.6],
+                (MobType::Warden, _) => [0.9, 2.9],
+                (MobType::Creaking, _) => [0.9, 2.7],
+                (MobType::Breeze, _) => [0.6, 1.77],
+                (MobType::CopperGolem, _) => [0.49, 0.98],
+                (
+                    MobType::Pillager | MobType::Vindicator | MobType::Evoker | MobType::Illusioner,
+                    _,
+                ) => [0.6, 1.95],
+                (MobType::Vex, _) => [0.4, 0.8],
+                (MobType::Ravager, _) => [1.95, 2.2],
+                (MobType::Axolotl, false) => [0.75, 0.42],
+                (MobType::Axolotl, true) => [0.375, 0.21],
+                (MobType::Nautilus | MobType::ZombieNautilus, false) => [0.875, 0.95],
+                (MobType::Nautilus | MobType::ZombieNautilus, true) => [0.875 * 0.5, 0.95 * 0.5],
+                // `Sniffer.DIGGING_DIMENSIONS` while it digs.
+                (MobType::Sniffer, _) => {
+                    let digging = matches!(self.data.get(&MONSTER_STATE), Some(DataValue::Int(5)));
+                    let height = if digging { 1.75 - 0.4 } else { 1.75 };
+                    [1.9, height].map(|d| if baby { d * 0.5 } else { d })
+                }
                 (MobType::Skeleton | MobType::Stray, _) => [0.6, 1.99],
                 (MobType::Enderman, _) => [0.6, 2.9],
                 (MobType::Slime, _) => [0.52 * self.slime_size(); 2],
@@ -1711,6 +1985,7 @@ impl Tracked {
         blocks: &mc_physics::BlockPhysics,
         uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>,
         particles: &mut crate::particles::Particles,
+        sounds: &mut Vec<(&'static str, DVec3, f32)>,
         game_time: i64,
     ) {
         // `Entity.commonTick`.
@@ -1727,11 +2002,50 @@ impl Tracked {
             Sort::Item => self.tick_item(world, blocks),
             Sort::Arrow { .. } => self.tick_arrow(world, blocks, particles),
             Sort::Thrown { gravity, .. } => self.tick_thrown(world, blocks, gravity),
+            Sort::Fangs => self.tick_fangs(particles),
             Sort::Player | Sort::Mob(_) => {
                 self.tick_living();
                 self.tick_mob(world, blocks, game_time);
                 self.tick_effects(particles);
                 self.tick_using(uses);
+            }
+        }
+        self.tick_spell(particles);
+        // `EnderMan.aiStep` on the client: two specks about it every tick.
+        if self.sort == Sort::Mob(MobType::Enderman) {
+            let [width, height] = self.size(false).map(f64::from);
+            for _ in 0..2 {
+                let mut r = || f64::from(particles.random());
+                let at = self.now.pos
+                    + DVec3::new(
+                        (2.0 * r() - 1.0) * width * 0.5,
+                        height * r() - 0.25,
+                        (2.0 * r() - 1.0) * width * 0.5,
+                    );
+                let offset = DVec3::new((r() - 0.5) * 2.0, -r(), (r() - 0.5) * 2.0);
+                if particles.allowed(false, false) {
+                    particles.portal(at, offset);
+                }
+            }
+        }
+        self.tick_illusions(particles, sounds);
+        // `Ravager.stunEffect`: now and then a grey swirl over its head while it's stunned.
+        if self.sort == Sort::Mob(MobType::Ravager)
+            && self.anim.stun > 0
+            && self.anim.next_int(6) == 0
+        {
+            let [width, height] = self.size(false).map(f64::from);
+            let yaw = f64::from(self.body_yaw.to_radians());
+            let mut r = || f64::from(particles.random()) * 0.6 - 0.3;
+            let (dx, dz) = (r(), r());
+            let at = self.now.pos
+                + DVec3::new(
+                    -width * yaw.sin() + dx,
+                    height - 0.3,
+                    width * yaw.cos() + dz,
+                );
+            if particles.allowed(false, false) {
+                particles.effect(at, DVec3::ZERO, 0xff7f_8392);
             }
         }
         // `GlowSquid.aiStep`: a glow every tick somewhere about it (`getRandomX(0.6)`).
@@ -1872,6 +2186,8 @@ impl Tracked {
                 ((distance * 6.0).min(1.0), 0.2)
             }
             Sort::Mob(MobType::Camel) => (0.0, 0.2),
+            // `Creaking.updateWalkAnimation`.
+            Sort::Mob(MobType::Creaking) => ((distance * 25.0).min(3.0), 0.4),
             _ => ((distance * 4.0).min(1.0), 0.4),
         };
         self.walk_speed += (target - self.walk_speed) * factor;
@@ -1897,23 +2213,30 @@ impl Tracked {
                     self.body_yaw += head - head.signum() * 50.0;
                 }
             }
-            // `BodyRotationControl.clientTick`, with `Mob.getMaxHeadYRot` 75.
+            // `CreakingBodyRotationControl.clientTick`: it turns only while it can move.
+            Sort::Mob(MobType::Creaking)
+                if !matches!(
+                    self.data.get(&CREAKING_CAN_MOVE),
+                    Some(DataValue::Bool(true))
+                ) => {}
+            // `BodyRotationControl.clientTick`, with the mob's `getMaxHeadYRot`.
             _ => {
+                let max = self.max_head_turn();
                 if side > 2.5000003e-7 {
                     self.body_yaw = self.now.yaw;
-                    self.head_yaw = rotate_if_necessary(self.head_yaw, self.body_yaw, 75.0);
+                    self.head_yaw = rotate_if_necessary(self.head_yaw, self.body_yaw, max);
                     self.last_stable_head_yaw = self.head_yaw;
                     self.head_stable_time = 0;
                 } else if (self.head_yaw - self.last_stable_head_yaw).abs() > 15.0 {
                     self.head_stable_time = 0;
                     self.last_stable_head_yaw = self.head_yaw;
-                    self.body_yaw = rotate_if_necessary(self.body_yaw, self.head_yaw, 75.0);
+                    self.body_yaw = rotate_if_necessary(self.body_yaw, self.head_yaw, max);
                 } else {
                     self.head_stable_time += 1;
                     if self.head_stable_time > 10 {
                         let t = ((self.head_stable_time - 10) as f32 / 10.0).clamp(0.0, 1.0);
                         self.body_yaw =
-                            rotate_if_necessary(self.body_yaw, self.head_yaw, 75.0 * (1.0 - t));
+                            rotate_if_necessary(self.body_yaw, self.head_yaw, max * (1.0 - t));
                     }
                 }
             }
@@ -1937,6 +2260,25 @@ impl Tracked {
             // `IronGolem.aiStep`, and `Hoglin` and `Zoglin`'s.
             MobType::IronGolem | MobType::Hoglin | MobType::Zoglin => {
                 a.golem_attack = (a.golem_attack - 1).max(0)
+            }
+            // `Ravager.aiStep`: its roar, bite and stun run down, and it roars as it
+            // recovers.
+            MobType::Ravager => {
+                a.roar = (a.roar - 1).max(0);
+                a.golem_attack = (a.golem_attack - 1).max(0);
+                if a.stun > 0 {
+                    a.stun -= 1;
+                    if a.stun == 0 {
+                        a.roar = 20;
+                    }
+                }
+            }
+            MobType::Pillager => {
+                let charging = matches!(
+                    self.data.get(&PILLAGER_CHARGING),
+                    Some(DataValue::Bool(true))
+                );
+                a.crossbow = if charging { a.crossbow + 1 } else { 0 };
             }
             // How long it's been charging its crossbow, for `getTicksUsingItem`.
             MobType::Piglin => {
@@ -2104,6 +2446,161 @@ impl Tracked {
                     }
                 }
             }
+            // `Breeze.tick`: it long jumps while that's its pose, idles all the time, and
+            // slides back once it stops sliding.
+            MobType::Breeze => {
+                let age = i64::from(self.age);
+                let pose = match self.data.get(&POSE) {
+                    Some(DataValue::Int(p)) => *p,
+                    _ => 0,
+                };
+                if pose == 6 {
+                    a.started[5].get_or_insert(age);
+                }
+                a.started[0].get_or_insert(age);
+                if pose != 15 && a.started[2].is_some() {
+                    a.started[3] = Some(age);
+                    a.started[2] = None;
+                }
+            }
+            // `Axolotl.tick` on the client: a baby runs one of its animations at a time
+            // (`soloAnimation`), an adult eases between playing dead, being in water, on the
+            // ground and moving.
+            MobType::Axolotl => {
+                let block = self.now.pos.floor().as_ivec3();
+                let in_water = mc_physics::fluid::fluid_at(world, blocks, block.to_array())
+                    .is_some_and(|f| f.kind == mc_physics::fluid::FluidKind::Water);
+                let dead = matches!(
+                    self.data.get(&AXOLOTL_PLAYING_DEAD),
+                    Some(DataValue::Bool(true))
+                );
+                let ground = self.on_ground;
+                let moving = self.walk_speed > 1.0e-5
+                    || self.now.pitch != self.old.pitch
+                    || self.now.yaw != self.old.yaw;
+                let baby = matches!(self.data.get(&16), Some(DataValue::Bool(true)));
+                if baby {
+                    let solo = if dead {
+                        6
+                    } else if moving {
+                        match (in_water, ground) {
+                            (true, false) => 0,
+                            (false, true) => 1,
+                            _ => 2,
+                        }
+                    } else if in_water && !ground {
+                        3
+                    } else if in_water {
+                        4
+                    } else {
+                        5
+                    };
+                    for (i, s) in a.started.iter_mut().enumerate() {
+                        if i == solo {
+                            s.get_or_insert(i64::from(self.age));
+                        } else {
+                            *s = None;
+                        }
+                    }
+                } else {
+                    let water = !dead && in_water;
+                    let on_ground = !dead && !in_water && ground;
+                    for (ticks, active) in
+                        a.axolotl.iter_mut().zip([dead, water, on_ground, moving])
+                    {
+                        ticks[0] = ticks[1];
+                        ticks[1] = if active {
+                            (ticks[1] + 1).min(10)
+                        } else {
+                            ticks[1].saturating_sub(1)
+                        };
+                    }
+                }
+            }
+            // `CopperGolem.setupAnimationStates`, unless it has no AI (`Mob` flag 1): idle,
+            // its head spins every 200 to 239 ticks; otherwise the state's own chest
+            // interaction runs, the rest stopped.
+            MobType::CopperGolem => {
+                let no_ai =
+                    matches!(self.data.get(&MOB_FLAGS), Some(DataValue::Byte(f)) if f & 1 != 0);
+                if no_ai {
+                    return;
+                }
+                let age = i64::from(self.age);
+                let state = match self.data.get(&COPPER_GOLEM_STATE) {
+                    Some(DataValue::Int(s @ 1..=4)) => *s as usize,
+                    _ => 0,
+                };
+                for (slot, s) in a.started.iter_mut().enumerate().take(5).skip(1) {
+                    if slot != state {
+                        *s = None;
+                    }
+                }
+                if state == 0 {
+                    if a.idle_start == self.age {
+                        a.started[0] = Some(age);
+                    } else if a.idle_start == 0 {
+                        a.idle_start = self.age + 200 + a.next_int(40) as u32;
+                    }
+                    if self.age == a.idle_start + 10 {
+                        a.idle_start = 0;
+                    }
+                } else {
+                    a.started[0] = None;
+                    a.idle_start = 0;
+                    a.started[state].get_or_insert(age);
+                }
+            }
+            // `Creaking.aiStep`'s countdowns, then `tick`'s `setupAnimationStates` and
+            // `checkEyeBlink`: its eyes flicker faster and faster as it's torn down.
+            MobType::Creaking => {
+                let age = i64::from(self.age);
+                a.creaking_invulnerable = (a.creaking_invulnerable - 1).max(0);
+                a.creaking_attack = (a.creaking_attack - 1).max(0);
+                let tearing = matches!(
+                    self.data.get(&CREAKING_TEARING_DOWN),
+                    Some(DataValue::Bool(true))
+                );
+                for (slot, on) in [
+                    (0, a.creaking_attack > 0),
+                    (1, a.creaking_invulnerable > 0),
+                    (2, tearing),
+                ] {
+                    if on {
+                        a.started[slot].get_or_insert(age);
+                    } else {
+                        a.started[slot] = None;
+                    }
+                }
+                let death = self.death_time;
+                if death > a.next_flicker {
+                    // `nextIntBetweenInclusive`.
+                    let (lo, hi) = if a.eyes_glowing {
+                        (2, 8)
+                    } else {
+                        (death / 4, death / 2)
+                    };
+                    a.next_flicker = death + lo + a.next_int(hi - lo + 1) as u32;
+                    a.eyes_glowing = !a.eyes_glowing;
+                }
+            }
+            // `Warden.tick` on the client: its heart beats every 40 ticks, down to every 10
+            // as its anger (`CLIENT_ANGER_LEVEL`) climbs to `AngerLevel.ANGRY`'s 80; the
+            // beat and the tendrils' twitch fade over 10 ticks.
+            MobType::Warden => {
+                let anger = match self.data.get(&WARDEN_ANGER) {
+                    Some(DataValue::Int(a)) => *a as f32,
+                    _ => 0.0,
+                };
+                let delay = 40 - ((anger / 80.0).clamp(0.0, 1.0) * 30.0).floor() as u32;
+                if self.age.is_multiple_of(delay) {
+                    a.heart[1] = 10.0;
+                }
+                for v in [&mut a.tendril, &mut a.heart] {
+                    v[0] = v[1];
+                    v[1] = (v[1] - 1.0).max(0.0);
+                }
+            }
             // `Armadillo.setupAnimationStates`, then `inStateTicks++`.
             MobType::Armadillo => {
                 let age = i64::from(self.age);
@@ -2254,6 +2751,107 @@ impl Tracked {
         }
     }
 
+    /// `EvokerFangs.tick` on the client: once they've bitten, their life runs down, and
+    /// eight ticks in they throw up a dozen sparks.
+    fn tick_fangs(&mut self, particles: &mut crate::particles::Particles) {
+        let Some(life) = &mut self.anim.fangs_life else {
+            return;
+        };
+        *life -= 1;
+        if *life != 14 {
+            return;
+        }
+        let width = f64::from(self.size(false)[0]);
+        for _ in 0..12 {
+            let mut r = || f64::from(particles.random()) * 2.0 - 1.0;
+            let (x, z) = (r() * width * 0.5, r() * width * 0.5);
+            let (xd, zd) = (r() * 0.3, r() * 0.3);
+            let y = 0.05 + f64::from(particles.random());
+            let yd = 0.3 + f64::from(particles.random()) * 0.3;
+            let at = self.now.pos + DVec3::new(x, y + 1.0, z);
+            if particles.allowed(false, false) {
+                particles.crit(crate::particles::Kind::Crit, at, DVec3::new(xd, yd, zd));
+            }
+        }
+    }
+
+    /// `Illusioner.aiStep` on the client: while it's invisible, its four copies scatter
+    /// afresh in a puff of clouds as its hurt flash ends and once a minute, and gather back
+    /// into it as it's hit, over three ticks each time.
+    fn tick_illusions(
+        &mut self,
+        particles: &mut crate::particles::Particles,
+        sounds: &mut Vec<(&'static str, DVec3, f32)>,
+    ) {
+        if self.sort != Sort::Mob(MobType::Illusioner) || !self.invisible() {
+            return;
+        }
+        let a = &mut self.anim;
+        a.illusion_ticks = (a.illusion_ticks - 1).max(0);
+        if self.hurt_time == 1 || self.age.is_multiple_of(1200) {
+            a.illusion_ticks = 3;
+            for i in 0..4 {
+                a.illusions[0][i] = a.illusions[1][i];
+                let x = (-6.0 + a.next_int(13) as f64) * 0.5;
+                let y = (a.next_int(6) - 4).max(0) as f64;
+                let z = (-6.0 + a.next_int(13) as f64) * 0.5;
+                a.illusions[1][i] = DVec3::new(x, y, z);
+            }
+            let [width, height] = self.size(false).map(f64::from);
+            for _ in 0..16 {
+                // `getRandomX(0.5)`, `getRandomY()` and `getZ(0.5)`, which isn't random.
+                let x = (2.0 * f64::from(particles.random()) - 1.0) * width * 0.5;
+                let y = height * f64::from(particles.random());
+                let at = self.now.pos + DVec3::new(x, y, width * 0.5);
+                if particles.allowed(false, false) {
+                    particles.cloud(at, DVec3::ZERO);
+                }
+            }
+            sounds.push(("minecraft:entity.illusioner.mirror_move", self.now.pos, 1.0));
+        } else if self.hurt_time == 9 {
+            a.illusion_ticks = 3;
+            a.illusions[0] = a.illusions[1];
+            a.illusions[1] = [DVec3::ZERO; 4];
+        }
+    }
+
+    /// `Entity.isInvisible`: shared flag 5.
+    fn invisible(&self) -> bool {
+        matches!(self.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 0x20 != 0)
+    }
+
+    /// `SpellcasterIllager.tick` on the client: while it casts, a swirl of its spell's
+    /// colour at each raised hand.
+    fn tick_spell(&mut self, particles: &mut crate::particles::Particles) {
+        if !matches!(self.sort, Sort::Mob(MobType::Evoker | MobType::Illusioner)) {
+            return;
+        }
+        let spell = match self.data.get(&SPELL) {
+            Some(DataValue::Byte(b)) => *b,
+            _ => 0,
+        };
+        // `IllagerSpell`'s colours, by id.
+        let rgb = match spell {
+            1 => [0.7, 0.7, 0.8],
+            2 => [0.4, 0.3, 0.35],
+            3 => [0.7, 0.5, 0.2],
+            4 => [0.3, 0.3, 0.8],
+            5 => [0.1, 0.1, 0.2],
+            _ => return,
+        };
+        let argb = rgb
+            .iter()
+            .fold(0xffu32, |c, v| c << 8 | ((*v as f32) * 255.0) as u32);
+        let angle = self.body_yaw.to_radians() + (self.age as f32 * 0.6662).cos() * 0.25;
+        let (sin, cos) = (f64::from(angle.sin()), f64::from(angle.cos()));
+        for sign in [1.0, -1.0] {
+            let at = self.now.pos + DVec3::new(sign * cos * 0.6, 1.8, sign * sin * 0.6);
+            if particles.allowed(false, false) {
+                particles.effect(at, DVec3::ZERO, argb);
+            }
+        }
+    }
+
     /// The item a thrown item shows: the server's, or its type's own.
     fn item_shown(&self) -> String {
         match (self.data.get(&ITEM), self.sort) {
@@ -2316,6 +2914,19 @@ impl Tracked {
                     pitch: lerp(self.old.pitch, self.now.pitch),
                     shake: self.shake as f32 - pt,
                     texture,
+                }));
+            }
+            // `EvokerFangs.getAnimationProgress`.
+            Sort::Fangs => {
+                let bite = match self.anim.fangs_life {
+                    None => 0.0,
+                    Some(life) if life - 2 <= 0 => 1.0,
+                    Some(life) => 1.0 - ((life - 2) as f32 - pt) / 20.0,
+                };
+                return Some(Entity::Fangs(mc_render::entity::Fangs {
+                    pos,
+                    yaw: self.now.yaw,
+                    bite,
                 }));
             }
             Sort::Thrown { .. } => {
@@ -2796,7 +3407,8 @@ impl Tracked {
                         true => mc_render::entity::CAMEL_BABY,
                         false => mc_render::entity::CAMEL,
                     };
-                    (Kind::Camel { anims: since }, texture.into())
+                    let anims = std::array::from_fn(|i| since[i]);
+                    (Kind::Camel { anims }, texture.into())
                 }
                 // `ArmadilloRenderer`, with `Armadillo.ArmadilloState.shouldHideInShell`.
                 MobType::Armadillo => {
@@ -2817,9 +3429,237 @@ impl Tracked {
                     };
                     (kind, texture.into())
                 }
+                // `AxolotlRenderer`: its variant's texture, and the animators' factors eased
+                // `IN_OUT_SINE`.
+                MobType::Axolotl => {
+                    let factors = self.anim.axolotl.map(|[old, now]| {
+                        let x = (f32::from(old) + (f32::from(now) - f32::from(old)) * pt) / 10.0;
+                        -((std::f32::consts::PI * x).cos() - 1.0) / 2.0
+                    });
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let variant = match self.data.get(&AXOLOTL_VARIANT) {
+                        Some(DataValue::Int(v @ 0..=4)) => *v as usize,
+                        _ => 0,
+                    };
+                    let name = mc_render::entity::AXOLOTL_VARIANTS[variant];
+                    let baby = if self.baby() { "_baby" } else { "" };
+                    (
+                        Kind::Axolotl {
+                            factors,
+                            anims: since,
+                        },
+                        format!("minecraft:entity/axolotl/axolotl_{name}{baby}"),
+                    )
+                }
+                // `NautilusRenderer.getTextureLocation`.
+                MobType::Nautilus => {
+                    let texture = match self.baby() {
+                        true => "minecraft:entity/nautilus/nautilus_baby",
+                        false => "minecraft:entity/nautilus/nautilus",
+                    };
+                    let kind = Kind::Nautilus {
+                        zombie: false,
+                        corals: false,
+                    };
+                    (kind, texture.into())
+                }
+                // `ZombieNautilusRenderer`: the warm variant has corals on its shell, unless it
+                // wears armour (in `EquipmentSlot.BODY`, 6).
+                MobType::ZombieNautilus => {
+                    let warm = matches!(
+                        self.data.get(&ZOMBIE_NAUTILUS_VARIANT),
+                        Some(DataValue::Variant(v)) if v == "minecraft:warm"
+                    );
+                    let kind = Kind::Nautilus {
+                        zombie: true,
+                        corals: warm && !self.equipment.contains_key(&6),
+                    };
+                    let texture = match warm {
+                        true => "minecraft:entity/nautilus/zombie_nautilus_coral",
+                        false => "minecraft:entity/nautilus/zombie_nautilus",
+                    };
+                    (kind, texture.into())
+                }
+                // `CopperGolemRenderer.getTextureLocation`: its oxidation level's texture.
+                MobType::CopperGolem => {
+                    let level = match self.data.get(&COPPER_WEATHER) {
+                        Some(DataValue::Int(1)) => "_exposed",
+                        Some(DataValue::Int(2)) => "_weathered",
+                        Some(DataValue::Int(3)) => "_oxidized",
+                        _ => "",
+                    };
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let kind = Kind::CopperGolem {
+                        anims: std::array::from_fn(|i| since[i]),
+                    };
+                    (kind, format!("{}{level}", mc_render::entity::COPPER_GOLEM))
+                }
+                MobType::Breeze => {
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let anims = std::array::from_fn(|i| since[i]);
+                    (Kind::Breeze { anims }, mc_render::entity::BREEZE.into())
+                }
+                // `CreakingRenderer.extractRenderState`: torn down, its eyes flicker;
+                // otherwise they glow while it's active.
+                MobType::Creaking => {
+                    let flag = |i: u8| matches!(self.data.get(&i), Some(DataValue::Bool(true)));
+                    let eyes = if flag(CREAKING_TEARING_DOWN) {
+                        self.anim.eyes_glowing
+                    } else {
+                        flag(CREAKING_ACTIVE)
+                    };
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let kind = Kind::Creaking {
+                        can_move: flag(CREAKING_CAN_MOVE),
+                        eyes,
+                        anims: [since[0], since[1], since[2]],
+                    };
+                    (kind, mc_render::entity::CREAKING.into())
+                }
+                // `WardenRenderer.extractRenderState`.
+                MobType::Warden => {
+                    let lerp = |v: [f32; 2]| (v[0] + (v[1] - v[0]) * pt) / 10.0;
+                    let kind = Kind::Warden {
+                        tendril: lerp(self.anim.tendril),
+                        heart: lerp(self.anim.heart),
+                        anims: std::array::from_fn(|i| {
+                            self.anim.started[i].map(|s| age - s as f32)
+                        }),
+                    };
+                    (kind, mc_render::entity::WARDEN.into())
+                }
+                // `SnifferRenderer`.
+                MobType::Sniffer => {
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let searching =
+                        matches!(self.data.get(&MONSTER_STATE), Some(DataValue::Int(4)));
+                    let texture = match self.baby() {
+                        true => mc_render::entity::SNIFFLET,
+                        false => mc_render::entity::SNIFFER,
+                    };
+                    (
+                        Kind::Sniffer {
+                            searching,
+                            anims: std::array::from_fn(|i| since[i]),
+                        },
+                        texture.into(),
+                    )
+                }
                 MobType::Creeper => (Kind::Creeper, mc_render::entity::CREEPER.into()),
                 MobType::Spider => (Kind::Spider, mc_render::entity::SPIDER.into()),
                 MobType::Cow => (Kind::Cow, variant(VARIANT, "cow")),
+                // `Pillager`, `Vindicator`, `SpellcasterIllager` and `Illusioner.getArmPose`,
+                // and whether each renderer's `ItemInHandLayer` draws.
+                MobType::Pillager | MobType::Vindicator | MobType::Evoker | MobType::Illusioner => {
+                    use mc_render::entity::IllagerPose;
+                    let casting =
+                        matches!(self.data.get(&SPELL), Some(DataValue::Byte(b)) if *b > 0);
+                    let celebrating = flag(RAIDER_CELEBRATING);
+                    let holding = |item: &str| {
+                        [0, 1]
+                            .iter()
+                            .any(|s| self.equipment.get(s).is_some_and(|e| e.item == item))
+                    };
+                    let (pose, items, texture) = match mob {
+                        MobType::Pillager => {
+                            let pose = if flag(PILLAGER_CHARGING) {
+                                let ticks = self.anim.crossbow as f32 + pt;
+                                IllagerPose::CrossbowCharge(ticks.clamp(0.0, 25.0) / 25.0)
+                            } else if holding("minecraft:crossbow") {
+                                IllagerPose::CrossbowHold
+                            } else if aggressive {
+                                IllagerPose::Attacking
+                            } else {
+                                IllagerPose::Neutral
+                            };
+                            (pose, true, mc_render::entity::PILLAGER)
+                        }
+                        MobType::Vindicator => {
+                            let pose = if aggressive {
+                                IllagerPose::Attacking
+                            } else if celebrating {
+                                IllagerPose::Celebrating
+                            } else {
+                                IllagerPose::Crossed
+                            };
+                            (pose, aggressive, mc_render::entity::VINDICATOR)
+                        }
+                        MobType::Evoker => {
+                            let pose = if casting {
+                                IllagerPose::Spellcasting
+                            } else if celebrating {
+                                IllagerPose::Celebrating
+                            } else {
+                                IllagerPose::Crossed
+                            };
+                            (pose, casting, mc_render::entity::EVOKER)
+                        }
+                        _ => {
+                            let pose = if casting {
+                                IllagerPose::Spellcasting
+                            } else if aggressive {
+                                IllagerPose::BowAndArrow
+                            } else {
+                                IllagerPose::Crossed
+                            };
+                            (pose, casting || aggressive, mc_render::entity::ILLUSIONER)
+                        }
+                    };
+                    let hat = mob == MobType::Illusioner;
+                    // `Illusioner.getIllusionOffsets`, each copy bobbing on its own
+                    // (`IllusionerRenderer.submit`).
+                    let illusions = (hat && self.invisible()).then(|| {
+                        let a = &self.anim;
+                        let scale = if a.illusion_ticks > 0 {
+                            ((a.illusion_ticks as f32 - pt) / 3.0).powf(0.25)
+                        } else {
+                            0.0
+                        };
+                        std::array::from_fn(|i| {
+                            let at = a.illusions[1][i].as_vec3() * (1.0 - scale)
+                                + a.illusions[0][i].as_vec3() * scale;
+                            let f = i as f32;
+                            at + glam::Vec3::new(
+                                (f + age * 0.5).cos() * 0.025,
+                                (f + age * 0.75).cos() * 0.0125,
+                                (f + age * 0.7).cos() * 0.025,
+                            )
+                        })
+                    });
+                    let kind = Kind::Illager {
+                        pose,
+                        hat,
+                        items,
+                        illusions,
+                    };
+                    (kind, texture.into())
+                }
+                // `RavagerRenderer.extractRenderState`.
+                MobType::Ravager => {
+                    let a = &self.anim;
+                    let left = |t: i32| if t > 0 { t as f32 - pt } else { 0.0 };
+                    let roar = if a.roar > 0 {
+                        (20 - a.roar) as f32 + pt
+                    } else {
+                        0.0
+                    } / 20.0;
+                    let kind = Kind::Ravager {
+                        attack: left(a.golem_attack),
+                        stunned: left(a.stun),
+                        roar,
+                    };
+                    (kind, mc_render::entity::RAVAGER.into())
+                }
+                // `Vex.isCharging`: bit 1 of its flags.
+                MobType::Vex => {
+                    let charging = matches!(self.data.get(&MONSTER_DATA), Some(DataValue::Byte(f)) if f & 1 != 0);
+                    let texture = if charging {
+                        mc_render::entity::VEX_CHARGING
+                    } else {
+                        mc_render::entity::VEX
+                    };
+                    (Kind::Vex { charging }, texture.into())
+                }
                 MobType::Pig => (Kind::Pig, variant(PIG_VARIANT, "pig")),
                 MobType::Chicken => (Kind::Chicken, variant(VARIANT, "chicken")),
                 MobType::Sheep => {
@@ -2835,7 +3675,7 @@ impl Tracked {
                     (kind, mc_render::entity::SHEEP.into())
                 }
             },
-            Sort::Item | Sort::Arrow { .. } | Sort::Thrown { .. } => {
+            Sort::Item | Sort::Arrow { .. } | Sort::Thrown { .. } | Sort::Fangs => {
                 unreachable!("handled above")
             }
         };
@@ -2864,14 +3704,17 @@ impl Tracked {
             equipment: self.equipment(armor, uses, pt),
             swing: self.swing(pt),
             burning: self.burning(self.baby()),
-            // `hasRedOverlay`.
-            hurt: self.hurt_time > 0 || self.death_time > 0,
-            death_time: if self.death_time > 0 {
+            // `hasRedOverlay`; a creaking that's torn down neither flashes nor falls over.
+            hurt: (self.hurt_time > 0 || self.death_time > 0) && !self.torn_down(),
+            death_time: if self.death_time > 0 && !self.torn_down() {
                 self.death_time as f32 + pt
             } else {
                 0.0
             },
             layers,
+            // `IllusionerRenderer.isBodyVisible`: always, so its copies show.
+            invisible: self.invisible() && self.sort != Sort::Mob(MobType::Illusioner),
+            invisible_to_player: self.invisible() && !all.spectator,
         }))
     }
 
@@ -2952,6 +3795,42 @@ impl Tracked {
                 }
                 (Sort::Mob(MobType::Armadillo), MONSTER_STATE, _) if changed => {
                     self.anim.in_state = 0
+                }
+                // `Warden.onSyncedDataUpdated`: emerging, digging, roaring and sniffing
+                // (re)start their animations.
+                (Sort::Mob(MobType::Warden), POSE, DataValue::Int(pose)) => {
+                    let slot = match pose {
+                        13 => 3,
+                        14 => 2,
+                        11 => 4,
+                        12 => 5,
+                        _ => continue,
+                    };
+                    self.anim.started[slot] = Some(i64::from(self.age));
+                }
+                // `Breeze.onSyncedDataUpdated`: `resetAnimations` (all but sliding and
+                // sliding back), then shooting, inhaling or sliding starts its own.
+                (Sort::Mob(MobType::Breeze), POSE, DataValue::Int(pose)) => {
+                    let age = i64::from(self.age);
+                    let a = &mut self.anim.started;
+                    for slot in [0, 1, 4, 5] {
+                        a[slot] = None;
+                    }
+                    match pose {
+                        16 => _ = a[1].get_or_insert(age),
+                        17 => _ = a[4].get_or_insert(age),
+                        15 => _ = a[2].get_or_insert(age),
+                        _ => {}
+                    }
+                }
+                // `Sniffer.onSyncedDataUpdated`: `resetAnimations`, then the new state's
+                // own: digging, sniffing (the long sniff), rising, feeling happy and
+                // scenting (the sniff sniff).
+                (Sort::Mob(MobType::Sniffer), MONSTER_STATE, DataValue::Int(state)) => {
+                    let age = i64::from(self.age);
+                    for (slot, wanted) in [(0, 5), (1, 3), (2, 6), (3, 1), (4, 2)] {
+                        self.anim.started[slot] = (*state == wanted).then_some(age);
+                    }
                 }
                 _ => {}
             }
@@ -3056,7 +3935,9 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            hostile_sounds: Vec::new(),
             game_time: 0,
+            spectator: false,
         };
         for (id, x) in [(1, 5.0), (2, 2.5), (3, -2.0)] {
             e.event(Event::AddEntity {
@@ -3102,7 +3983,9 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            hostile_sounds: Vec::new(),
             game_time: 0,
+            spectator: false,
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -3201,7 +4084,9 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            hostile_sounds: Vec::new(),
             game_time: 0,
+            spectator: false,
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -3258,7 +4143,9 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            hostile_sounds: Vec::new(),
             game_time: 0,
+            spectator: false,
         };
         e.event(Event::AddEntity {
             id: 1,

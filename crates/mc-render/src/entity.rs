@@ -97,11 +97,35 @@ pub fn sprites() -> Vec<String> {
         CAMEL_BABY,
         ARMADILLO,
         ARMADILLO_BABY,
+        SNIFFER,
+        SNIFFLET,
+        WARDEN,
+        WARDEN_BIOLUMINESCENT,
+        WARDEN_HEART,
+        WARDEN_PULSATING_SPOTS_1,
+        WARDEN_PULSATING_SPOTS_2,
+        CREAKING,
+        CREAKING_EYES,
+        BREEZE,
+        BREEZE_WIND,
+        BREEZE_EYES,
+        "minecraft:entity/nautilus/nautilus",
+        "minecraft:entity/nautilus/nautilus_baby",
+        "minecraft:entity/nautilus/zombie_nautilus",
+        "minecraft:entity/nautilus/zombie_nautilus_coral",
         "minecraft:entity/frog/frog_temperate",
         "minecraft:entity/frog/frog_warm",
         "minecraft:entity/frog/frog_cold",
         "minecraft:entity/rabbit/rabbit_toast",
         "minecraft:entity/rabbit/rabbit_toast_baby",
+        PILLAGER,
+        VINDICATOR,
+        EVOKER,
+        ILLUSIONER,
+        VEX,
+        VEX_CHARGING,
+        RAVAGER,
+        EVOKER_FANGS,
     ]
     .map(str::to_owned)
     .into();
@@ -129,6 +153,15 @@ pub fn sprites() -> Vec<String> {
         }
         for l in VILLAGER_LEVELS {
             out.push(format!("minecraft:entity/{base}/profession_level/{l}"));
+        }
+    }
+    for v in AXOLOTL_VARIANTS {
+        out.push(format!("minecraft:entity/axolotl/axolotl_{v}"));
+        out.push(format!("minecraft:entity/axolotl/axolotl_{v}_baby"));
+    }
+    for level in ["", "_exposed", "_weathered", "_oxidized"] {
+        for eyes in ["", "_eyes"] {
+            out.push(format!("{COPPER_GOLEM}{eyes}{level}"));
         }
     }
     for level in ["low", "medium", "high"] {
@@ -294,6 +327,14 @@ pub const ENDERMITE: &str = "minecraft:entity/endermite/endermite";
 pub const POLAR_BEAR: &str = "minecraft:entity/bear/polarbear";
 pub const GOAT: &str = "minecraft:entity/goat/goat";
 pub const PIGLIN: &str = "minecraft:entity/piglin/piglin";
+pub const PILLAGER: &str = "minecraft:entity/illager/pillager";
+pub const VINDICATOR: &str = "minecraft:entity/illager/vindicator";
+pub const EVOKER: &str = "minecraft:entity/illager/evoker";
+pub const ILLUSIONER: &str = "minecraft:entity/illager/illusioner";
+pub const VEX: &str = "minecraft:entity/illager/vex";
+pub const VEX_CHARGING: &str = "minecraft:entity/illager/vex_charging";
+pub const RAVAGER: &str = "minecraft:entity/illager/ravager";
+const EVOKER_FANGS: &str = "minecraft:entity/illager/evoker_fangs";
 pub const PIGLIN_BRUTE: &str = "minecraft:entity/piglin/piglin_brute";
 pub const PIGLIN_BABY: &str = "minecraft:entity/piglin/piglin_baby";
 pub const ZOMBIFIED_PIGLIN: &str = "minecraft:entity/piglin/zombified_piglin";
@@ -315,6 +356,23 @@ pub const CAMEL: &str = "minecraft:entity/camel/camel";
 pub const CAMEL_BABY: &str = "minecraft:entity/camel/camel_baby";
 pub const ARMADILLO: &str = "minecraft:entity/armadillo/armadillo";
 pub const ARMADILLO_BABY: &str = "minecraft:entity/armadillo/armadillo_baby";
+pub const SNIFFER: &str = "minecraft:entity/sniffer/sniffer";
+pub const SNIFFLET: &str = "minecraft:entity/sniffer/snifflet";
+pub const WARDEN: &str = "minecraft:entity/warden/warden";
+pub const CREAKING: &str = "minecraft:entity/creaking/creaking";
+pub const BREEZE: &str = "minecraft:entity/breeze/breeze";
+/// `Axolotl.Variant`'s names, by id.
+pub const AXOLOTL_VARIANTS: [&str; 5] = ["lucy", "wild", "gold", "cyan", "blue"];
+/// The unweathered copper golem; the others add `_exposed`, `_weathered` or `_oxidized`,
+/// and their eyes `_eyes` before that.
+pub const COPPER_GOLEM: &str = "minecraft:entity/copper_golem/copper_golem";
+const BREEZE_WIND: &str = "minecraft:entity/breeze/breeze_wind";
+const BREEZE_EYES: &str = "minecraft:entity/breeze/breeze_eyes";
+const CREAKING_EYES: &str = "minecraft:entity/creaking/creaking_eyes";
+const WARDEN_BIOLUMINESCENT: &str = "minecraft:entity/warden/warden_bioluminescent_layer";
+const WARDEN_HEART: &str = "minecraft:entity/warden/warden_heart";
+const WARDEN_PULSATING_SPOTS_1: &str = "minecraft:entity/warden/warden_pulsating_spots_1";
+const WARDEN_PULSATING_SPOTS_2: &str = "minecraft:entity/warden/warden_pulsating_spots_2";
 /// `Rabbit.Variant`'s textures (`RabbitRenderer.RABBIT_LOCATIONS`), by id: 0 to 5, then
 /// `EVIL` (99), the killer bunny.
 pub const RABBIT_VARIANTS: [&str; 7] = [
@@ -517,6 +575,92 @@ pub enum Kind {
         hiding: bool,
         anims: [Option<f32>; 3],
     },
+    /// `SnifferModel` on the adult's or the snifflet's layer: whether it's searching
+    /// (`isSearching`), and ticks since its dig, long sniff, stand up, happy and sniff
+    /// sniff animations started, while they run.
+    Sniffer {
+        searching: bool,
+        anims: [Option<f32>; 5],
+    },
+    /// `WardenModel`: how far its tendrils and heart are through a twitch and a beat, 1
+    /// to 0 (`getTendrilAnimation`, `getHeartAnimation`), and ticks since its attack,
+    /// sonic boom, dig, emerge, roar and sniff animations started, while they run.
+    Warden {
+        tendril: f32,
+        heart: f32,
+        anims: [Option<f32>; 6],
+    },
+    /// `CreakingModel`: whether it can move (`canMove`), so walks; whether its eyes glow;
+    /// and ticks since its attack, invulnerability and death animations started, while
+    /// they run.
+    Creaking {
+        can_move: bool,
+        eyes: bool,
+        anims: [Option<f32>; 3],
+    },
+    /// `BreezeModel`: ticks since its idle, shoot, slide, slide back, inhale and long
+    /// jump animations started, while they run.
+    Breeze {
+        anims: [Option<f32>; 6],
+    },
+    /// `CopperGolemModel`: ticks since its idle head spin and its four chest
+    /// interactions (getting an item or not, dropping one or not) started, while they
+    /// run.
+    CopperGolem {
+        anims: [Option<f32>; 5],
+    },
+    /// `NautilusModel` on a nautilus's adult or baby layer, or a zombie nautilus's
+    /// (`ZombieNautilusRenderer`), with corals on its shell while it's the warm variant
+    /// wearing no armour (`ZombieNautilusCoralModel`).
+    Nautilus {
+        zombie: bool,
+        corals: bool,
+    },
+    /// `AdultAxolotlModel`: how far it's playing dead, in water, on the ground and moving
+    /// (its `BinaryAnimator`s' eased factors, 0 to 1). `BabyAxolotlModel`: ticks since
+    /// its swim, walk, walk under water, idle under water, idle on the ground under
+    /// water, idle on the ground and play dead animations started, while they run.
+    Axolotl {
+        factors: [f32; 4],
+        anims: [Option<f32>; 7],
+    },
+    /// `IllagerModel` (pillagers, vindicators, evokers and illusioners): its arms'
+    /// `IllagerArmPose`, whether its hat shows (an illusioner's), and whether it draws the
+    /// items it holds (`ItemInHandLayer`, which each renderer but the pillager's shows only
+    /// while it fights or casts). An invisible illusioner is drawn as four copies at
+    /// these offsets from it instead (`IllusionerRenderer.submit`).
+    Illager {
+        pose: IllagerPose,
+        hat: bool,
+        items: bool,
+        illusions: Option<[Vec3; 4]>,
+    },
+    /// `RavagerModel`: ticks left of its bite and of being stunned, to the frame, and how
+    /// far through its roar it is (`RavagerRenderState`).
+    Ravager {
+        attack: f32,
+        stunned: f32,
+        roar: f32,
+    },
+    /// `VexModel`, see-through: charging, with its arms raised to strike.
+    Vex {
+        charging: bool,
+    },
+}
+
+/// `AbstractIllager.IllagerArmPose`: arms crossed, swinging as it walks, raised to fight,
+/// casting a spell, drawing a bow, holding or charging a crossbow (how far, 0 to 1), or
+/// cheering.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum IllagerPose {
+    Crossed,
+    Neutral,
+    Attacking,
+    Spellcasting,
+    BowAndArrow,
+    CrossbowHold,
+    CrossbowCharge(f32),
+    Celebrating,
 }
 
 /// `PiglinArmPose`, as far as it's posed: dancing, holding a melee weapon high while
@@ -578,6 +722,13 @@ pub struct Living {
     /// More textures drawn over the body on the same model: a villager's type, profession
     /// and level (`VillagerProfessionLayer`).
     pub layers: Vec<String>,
+    /// `isInvisible`, unless its renderer draws its body anyway (`isBodyVisible`): the
+    /// body and most layers aren't drawn, though glowing eyes, armour, held items and
+    /// flames still are.
+    pub invisible: bool,
+    /// Whether the player can't see it, invisible as it is (`isInvisibleToPlayer`); a
+    /// spectator can, and sees its body faintly.
+    pub invisible_to_player: bool,
 }
 
 /// What a humanoid wears and holds (`HumanoidRenderState`'s equipment and hand items).
@@ -743,6 +894,18 @@ pub enum Entity {
     Item(Dropped),
     Arrow(Arrow),
     Thrown(Thrown),
+    Fangs(Fangs),
+}
+
+/// An evoker's fangs (`EvokerFangsRenderState`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fangs {
+    pub pos: Vec3,
+    /// `yRot`, in degrees.
+    pub yaw: f32,
+    /// How far through its bite it is, 0 (not started, so not drawn) to 1
+    /// (`getAnimationProgress`).
+    pub bite: f32,
 }
 
 /// An arrow (`ArrowRenderState`), already interpolated to the frame.
@@ -780,6 +943,9 @@ pub struct Meshes {
     /// Glowing layers such as spiders' eyes (`RenderTypes.eyes`), to blend over them at
     /// full brightness without writing depth.
     pub eyes: Vec<Vertex>,
+    /// Translucent layers that write depth where they show, such as a breeze's wind
+    /// (`RenderPipelines.BREEZE_WIND`, `ALPHA_CUTOUT` 0.1), drawn before the glowing ones.
+    pub translucent: Vec<Vertex>,
     /// Name tags' backgrounds and faint text (`DisplayMode.SEE_THROUGH`), to blend over
     /// everything drawn so far, walls included, without testing depth.
     pub see_through: Vec<Vertex>,
@@ -825,16 +991,47 @@ pub fn vertices(
                 } else {
                     l
                 };
-                living(models, l, *light, camera.eye, &mut out);
-                equipment(models, l, *light, &mut out.cutout);
-                if let Some(tag) = l.name_tag.as_ref().filter(|_| name_tags) {
-                    crate::hud::name_tag(art, tag, l.pos, *light, camera, &mut out);
+                let mut draw = |l: &Living| {
+                    living(models, l, *light, camera.eye, &mut out);
+                    equipment(models, l, *light, &mut out.cutout);
+                    if let Some(tag) = l.name_tag.as_ref().filter(|_| name_tags) {
+                        crate::hud::name_tag(art, tag, l.pos, *light, camera, &mut out);
+                    }
+                };
+                match l.kind {
+                    Kind::Illager {
+                        illusions: Some(offsets),
+                        ..
+                    } => {
+                        for offset in offsets {
+                            draw(&Living {
+                                pos: l.pos + offset,
+                                ..l.clone()
+                            });
+                        }
+                    }
+                    _ => draw(l),
                 }
                 if let Some(size) = l.burning {
                     flames(fire, l.pos, size, camera.yaw, *light, &mut out.cutout);
                 }
             }
             Entity::Arrow(a) => arrow(atlas, a, camera, *light, &mut out.cutout),
+            Entity::Fangs(f) if f.bite > 0.0 => {
+                // `EvokerFangsRenderer.submit`.
+                let m = Mat4::from_rotation_y((90.0 - f.yaw).to_radians())
+                    * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
+                    * Mat4::from_translation(Vec3::new(0.0, -1.501, 0.0));
+                let mut b = Builder {
+                    quads: Vec::new(),
+                    sprite: atlas.sprite(EVOKER_FANGS),
+                    tex_size: [64.0, 32.0],
+                    tint: -1,
+                };
+                b.nodes(m, &evoker_fangs(f.bite));
+                emit(&b.quads, f.pos, [1.0; 3], *light, &mut out.cutout);
+            }
+            Entity::Fangs(_) => {}
             // `ThrowableProjectile.shouldRenderAtSqrDistance`: not in the thrower's face as
             // it leaves their hand.
             Entity::Thrown(t) if t.age < 2 && t.pos.distance_squared(camera.eye) < 12.25 => {}
@@ -929,7 +1126,8 @@ fn living_root_scaled(l: &Living, model_scale: Vec3) -> Mat4 {
 /// at half size. Vanilla 26.3 gives every baby its own; so far the piglin's (which a
 /// zombified piglin shares), the hoglin's (and zoglin's), the strider's, the zombie
 /// villager's, the fox's, the goat's, the polar bear's, the cat's (and ocelot's), the
-/// squid's, the rabbit's, the camel's and the armadillo's are here.
+/// squid's, the rabbit's, the camel's, the armadillo's, the sniffer's, the nautilus's and
+/// the axolotl's are here.
 fn baby_model(l: &Living) -> bool {
     l.baby
         && matches!(
@@ -948,6 +1146,9 @@ fn baby_model(l: &Living) -> bool {
                 | Kind::Rabbit { .. }
                 | Kind::Camel { .. }
                 | Kind::Armadillo { .. }
+                | Kind::Sniffer { .. }
+                | Kind::Nautilus { zombie: false, .. }
+                | Kind::Axolotl { .. }
         )
 }
 
@@ -1108,6 +1309,34 @@ fn living(
         Kind::Camel { anims } if l.baby => (baby_camel(l, anims), [64.0; 2], 1.0),
         Kind::Camel { anims } => (camel(l, anims), [128.0; 2], 1.0),
         Kind::Armadillo { hiding, anims } => (armadillo(l, hiding, anims), [64.0; 2], 1.0),
+        Kind::Sniffer { searching, anims } if l.baby => {
+            (sniffer(l, searching, anims), [128.0; 2], 1.0)
+        }
+        Kind::Sniffer { searching, anims } => (sniffer(l, searching, anims), [192.0; 2], 1.0),
+        Kind::Warden { tendril, anims, .. } => (warden(l, tendril, anims), [128.0; 2], 1.0),
+        Kind::Creaking {
+            can_move, anims, ..
+        } => (creaking(l, can_move, anims), [64.0; 2], 1.0),
+        // `BreezeModel.createBodyLayer` keeps its head (with its eyes) and rods; the wind
+        // is its own layer.
+        Kind::CopperGolem { anims } => (copper_golem(l, anims), [64.0; 2], 1.0),
+        Kind::Nautilus { zombie: false, .. } if l.baby => (nautilus(l, false), [64.0; 2], 1.0),
+        Kind::Nautilus { corals, .. } => (nautilus(l, corals), [128.0; 2], 1.0),
+        Kind::Axolotl { anims, .. } if l.baby => (baby_axolotl(l, anims), [32.0; 2], 1.0),
+        Kind::Axolotl { factors, .. } => (axolotl(l, factors), [64.0; 2], 1.0),
+        Kind::Breeze { anims } => {
+            let mut nodes = breeze(anims);
+            hide(&mut nodes, BREEZE_WIND_BODY);
+            (nodes, [32.0; 2], 1.0)
+        }
+        // `LayerDefinitions`' `villagerLikeScale`.
+        Kind::Illager { pose, hat, .. } => (illager(l, pose, hat), [64.0; 2], 0.9375),
+        Kind::Ravager {
+            attack,
+            stunned,
+            roar,
+        } => (ravager(l, attack, stunned, roar), [128.0; 2], 1.0),
+        Kind::Vex { charging } => (vex(l, charging), [32.0; 2], 1.0),
     };
     let root = match l.kind {
         // `AbstractCubeMobRenderer.scale`: `downscaleSlightly`, then the size, wider and
@@ -1178,7 +1407,23 @@ fn living(
             normal.dot(eye - (l.pos + q.pos[0])) > 0.0
         });
     }
-    emit(&b.quads, l.pos, [1.0; 3], light, &mut out.cutout);
+    if !l.invisible {
+        emit(&b.quads, l.pos, [1.0; 3], light, &mut out.cutout);
+    } else if !l.invisible_to_player {
+        // `forceTransparent`: `RenderTypes.entityTranslucentCull`, its faces turned away
+        // left out, at `0x26FFFFFF`, flashing red as it's hurt.
+        b.quads.retain(|q| {
+            let normal = (q.pos[1] - q.pos[0]).cross(q.pos[2] - q.pos[0]);
+            normal.dot(eye - (l.pos + q.pos[0])) > 0.0
+        });
+        let ghost = out.translucent.len();
+        emit(&b.quads, l.pos, [1.0; 3], light, &mut out.translucent);
+        let red = if l.hurt { crate::mesh::RED } else { 0 };
+        for v in &mut out.translucent[ghost..] {
+            v.color[3] = 0x26;
+            v.light[3] |= red;
+        }
+    }
     // A layer: the same or another model's parts, with another texture.
     let layer = |sprite: &str, nodes: &[Node]| {
         let mut b = Builder {
@@ -1201,6 +1446,22 @@ fn living(
                     light: [240, 240, 0, 0],
                 });
             }
+        }
+    };
+    // `LivingEntityEmissiveLayer` with `RenderTypes.entityTranslucentEmissive`: blended over
+    // the body at `ARGB.white(alpha)`, shaded by its faces but not by the light, and
+    // flashing red with it; nothing's drawn below an alpha of 0.00001.
+    // Layers drawn with `OverlayTexture.NO_OVERLAY` pass `flash` false and don't flash.
+    let emissive = |quads: Vec<Quad>, alpha: f32, flash: bool, out: &mut Meshes| {
+        if alpha <= 1.0e-5 {
+            return;
+        }
+        let start = out.eyes.len();
+        emit(&quads, l.pos, [1.0; 3], [0, 0], &mut out.eyes);
+        let red = if l.hurt && flash { crate::mesh::RED } else { 0 };
+        for v in &mut out.eyes[start..] {
+            v.color[3] = (alpha * 255.0).round() as u8;
+            v.light[3] = crate::mesh::UNLIT | red;
         }
     };
     // A layer on a model with a texture of this size.
@@ -1227,6 +1488,19 @@ fn living(
     };
     let mut collar = None;
     match l.kind {
+        // `RenderLayer.coloredCutoutModelCopyLayerRender` and most layers draw nothing
+        // over an invisible mob; `EyesLayer`, `CarriedBlockLayer`, the breeze's layers and
+        // the creaking's eyes (`alwaysVisible`) draw over it all the same.
+        _ if l.invisible
+            && !matches!(
+                l.kind,
+                Kind::Spider
+                    | Kind::CaveSpider
+                    | Kind::Phantom { .. }
+                    | Kind::Enderman { .. }
+                    | Kind::Breeze { .. }
+                    | Kind::Creaking { .. }
+            ) => {}
         // `SpiderEyesLayer`.
         Kind::Spider | Kind::CaveSpider => eyes(layer(SPIDER_EYES, &nodes), out),
         // `SkeletonClothingLayer` with the bogged's overlay.
@@ -1258,6 +1532,99 @@ fn living(
         }
         // `PhantomEyesLayer`.
         Kind::Phantom { .. } => eyes(layer64(PHANTOM_EYES, &nodes), out),
+        // `BreezeWindLayer`: the wind, its texture scrolling sideways 0.02 a tick
+        // (`RenderTypes.breezeWind`), lit but not shaded by its faces
+        // (`NO_CARDINAL_LIGHTING`), blended; and `BreezeEyesLayer`, glowing, unflashed.
+        Kind::Breeze { anims } => {
+            let full = breeze(anims);
+            let mut wind = full.clone();
+            for n in &mut wind[..BREEZE_WIND_BODY] {
+                n.cubes = &[];
+            }
+            let mut b = Builder {
+                quads: Vec::new(),
+                sprite: crate::atlas::Sprite {
+                    rect: [0.0, 0.0, 1.0, 1.0],
+                    layer: crate::atlas::Layer::Cutout,
+                },
+                tex_size: [128.0; 2],
+                tint: -1,
+            };
+            b.nodes(root, &wind);
+            let [u0, v0, u1, v1] = atlas.sprite(BREEZE_WIND).rect;
+            let [sky, block] = light;
+            for (pos, uv) in scrolled(&b.quads, (l.age * 0.02) % 1.0) {
+                for (p, [u, v]) in pos.iter().zip(uv) {
+                    out.translucent.push(Vertex {
+                        pos: (l.pos + *p).to_array(),
+                        uv: [u0 + (u1 - u0) * u, v0 + (v1 - v0) * v],
+                        color: [255; 4],
+                        light: [sky.min(15) * 16, block.min(15) * 16, 0, 0],
+                    });
+                }
+            }
+            let mut eyes_only = full;
+            for (i, n) in eyes_only.iter_mut().enumerate() {
+                if i != BREEZE_EYES_PART {
+                    n.cubes = &[];
+                }
+            }
+            emissive(
+                layer_tex(BREEZE_EYES, &eyes_only, [32.0; 2]),
+                1.0,
+                false,
+                out,
+            );
+        }
+        // `CopperGolemRenderer`'s eyes: `LivingEntityEmissiveLayer` with `RenderTypes.eyes`
+        // over the whole model, in its oxidation level's eye texture.
+        Kind::CopperGolem { .. } => {
+            let texture = l.texture.replacen(
+                "copper_golem/copper_golem",
+                "copper_golem/copper_golem_eyes",
+                1,
+            );
+            eyes(layer_tex(&texture, &nodes, [64.0; 2]), out);
+        }
+        // `CreakingRenderer`'s eyes: `LivingEntityEmissiveLayer` with `RenderTypes.eyes`, on
+        // its head alone, fully there while they glow and not at all otherwise.
+        Kind::Creaking { eyes: true, .. } => {
+            let mut head = nodes.clone();
+            for (i, n) in head.iter_mut().enumerate() {
+                if i != 2 {
+                    n.cubes = &[];
+                }
+            }
+            eyes(layer_tex(CREAKING_EYES, &head, [64.0; 2]), out);
+        }
+        // `WardenRenderer`'s emissive layers, each on the parts `WardenModel`'s layer
+        // keeps (`retainExactParts`): the bioluminescent layer, the two sets of spots
+        // pulsing in turn, the tendrils twitching and the heart beating.
+        Kind::Warden { tendril, heart, .. } => {
+            // Node indices: body 1, ribcages 2 and 3, head 4, tendrils 5 and 6, arms 7
+            // and 8, legs 9 and 10.
+            let only = |parts: &[usize]| -> Vec<Node> {
+                let mut kept = nodes.clone();
+                for (i, n) in kept.iter_mut().enumerate() {
+                    if !parts.contains(&i) {
+                        n.cubes = &[];
+                    }
+                }
+                kept
+            };
+            let limbs = only(&[4, 7, 8, 9, 10]);
+            let spots = only(&[1, 4, 7, 8, 9, 10]);
+            let pulse = (l.age * 0.045).cos() * 0.25;
+            for (texture, parts, alpha) in [
+                (WARDEN_BIOLUMINESCENT, &limbs, 1.0),
+                (WARDEN_PULSATING_SPOTS_1, &spots, pulse.max(0.0)),
+                (WARDEN_PULSATING_SPOTS_2, &spots, (-pulse).max(0.0)),
+                (WARDEN, &only(&[5, 6]), tendril),
+                (WARDEN_HEART, &only(&[1]), heart),
+            ] {
+                emissive(layer_tex(texture, parts, [128.0; 2]), alpha, true, out);
+            }
+        }
         // `IronGolemCrackinessLayer`: cracks as its health falls, flashing red with it.
         Kind::IronGolem { cracks, .. } if cracks > 0 => {
             let level = ["low", "medium", "high"][cracks.min(3) as usize - 1];
@@ -1397,6 +1764,11 @@ fn living(
         for v in &mut out.cutout[start..] {
             v.light[3] |= crate::mesh::RED;
         }
+    }
+    // `VexModel`'s `RenderTypes::entityTranslucent`.
+    if matches!(l.kind, Kind::Vex { .. }) {
+        let body = out.cutout.split_off(start);
+        out.translucent.extend(body);
     }
     if let Some((quads, dye)) = collar {
         let c = DYE_RGB[dye as usize & 15];
@@ -1818,9 +2190,12 @@ fn humanoid_kind(l: &Living) -> Option<(Option<bool>, f32, f32)> {
 
 /// `HumanoidArmorLayer` and `ItemInHandLayer`: a humanoid's armour, chest, legs, feet then
 /// head, each of its equipment asset's layers tinted by its dye, on armour models posed as
-/// the body is; then the items in its hands.
+/// the body is; then the items in its hands, as other armed mobs hold theirs.
 fn equipment(models: &crate::bake::BlockModels, l: &Living, light: [u8; 2], out: &mut Vec<Vertex>) {
     let Some((zombie, model_scale, hand_x)) = humanoid_kind(l) else {
+        if let Some(hands) = armed_hands(l) {
+            held_items(models, l, hands, light, out);
+        }
         return;
     };
     let root = living_root(l, model_scale);
@@ -1862,9 +2237,65 @@ fn equipment(models: &crate::bake::BlockModels, l: &Living, light: [u8; 2], out:
             emit(&b.quads, l.pos, rgb, light, out);
         }
     }
-    // `ItemInHandLayer.submitArmWithItem`: from each hand, turned to point the item
-    // forward, then placed by its model's hand transform.
     let nodes = humanoid_parts(l, [&[]; 3], ARMOR[3].1, zombie);
+    // `HumanoidModel.translateToHand`.
+    let hands = [0, 1].map(|i| {
+        let [x, y, z, arm_x, arm_y, arm_z] = nodes[3 + i].pose;
+        let sign = if i == 1 { -1.0 } else { 1.0 };
+        root * crate::entity_model::pose([x + sign * hand_x, y, z], [arm_x, arm_y, arm_z])
+    });
+    held_items(models, l, hands, light, out);
+}
+
+/// Where an armed mob that isn't a humanoid holds its items, for each arm
+/// (`ArmedModel.translateToHand`), if it draws them.
+fn armed_hands(l: &Living) -> Option<[Mat4; 2]> {
+    match l.kind {
+        // `IllagerModel.translateToHand`: at the arm's pivot.
+        Kind::Illager {
+            pose,
+            hat,
+            items: true,
+            ..
+        } => {
+            let root = living_root(l, 0.9375);
+            let nodes = illager(l, pose, hat);
+            Some([8, 9].map(|i| {
+                let [x, y, z, rx, ry, rz] = nodes[i].pose;
+                root * crate::entity_model::pose([x, y, z], [rx, ry, rz])
+            }))
+        }
+        // `VexModel.translateToHand`: from the body's arm, a little over half size, and
+        // nudged into the small hand.
+        Kind::Vex { charging } => {
+            let root = living_root(l, 1.0);
+            let nodes = vex(l, charging);
+            let at = |i: usize| {
+                let [x, y, z, rx, ry, rz] = nodes[i].pose;
+                crate::entity_model::pose([x, y, z], [rx, ry, rz])
+            };
+            Some([(3, 1.0), (4, -1.0)].map(|(i, sign)| {
+                root * at(0)
+                    * at(2)
+                    * at(i)
+                    * Mat4::from_scale(Vec3::splat(0.55))
+                    * Mat4::from_translation(Vec3::new(sign * 0.046875, -0.15625, 0.078125))
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// `ItemInHandLayer.submitArmWithItem`: the items in each hand, from `hands` (each arm's
+/// `translateToHand`), turned to point the item forward, then placed by its model's hand
+/// transform.
+fn held_items(
+    models: &crate::bake::BlockModels,
+    l: &Living,
+    hands: [Mat4; 2],
+    light: [u8; 2],
+    out: &mut Vec<Vertex>,
+) {
     for (i, held) in l.equipment.hands.iter().enumerate() {
         let using = l.equipment.using;
         let Some(icon) = held
@@ -1881,9 +2312,7 @@ fn equipment(models: &crate::bake::BlockModels, l: &Living, light: [u8; 2], out:
         } else {
             Vec3::new(sign, 2.0, -10.0)
         };
-        let [x, y, z, arm_x, arm_y, arm_z] = nodes[3 + i].pose;
-        let hand = root
-            * crate::entity_model::pose([x + sign * hand_x, y, z], [arm_x, arm_y, arm_z])
+        let hand = hands[i]
             * Mat4::from_rotation_x(-PI / 2.0)
             * Mat4::from_rotation_y(PI)
             * Mat4::from_translation(hand_offset / 16.0);
@@ -1935,6 +2364,9 @@ pub struct FirstPerson {
     pub sway: [f32; 2],
     /// The item being used, by hand, while it has ticks left.
     pub using: Option<Using>,
+    /// Whether the player is invisible, which hides their empty arm but not what they
+    /// hold.
+    pub invisible: bool,
 }
 
 /// `GameRenderer.renderItemInHand` and `FirstPersonHandsAndItemsRenderer.submitHandsWithItems`:
@@ -1973,8 +2405,9 @@ pub fn first_person(
         };
         let lowered = hands.lowered[hand];
         let Some(item) = item else {
-            // `renderPlayerArm`: only an empty main hand shows the arm.
-            if hand != 0 {
+            // `renderPlayerArm`: only an empty main hand shows the arm, and not while the
+            // player's invisible.
+            if hand != 0 || hands.invisible {
                 continue;
             }
             let sqrt = attack.sqrt();
@@ -3032,6 +3465,327 @@ fn baby_rabbit(l: &Living, hop: Option<f32>, tilt: Option<f32>) -> Vec<Node> {
     nodes
 }
 
+/// `IllagerModel`, posed by its `setupAnim`: the head looks, the arms and legs swing as it
+/// walks (it's never drawn riding yet), then the arms take its `IllagerArmPose`; crossed,
+/// the folded `arms` part shows instead of the two arms. Nodes: head 0, hat 1, nose 2,
+/// body 3, folded arms 4 and their left shoulder 5, right leg 6, left leg 7, right arm 8,
+/// left arm 9.
+fn illager(l: &Living, pose: IllagerPose, hat: bool) -> Vec<Node> {
+    const HEAD: &[Cube] = &[cube([-4.0, -10.0, -4.0], [8.0, 10.0, 8.0], [0.0, 0.0])];
+    const HAT: &[Cube] = &[grown(
+        cube([-4.0, -10.0, -4.0], [8.0, 12.0, 8.0], [32.0, 0.0]),
+        0.45,
+    )];
+    const NOSE: &[Cube] = &[cube([-1.0, -1.0, -6.0], [2.0, 4.0, 2.0], [24.0, 0.0])];
+    const BODY: &[Cube] = &[
+        cube([-4.0, 0.0, -3.0], [8.0, 12.0, 6.0], [16.0, 20.0]),
+        grown(cube([-4.0, 0.0, -3.0], [8.0, 20.0, 6.0], [0.0, 38.0]), 0.5),
+    ];
+    const ARMS: &[Cube] = &[
+        cube([-8.0, -2.0, -2.0], [4.0, 8.0, 4.0], [44.0, 22.0]),
+        cube([-4.0, 2.0, -2.0], [8.0, 4.0, 4.0], [40.0, 38.0]),
+    ];
+    const LEFT_SHOULDER: &[Cube] = &[mirrored(cube(
+        [4.0, -2.0, -2.0],
+        [4.0, 8.0, 4.0],
+        [44.0, 22.0],
+    ))];
+    const RIGHT_LEG: &[Cube] = &[cube([-2.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 22.0])];
+    const LEFT_LEG: &[Cube] = &[mirrored(RIGHT_LEG[0])];
+    const RIGHT_ARM: &[Cube] = &[cube([-3.0, -2.0, -2.0], [4.0, 12.0, 4.0], [40.0, 46.0])];
+    const LEFT_ARM: &[Cube] = &[mirrored(cube(
+        [-1.0, -2.0, -2.0],
+        [4.0, 12.0, 4.0],
+        [40.0, 46.0],
+    ))];
+    let (p, s) = (l.walk_pos * 0.6662, l.walk_speed);
+    let (head_x, head_y) = (l.pitch.to_radians(), l.head_yaw.to_radians());
+    let mut right = [(p + PI).cos() * 2.0 * s * 0.5, 0.0, 0.0];
+    let mut left = [p.cos() * 2.0 * s * 0.5, 0.0, 0.0];
+    let t = l.age;
+    let swing = l.swing.map_or(0.0, |s| s.progress);
+    // `AnimationUtils.bobArms`.
+    let bob = |right: &mut [f32; 3], left: &mut [f32; 3]| {
+        right[2] += (t * 0.09).cos() * 0.05 + 0.05;
+        left[2] -= (t * 0.09).cos() * 0.05 + 0.05;
+        right[0] += (t * 0.067).sin() * 0.05;
+        left[0] -= (t * 0.067).sin() * 0.05;
+    };
+    let right_main = !l.equipment.left_handed;
+    match pose {
+        IllagerPose::Attacking if l.equipment.hands[usize::from(!right_main)].is_none() => {
+            // `AnimationUtils.animateZombieArms`, aggressive, for a grown mob.
+            let ay = (swing * PI).sin();
+            let ax = ((1.0 - (1.0 - swing) * (1.0 - swing)) * PI).sin();
+            let (x, y) = (-PI / 1.5 + ay * 1.2 - ax * 0.4, 0.1 - ay * 0.6);
+            right = [x, -y, 0.0];
+            left = [x, y, 0.0];
+            bob(&mut right, &mut left);
+        }
+        // `AnimationUtils.swingWeaponDown`.
+        IllagerPose::Attacking => {
+            let a2 = (swing * PI).sin();
+            let a = ((1.0 - (1.0 - swing) * (1.0 - swing)) * PI).sin();
+            right = [0.0, PI / 20.0, 0.0];
+            left = [0.0, -PI / 20.0, 0.0];
+            let (main, off) = if right_main {
+                (&mut right, &mut left)
+            } else {
+                (&mut left, &mut right)
+            };
+            main[0] = -1.8849558 + (t * 0.09).cos() * 0.15 + a2 * 2.2 - a * 0.4;
+            off[0] = (t * 0.19).cos() * 0.5 + a2 * 1.2 - a * 0.4;
+            bob(&mut right, &mut left);
+        }
+        // Its arms' pivots, moved back to `x` ∓5 and `z` 0, are where they start anyway.
+        IllagerPose::Spellcasting => {
+            let x = (t * 0.6662).cos() * 0.25;
+            right = [x, 0.0, PI * 3.0 / 4.0];
+            left = [x, 0.0, -PI * 3.0 / 4.0];
+        }
+        IllagerPose::BowAndArrow => {
+            right[1] = -0.1 + head_y;
+            right[0] = -PI / 2.0 + head_x;
+            left = [-0.9424779 + head_x, head_y - 0.4, PI / 2.0];
+        }
+        // `AnimationUtils.animateCrossbowHold`, in the right arm.
+        IllagerPose::CrossbowHold => {
+            right[1] = -0.3 + head_y;
+            left[1] = 0.6 + head_y;
+            right[0] = -PI / 2.0 + head_x + 0.1;
+            left[0] = -1.5 + head_x;
+        }
+        // `AnimationUtils.animateCrossbowCharge`, in the right arm.
+        IllagerPose::CrossbowCharge(f) => {
+            right[1] = -0.8;
+            right[0] = -0.97079635;
+            left[1] = 0.4 + f * (0.85 - 0.4);
+            left[0] = -0.97079635 + f * (-PI / 2.0 + 0.97079635);
+        }
+        IllagerPose::Celebrating => {
+            let x = (t * 0.6662).cos() * 0.05;
+            right = [x, 0.0, 2.670354];
+            left = [x, 0.0, -PI * 3.0 / 4.0];
+        }
+        IllagerPose::Crossed | IllagerPose::Neutral => {}
+    }
+    let crossed = pose == IllagerPose::Crossed;
+    let pick = |show: bool, cubes: &'static [Cube]| if show { cubes } else { &[] };
+    vec![
+        part(None, [0.0; 3], [head_x, head_y, 0.0], HEAD),
+        part(Some(0), [0.0; 3], [0.0; 3], pick(hat, HAT)),
+        part(Some(0), [0.0, -2.0, 0.0], [0.0; 3], NOSE),
+        part(None, [0.0; 3], [0.0; 3], BODY),
+        part(
+            None,
+            [0.0, 3.0, -1.0],
+            [-0.75, 0.0, 0.0],
+            pick(crossed, ARMS),
+        ),
+        part(Some(4), [0.0; 3], [0.0; 3], pick(crossed, LEFT_SHOULDER)),
+        part(
+            None,
+            [-2.0, 12.0, 0.0],
+            [p.cos() * 1.4 * s * 0.5, 0.0, 0.0],
+            RIGHT_LEG,
+        ),
+        part(
+            None,
+            [2.0, 12.0, 0.0],
+            [(p + PI).cos() * 1.4 * s * 0.5, 0.0, 0.0],
+            LEFT_LEG,
+        ),
+        part(None, [-5.0, 2.0, 0.0], right, pick(!crossed, RIGHT_ARM)),
+        part(None, [5.0, 2.0, 0.0], left, pick(!crossed, LEFT_ARM)),
+    ]
+}
+
+/// `RavagerModel` (128 × 128), posed by its `setupAnim`: its neck lunges and its jaw snaps
+/// as it bites; stunned, its head droops and sways; and it opens its mouth wide to roar.
+fn ravager(l: &Living, attack: f32, stunned: f32, roar: f32) -> Vec<Node> {
+    const NECK: &[Cube] = &[cube([-5.0, -1.0, -18.0], [10.0, 10.0, 18.0], [68.0, 73.0])];
+    const HEAD: &[Cube] = &[
+        cube([-8.0, -20.0, -14.0], [16.0, 20.0, 16.0], [0.0, 0.0]),
+        cube([-2.0, -6.0, -18.0], [4.0, 8.0, 4.0], [0.0, 0.0]),
+    ];
+    const RIGHT_HORN: &[Cube] = &[cube([0.0, -14.0, -2.0], [2.0, 14.0, 4.0], [74.0, 55.0])];
+    const LEFT_HORN: &[Cube] = &[mirrored(RIGHT_HORN[0])];
+    const MOUTH: &[Cube] = &[cube([-8.0, 0.0, -16.0], [16.0, 3.0, 16.0], [0.0, 36.0])];
+    const BODY: &[Cube] = &[
+        cube([-7.0, -10.0, -7.0], [14.0, 16.0, 20.0], [0.0, 55.0]),
+        cube([-6.0, 6.0, -7.0], [12.0, 13.0, 18.0], [0.0, 91.0]),
+    ];
+    const RIGHT_HIND: &[Cube] = &[cube([-4.0, 0.0, -4.0], [8.0, 37.0, 8.0], [96.0, 0.0])];
+    const LEFT_HIND: &[Cube] = &[mirrored(RIGHT_HIND[0])];
+    const RIGHT_FRONT: &[Cube] = &[cube([-4.0, 0.0, -4.0], [8.0, 37.0, 8.0], [64.0, 0.0])];
+    const LEFT_FRONT: &[Cube] = &[mirrored(RIGHT_FRONT[0])];
+    // The neck's pitch is reset to 0 before its height is worked out from it, so it always
+    // hangs at -7.
+    let (mut neck, mut neck_x) = ([0.0, -7.0, 5.5], 0.0);
+    let mouth;
+    if attack > 0.0 {
+        let scaled = (1.0 + triangle_wave(attack, 10.0)) * 0.5;
+        neck[2] = -6.5 + scaled * scaled * scaled * 12.0;
+        mouth = if attack > 5.0 {
+            ((-4.0 + attack) / 4.0).sin() * PI * 0.4
+        } else {
+            PI / 20.0 * (PI * attack / 10.0).sin()
+        };
+    } else {
+        let is_stunned = stunned > 0.0;
+        neck_x = if is_stunned { 0.21991149 } else { 0.0 };
+        mouth = if is_stunned {
+            PI * 0.05
+        } else if roar > 0.0 {
+            PI / 2.0 * (roar * PI * 0.25).sin()
+        } else {
+            PI * 0.01
+        };
+        if is_stunned {
+            neck[0] = ((f64::from(stunned) / 40.0 * 10.0).sin() * 3.0) as f32;
+        }
+    }
+    let (p, legs) = (l.walk_pos * 0.6662, 0.4 * l.walk_speed);
+    let look = [l.pitch.to_radians(), l.head_yaw.to_radians(), 0.0];
+    vec![
+        part(None, neck, [neck_x, 0.0, 0.0], NECK),
+        part(Some(0), [0.0, 16.0, -17.0], look, HEAD),
+        part(
+            Some(1),
+            [-10.0, -14.0, -8.0],
+            [1.0995574, 0.0, 0.0],
+            RIGHT_HORN,
+        ),
+        part(
+            Some(1),
+            [8.0, -14.0, -8.0],
+            [1.0995574, 0.0, 0.0],
+            LEFT_HORN,
+        ),
+        part(Some(1), [0.0, -2.0, 2.0], [mouth, 0.0, 0.0], MOUTH),
+        part(None, [0.0, 1.0, 2.0], [PI / 2.0, 0.0, 0.0], BODY),
+        part(
+            None,
+            [-8.0, -13.0, 18.0],
+            [p.cos() * legs, 0.0, 0.0],
+            RIGHT_HIND,
+        ),
+        part(
+            None,
+            [8.0, -13.0, 18.0],
+            [(p + PI).cos() * legs, 0.0, 0.0],
+            LEFT_HIND,
+        ),
+        part(
+            None,
+            [-8.0, -13.0, -5.0],
+            [(p + PI).cos() * legs, 0.0, 0.0],
+            RIGHT_FRONT,
+        ),
+        part(
+            None,
+            [8.0, -13.0, -5.0],
+            [p.cos() * legs, 0.0, 0.0],
+            LEFT_FRONT,
+        ),
+    ]
+}
+
+/// `VexModel` (32 × 32), posed by its `setupAnim`: its arms bob out from its sides and its
+/// wings beat; it leans forward, unless it's charging, when it raises the arms that hold
+/// something (or both, holding nothing) to strike. Nodes: root 0, head 1, body 2, right
+/// arm 3, left arm 4, left wing 5, right wing 6.
+fn vex(l: &Living, charging: bool) -> Vec<Node> {
+    const HEAD: &[Cube] = &[cube([-2.5, -5.0, -2.5], [5.0; 3], [0.0, 0.0])];
+    const BODY: &[Cube] = &[
+        cube([-1.5, 0.0, -1.0], [3.0, 4.0, 2.0], [0.0, 10.0]),
+        grown(cube([-1.5, 1.0, -1.0], [3.0, 5.0, 2.0], [0.0, 16.0]), -0.2),
+    ];
+    const RIGHT_ARM: &[Cube] = &[grown(
+        cube([-1.25, -0.5, -1.0], [2.0, 4.0, 2.0], [23.0, 0.0]),
+        -0.1,
+    )];
+    const LEFT_ARM: &[Cube] = &[grown(
+        cube([-0.75, -0.5, -1.0], [2.0, 4.0, 2.0], [23.0, 6.0]),
+        -0.1,
+    )];
+    const RIGHT_WING: &[Cube] = &[cube([0.0; 3], [0.0, 5.0, 8.0], [16.0, 14.0])];
+    const LEFT_WING: &[Cube] = &[mirrored(RIGHT_WING[0])];
+    let bob = (l.age * 5.5f32.to_radians()).cos() * 0.1;
+    let mut right = [0.0, 0.0, PI / 5.0 + bob];
+    let mut left = [0.0, 0.0, -(PI / 5.0 + bob)];
+    let body_x = if charging {
+        // `setArmsCharging`.
+        let [right_held, left_held] = l.equipment.hands.each_ref().map(Option::is_some);
+        if !right_held && !left_held {
+            right = [-1.2217305, PI / 12.0, -0.47123888 - bob];
+            left = [-1.2217305, -PI / 12.0, 0.47123888 + bob];
+        }
+        if right_held {
+            right = [PI * 7.0 / 6.0, PI / 12.0, -0.47123888 - bob];
+        }
+        if left_held {
+            left = [PI * 7.0 / 6.0, -PI / 12.0, 0.47123888 + bob];
+        }
+        0.0
+    } else {
+        PI / 20.0
+    };
+    let wing = 1.0995574 + (l.age * 45.836624f32.to_radians()).cos() * 16.2f32.to_radians();
+    let look = [l.pitch.to_radians(), l.head_yaw.to_radians(), 0.0];
+    vec![
+        part(None, [0.0, -2.5, 0.0], [0.0; 3], &[]),
+        part(Some(0), [0.0, 20.0, 0.0], look, HEAD),
+        part(Some(0), [0.0, 20.0, 0.0], [body_x, 0.0, 0.0], BODY),
+        part(Some(2), [-1.75, 0.25, 0.0], right, RIGHT_ARM),
+        part(Some(2), [1.75, 0.25, 0.0], left, LEFT_ARM),
+        part(
+            Some(2),
+            [0.5, 1.0, 1.0],
+            [0.47123888, wing, -0.47123888],
+            LEFT_WING,
+        ),
+        part(
+            Some(2),
+            [-0.5, 1.0, 1.0],
+            [0.47123888, -wing, 0.47123888],
+            RIGHT_WING,
+        ),
+    ]
+}
+
+/// `EvokerFangsModel` (64 × 32), posed by its `setupAnim` `bite` of the way through: the
+/// jaws rise out of the ground, snap shut and sink, shrinking away at the end.
+fn evoker_fangs(bite: f32) -> Vec<Node> {
+    const BASE: &[Cube] = &[cube([0.0; 3], [10.0, 12.0, 10.0], [0.0, 0.0])];
+    const JAW: &[Cube] = &[cube([0.0; 3], [4.0, 14.0, 8.0], [40.0, 0.0])];
+    let amount = 1.0 - (bite * 2.0).min(1.0).powi(3);
+    let pre = if bite > 0.9 { (1.0 - bite) / 0.1 } else { 1.0 };
+    let mut root = part(None, [0.0, 24.0 - 20.0 * pre, 0.0], [0.0; 3], &[]);
+    root.scale = [pre; 3];
+    vec![
+        root,
+        part(
+            Some(0),
+            [-5.0, 24.0 - (bite + (bite * 2.7).sin()) * 7.2, -5.0],
+            [0.0; 3],
+            BASE,
+        ),
+        part(
+            Some(1),
+            [6.5, 0.0, 1.0],
+            [0.0, 0.0, PI - amount * 0.35 * PI],
+            JAW,
+        ),
+        part(
+            Some(1),
+            [3.5, 0.0, 9.0],
+            [0.0, PI, PI + amount * 0.35 * PI],
+            JAW,
+        ),
+    ]
+}
+
 /// `ModelPart.visible = false`: the part and everything hung from it aren't drawn.
 fn hide(nodes: &mut [Node], part: usize) {
     for i in part..nodes.len() {
@@ -3373,10 +4127,10 @@ fn armadillo(l: &Living, hiding: bool, anims: [Option<f32>; 3]) -> Vec<Node> {
             part(None, [0.0, 20.7, 0.5], [0.0; 3], BABY_BALL),
         ];
         let animations = [
-            &ARMADILLO_BABY_WALK,
-            &ARMADILLO_BABY_ROLL_OUT,
-            &ARMADILLO_BABY_ROLL_UP,
-            &ARMADILLO_BABY_PEEK,
+            &BABY_ARMADILLO_WALK,
+            &BABY_ARMADILLO_ROLL_OUT,
+            &BABY_ARMADILLO_ROLL_UP,
+            &BABY_ARMADILLO_PEEK,
         ];
         (nodes, BABY_BONES, animations, [1, 7, 11])
     } else {
@@ -3434,6 +4188,855 @@ fn armadillo(l: &Living, hiding: bool, anims: [Option<f32>; 3]) -> Vec<Node> {
         }
     }
     nodes
+}
+
+/// `SnifferModel.setupAnim` on `SnifferModel.createBodyLayer` (192 × 192) or, for a
+/// snifflet, `SniffletModel.createBodyLayer` (128 × 128; `SnifferRenderer` bakes it into a
+/// plain `SnifferModel`, so `SniffletModel`'s `BABY_TRANSFORM` never runs): its head
+/// follows its look, it walks (or walks searching, nose down), then digs, sniffs long,
+/// stands up, is happy and sniffs.
+fn sniffer(l: &Living, searching: bool, anims: [Option<f32>; 5]) -> Vec<Node> {
+    const BODY: &[Cube] = &[
+        cube([-12.5, -14.0, -20.0], [25.0, 29.0, 40.0], [62.0, 68.0]),
+        grown(
+            cube([-12.5, -14.0, -20.0], [25.0, 24.0, 40.0], [62.0, 0.0]),
+            0.5,
+        ),
+        cube([-12.5, 12.0, -20.0], [25.0, 0.0, 40.0], [87.0, 68.0]),
+    ];
+    const fn leg(u: f32, v: f32) -> [Cube; 1] {
+        [cube([-3.5, -1.0, -4.0], [7.0, 10.0, 8.0], [u, v])]
+    }
+    const RIGHT_FRONT: &[Cube] = &leg(32.0, 87.0);
+    const RIGHT_MID: &[Cube] = &leg(32.0, 105.0);
+    const RIGHT_HIND: &[Cube] = &leg(32.0, 123.0);
+    const LEFT_FRONT: &[Cube] = &leg(0.0, 87.0);
+    const LEFT_MID: &[Cube] = &leg(0.0, 105.0);
+    const LEFT_HIND: &[Cube] = &leg(0.0, 123.0);
+    const HEAD: &[Cube] = &[
+        cube([-6.5, -7.5, -11.5], [13.0, 18.0, 11.0], [8.0, 15.0]),
+        cube([-6.5, 7.5, -11.5], [13.0, 0.0, 11.0], [8.0, 4.0]),
+    ];
+    const LEFT_EAR: &[Cube] = &[cube([0.0, 0.0, -3.0], [1.0, 19.0, 7.0], [2.0, 0.0])];
+    const RIGHT_EAR: &[Cube] = &[cube([-1.0, 0.0, -3.0], [1.0, 19.0, 7.0], [48.0, 0.0])];
+    const NOSE: &[Cube] = &[cube([-6.5, -2.0, -9.0], [13.0, 2.0, 9.0], [10.0, 45.0])];
+    const BEAK: &[Cube] = &[cube([-6.5, -7.0, -8.0], [13.0, 12.0, 9.0], [10.0, 57.0])];
+    const BABY_BODY: &[Cube] = &[
+        grown(
+            cube([-13.0, -14.0, -0.5], [14.0, 14.0, 20.0], [0.0, 35.0]),
+            0.25,
+        ),
+        cube([-13.0, -14.0, -0.5], [14.0, 15.0, 20.0], [0.0, 0.0]),
+        cube([-13.0, 0.0, -0.5], [14.0, 0.0, 20.0], [68.0, 0.0]),
+    ];
+    const BABY_HEAD: &[Cube] = &[
+        cube([-5.0, -4.25, -7.5], [10.0, 9.0, 9.0], [68.0, 20.0]),
+        cube([-5.0, 3.75, -7.5], [10.0, 0.0, 9.0], [88.0, 20.0]),
+    ];
+    const BABY_LEFT_EAR: &[Cube] = &[cube([0.0, 0.0, -2.0], [1.0, 11.0, 3.0], [104.0, 38.0])];
+    const BABY_RIGHT_EAR: &[Cube] = &[cube([-1.0, 0.0, -2.0], [1.0, 11.0, 3.0], [96.0, 38.0])];
+    const BABY_NOSE: &[Cube] = &[cube([-5.0, -3.0, -2.0], [10.0, 3.0, 4.0], [68.0, 47.0])];
+    const BABY_BEAK: &[Cube] = &[cube([-5.0, -2.5, -2.0], [10.0, 5.0, 4.0], [68.0, 38.0])];
+    const fn baby_leg(u: f32, v: f32) -> [Cube; 1] {
+        [cube([-2.0, -1.0, -2.0], [4.0, 5.0, 4.0], [u, v])]
+    }
+    const BABY_RIGHT_FRONT: &[Cube] = &baby_leg(0.0, 69.0);
+    const BABY_RIGHT_MID: &[Cube] = &baby_leg(0.0, 78.0);
+    const BABY_RIGHT_HIND: &[Cube] = &baby_leg(0.0, 87.0);
+    const BABY_LEFT_FRONT: &[Cube] = &baby_leg(16.0, 69.0);
+    const BABY_LEFT_MID: &[Cube] = &baby_leg(16.0, 78.0);
+    const BABY_LEFT_HIND: &[Cube] = &baby_leg(16.0, 87.0);
+    const BONES: &[&str] = &[
+        "bone",
+        "body",
+        "head",
+        "left_ear",
+        "right_ear",
+        "nose",
+        "lower_beak",
+        "right_front_leg",
+        "right_mid_leg",
+        "right_hind_leg",
+        "left_front_leg",
+        "left_mid_leg",
+        "left_hind_leg",
+    ];
+    let mut nodes = if l.baby {
+        vec![
+            part(None, [0.0, 24.0, 0.0], [0.0; 3], &[]),
+            part(Some(0), [6.0, -3.0, -9.5], [0.0; 3], BABY_BODY),
+            part(Some(1), [-6.0, -4.75, 0.0], [0.0; 3], BABY_HEAD),
+            part(Some(2), [5.0, -4.25, -1.5], [0.0; 3], BABY_LEFT_EAR),
+            part(Some(2), [-5.0, -4.25, -1.5], [0.0; 3], BABY_RIGHT_EAR),
+            part(Some(2), [0.0, -1.25, -9.5], [0.0; 3], BABY_NOSE),
+            part(Some(2), [0.0, 1.25, -9.5], [0.0; 3], BABY_BEAK),
+            part(Some(0), [-4.0, -4.0, -7.0], [0.0; 3], BABY_RIGHT_FRONT),
+            part(Some(0), [-4.0, -4.0, 0.0], [0.0; 3], BABY_RIGHT_MID),
+            part(Some(0), [-4.0, -4.0, 7.0], [0.0; 3], BABY_RIGHT_HIND),
+            part(Some(0), [4.0, -4.0, -7.0], [0.0; 3], BABY_LEFT_FRONT),
+            part(Some(0), [4.0, -4.0, 0.0], [0.0; 3], BABY_LEFT_MID),
+            part(Some(0), [4.0, -4.0, 7.0], [0.0; 3], BABY_LEFT_HIND),
+        ]
+    } else {
+        vec![
+            part(None, [0.0, 5.0, 0.0], [0.0; 3], &[]),
+            part(Some(0), [0.0; 3], [0.0; 3], BODY),
+            part(Some(1), [0.0, 6.5, -19.48], [0.0; 3], HEAD),
+            part(Some(2), [6.51, -7.5, -4.51], [0.0; 3], LEFT_EAR),
+            part(Some(2), [-6.51, -7.5, -4.51], [0.0; 3], RIGHT_EAR),
+            part(Some(2), [0.0, -4.5, -11.5], [0.0; 3], NOSE),
+            part(Some(2), [0.0, 2.5, -12.5], [0.0; 3], BEAK),
+            part(Some(0), [-7.5, 10.0, -15.0], [0.0; 3], RIGHT_FRONT),
+            part(Some(0), [-7.5, 10.0, 0.0], [0.0; 3], RIGHT_MID),
+            part(Some(0), [-7.5, 10.0, 15.0], [0.0; 3], RIGHT_HIND),
+            part(Some(0), [7.5, 10.0, -15.0], [0.0; 3], LEFT_FRONT),
+            part(Some(0), [7.5, 10.0, 0.0], [0.0; 3], LEFT_MID),
+            part(Some(0), [7.5, 10.0, 15.0], [0.0; 3], LEFT_HIND),
+        ]
+    };
+    nodes[2].pose[3] = l.pitch.to_radians();
+    nodes[2].pose[4] = l.head_yaw.to_radians();
+    use crate::animations::*;
+    let walk = if searching {
+        &SNIFFER_SNIFF_SEARCH
+    } else {
+        &SNIFFER_WALK
+    };
+    let (millis, k) =
+        crate::animation::Animation::walk_millis(l.walk_pos, l.walk_speed, 9.0, 100.0);
+    walk.apply_at(millis, k, BONES, &mut nodes);
+    let animations = [
+        &SNIFFER_DIG,
+        &SNIFFER_LONGSNIFF,
+        &SNIFFER_STAND_UP,
+        &SNIFFER_HAPPY,
+        &SNIFFER_SNIFFSNIFF,
+    ];
+    for (anim, t) in animations.iter().zip(anims) {
+        if let Some(t) = t {
+            anim.apply(t, BONES, &mut nodes);
+        }
+    }
+    nodes
+}
+
+/// `WardenModel.setupAnim`: its head follows its look; it walks and sways (`animateWalk`,
+/// `animateIdlePose`); its tendrils twitch; then it attacks, sonic booms, digs, emerges,
+/// roars and sniffs.
+fn warden(l: &Living, tendril: f32, anims: [Option<f32>; 6]) -> Vec<Node> {
+    const BODY: &[Cube] = &[cube([-9.0, -13.0, -4.0], [18.0, 21.0, 11.0], [0.0, 0.0])];
+    const RIGHT_RIBCAGE: &[Cube] = &[cube([-2.0, -11.0, -0.1], [9.0, 21.0, 0.0], [90.0, 11.0])];
+    const LEFT_RIBCAGE: &[Cube] = &[mirrored(cube(
+        [-7.0, -11.0, -0.1],
+        [9.0, 21.0, 0.0],
+        [90.0, 11.0],
+    ))];
+    const HEAD: &[Cube] = &[cube([-8.0, -16.0, -5.0], [16.0, 16.0, 10.0], [0.0, 32.0])];
+    const RIGHT_TENDRIL: &[Cube] = &[cube([-16.0, -13.0, 0.0], [16.0, 16.0, 0.0], [52.0, 32.0])];
+    const LEFT_TENDRIL: &[Cube] = &[cube([0.0, -13.0, 0.0], [16.0, 16.0, 0.0], [58.0, 0.0])];
+    const RIGHT_ARM: &[Cube] = &[cube([-4.0, 0.0, -4.0], [8.0, 28.0, 8.0], [44.0, 50.0])];
+    const LEFT_ARM: &[Cube] = &[cube([-4.0, 0.0, -4.0], [8.0, 28.0, 8.0], [0.0, 58.0])];
+    const RIGHT_LEG: &[Cube] = &[cube([-3.1, 0.0, -3.0], [6.0, 13.0, 6.0], [76.0, 48.0])];
+    const LEFT_LEG: &[Cube] = &[cube([-2.9, 0.0, -3.0], [6.0, 13.0, 6.0], [76.0, 76.0])];
+    const BONES: &[&str] = &[
+        "bone",
+        "body",
+        "right_ribcage",
+        "left_ribcage",
+        "head",
+        "right_tendril",
+        "left_tendril",
+        "right_arm",
+        "left_arm",
+        "right_leg",
+        "left_leg",
+    ];
+    let mut nodes = vec![
+        part(None, [0.0, 24.0, 0.0], [0.0; 3], &[]),
+        part(Some(0), [0.0, -21.0, 0.0], [0.0; 3], BODY),
+        part(Some(1), [-7.0, -2.0, -4.0], [0.0; 3], RIGHT_RIBCAGE),
+        part(Some(1), [7.0, -2.0, -4.0], [0.0; 3], LEFT_RIBCAGE),
+        part(Some(1), [0.0, -13.0, 0.0], [0.0; 3], HEAD),
+        part(Some(4), [-8.0, -12.0, 0.0], [0.0; 3], RIGHT_TENDRIL),
+        part(Some(4), [8.0, -12.0, 0.0], [0.0; 3], LEFT_TENDRIL),
+        part(Some(1), [-13.0, -13.0, 1.0], [0.0; 3], RIGHT_ARM),
+        part(Some(1), [13.0, -13.0, 1.0], [0.0; 3], LEFT_ARM),
+        part(Some(0), [-5.9, -13.0, 0.0], [0.0; 3], RIGHT_LEG),
+        part(Some(0), [5.9, -13.0, 0.0], [0.0; 3], LEFT_LEG),
+    ];
+    let [body, head, right_arm, left_arm, right_leg, left_leg] = [1, 4, 7, 8, 9, 10];
+    // `animateHeadLookTarget`.
+    nodes[head].pose[3] = l.pitch.to_radians();
+    nodes[head].pose[4] = l.head_yaw.to_radians();
+    // `animateWalk`; the arms' positions it resets are their rest poses already.
+    let speed = (3.0 * l.walk_speed).min(0.5);
+    let pos = l.walk_pos * 0.8662;
+    let (sin, cos) = pos.sin_cos();
+    let speed_min = speed.min(0.35);
+    nodes[head].pose[5] += 0.3 * sin * speed;
+    nodes[head].pose[3] += 1.2 * (pos + PI / 2.0).cos() * speed_min;
+    nodes[body].pose[5] = 0.1 * sin * speed;
+    nodes[body].pose[3] = cos * speed_min;
+    nodes[left_leg].pose[3] = cos * speed;
+    nodes[right_leg].pose[3] = (pos + PI).cos() * speed;
+    nodes[left_arm].pose[3] = -(0.8 * cos * speed);
+    nodes[right_arm].pose[3] = -(0.8 * sin * speed);
+    // `animateIdlePose`.
+    let (sin, cos) = (l.age * 0.1).sin_cos();
+    nodes[head].pose[5] += 0.06 * cos;
+    nodes[head].pose[3] += 0.06 * sin;
+    nodes[body].pose[5] += 0.025 * sin;
+    nodes[body].pose[3] += 0.025 * cos;
+    // `animateTendrils`, in double precision as vanilla works it out.
+    let twitch = tendril * ((f64::from(l.age) * 2.25).cos() * std::f64::consts::PI * 0.1) as f32;
+    nodes[6].pose[3] = twitch;
+    nodes[5].pose[3] = -twitch;
+    use crate::animations::*;
+    let animations = [
+        &WARDEN_ATTACK,
+        &WARDEN_SONIC_BOOM,
+        &WARDEN_DIG,
+        &WARDEN_EMERGE,
+        &WARDEN_ROAR,
+        &WARDEN_SNIFF,
+    ];
+    for (anim, t) in animations.iter().zip(anims) {
+        if let Some(t) = t {
+            anim.apply(t, BONES, &mut nodes);
+        }
+    }
+    nodes
+}
+
+/// `CreakingModel.setupAnim`: its head follows its look; it walks only while it can move
+/// (`applyWalk` with a speed and scale of 1); then it attacks, shakes off a hit
+/// (`invulnerabilityAnimationState`) and twitches as it dies.
+fn creaking(l: &Living, can_move: bool, anims: [Option<f32>; 3]) -> Vec<Node> {
+    const HEAD: &[Cube] = &[
+        cube([-3.0, -10.0, -3.0], [6.0, 10.0, 6.0], [0.0, 0.0]),
+        cube([-3.0, -13.0, -3.0], [6.0, 3.0, 6.0], [28.0, 31.0]),
+        cube([3.0, -13.0, 0.0], [9.0, 14.0, 0.0], [12.0, 40.0]),
+        cube([-12.0, -14.0, 0.0], [9.0, 14.0, 0.0], [34.0, 12.0]),
+    ];
+    const BODY: &[Cube] = &[
+        cube([0.0, -3.0, -3.0], [6.0, 13.0, 5.0], [0.0, 16.0]),
+        cube([-6.0, -4.0, -3.0], [6.0, 7.0, 5.0], [24.0, 0.0]),
+    ];
+    const RIGHT_ARM: &[Cube] = &[
+        cube([-2.0, -1.5, -1.5], [3.0, 21.0, 3.0], [22.0, 13.0]),
+        cube([-2.0, 19.5, -1.5], [3.0, 4.0, 3.0], [46.0, 0.0]),
+    ];
+    const LEFT_ARM: &[Cube] = &[
+        cube([0.0, -1.0, -1.5], [3.0, 16.0, 3.0], [30.0, 40.0]),
+        cube([0.0, -5.0, -1.5], [3.0, 4.0, 3.0], [52.0, 12.0]),
+        cube([0.0, 15.0, -1.5], [3.0, 4.0, 3.0], [52.0, 19.0]),
+    ];
+    const LEFT_LEG: &[Cube] = &[
+        cube([-1.5, 0.0, -1.5], [3.0, 16.0, 3.0], [42.0, 40.0]),
+        cube([-1.5, 15.7, -4.5], [5.0, 0.0, 9.0], [45.0, 55.0]),
+    ];
+    const RIGHT_LEG: &[Cube] = &[
+        cube([-3.0, -1.5, -1.5], [3.0, 19.0, 3.0], [0.0, 34.0]),
+        cube([-5.0, 17.2, -4.5], [5.0, 0.0, 9.0], [45.0, 46.0]),
+        cube([-3.0, -4.5, -1.5], [3.0, 3.0, 3.0], [12.0, 34.0]),
+    ];
+    // The animations are baked on its "root" part, which they never move.
+    const BONES: &[&str] = &[
+        "",
+        "upper_body",
+        "head",
+        "body",
+        "right_arm",
+        "left_arm",
+        "left_leg",
+        "right_leg",
+    ];
+    let mut nodes = vec![
+        part(None, [0.0, 24.0, 0.0], [0.0; 3], &[]),
+        part(Some(0), [-1.0, -19.0, 0.0], [0.0; 3], &[]),
+        part(Some(1), [-3.0, -11.0, 0.0], [0.0; 3], HEAD),
+        part(Some(1), [0.0, -7.0, 1.0], [0.0; 3], BODY),
+        part(Some(1), [-7.0, -9.5, 1.5], [0.0; 3], RIGHT_ARM),
+        part(Some(1), [6.0, -9.0, 0.5], [0.0; 3], LEFT_ARM),
+        part(Some(0), [1.5, -16.0, 0.5], [0.0; 3], LEFT_LEG),
+        part(Some(0), [-1.0, -17.5, 0.5], [0.0; 3], RIGHT_LEG),
+    ];
+    nodes[2].pose[3] = l.pitch.to_radians();
+    nodes[2].pose[4] = l.head_yaw.to_radians();
+    use crate::animations::*;
+    if can_move {
+        let (millis, k) =
+            crate::animation::Animation::walk_millis(l.walk_pos, l.walk_speed, 1.0, 1.0);
+        CREAKING_WALK.apply_at(millis, k, BONES, &mut nodes);
+    }
+    let animations = [&CREAKING_ATTACK, &CREAKING_INVULNERABLE, &CREAKING_DEATH];
+    for (anim, t) in animations.iter().zip(anims) {
+        if let Some(t) = t {
+            anim.apply(t, BONES, &mut nodes);
+        }
+    }
+    nodes
+}
+
+/// `CopperGolemModel.setupAnim`: its head follows its look; it walks, holding its arms
+/// out in front while it carries something (`poseHeldItemArmsIfStill`); then it spins
+/// its head idly and opens chests.
+fn copper_golem(l: &Living, anims: [Option<f32>; 5]) -> Vec<Node> {
+    const BODY: &[Cube] = &[cube([-4.0, -6.0, -3.0], [8.0, 6.0, 6.0], [0.0, 15.0])];
+    const HEAD: &[Cube] = &[
+        grown(
+            cube([-4.0, -5.0, -5.0], [8.0, 5.0, 10.0], [0.0, 0.0]),
+            0.015,
+        ),
+        cube([-1.0, -2.0, -6.0], [2.0, 3.0, 2.0], [56.0, 0.0]),
+        grown(
+            cube([-1.0, -9.0, -1.0], [2.0, 4.0, 2.0], [37.0, 8.0]),
+            -0.015,
+        ),
+        grown(
+            cube([-2.0, -13.0, -2.0], [4.0, 4.0, 4.0], [37.0, 0.0]),
+            -0.015,
+        ),
+    ];
+    const RIGHT_ARM: &[Cube] = &[cube([-3.0, -1.0, -2.0], [3.0, 10.0, 4.0], [36.0, 16.0])];
+    const LEFT_ARM: &[Cube] = &[cube([0.0, -1.0, -2.0], [3.0, 10.0, 4.0], [50.0, 16.0])];
+    const RIGHT_LEG: &[Cube] = &[cube([-4.0, 0.0, -2.0], [4.0, 5.0, 4.0], [0.0, 27.0])];
+    const LEFT_LEG: &[Cube] = &[cube([0.0, 0.0, -2.0], [4.0, 5.0, 4.0], [16.0, 27.0])];
+    // Its mesh is `translated(0, 24, 0)`: the root part's own offset.
+    const BONES: &[&str] = &[
+        "",
+        "body",
+        "head",
+        "right_arm",
+        "left_arm",
+        "right_leg",
+        "left_leg",
+    ];
+    let mut nodes = vec![
+        part(None, [0.0, 24.0, 0.0], [0.0; 3], &[]),
+        part(Some(0), [0.0, -5.0, 0.0], [0.0; 3], BODY),
+        part(Some(1), [0.0, -6.0, 0.0], [0.0; 3], HEAD),
+        part(Some(1), [-4.0, -6.0, 0.0], [0.0; 3], RIGHT_ARM),
+        part(Some(1), [4.0, -6.0, 0.0], [0.0; 3], LEFT_ARM),
+        part(Some(0), [0.0, -5.0, 0.0], [0.0; 3], RIGHT_LEG),
+        part(Some(0), [0.0, -5.0, 0.0], [0.0; 3], LEFT_LEG),
+    ];
+    nodes[2].pose[3] = l.pitch.to_radians();
+    nodes[2].pose[4] = l.head_yaw.to_radians();
+    use crate::animations::*;
+    let (millis, k) = crate::animation::Animation::walk_millis(l.walk_pos, l.walk_speed, 2.0, 2.5);
+    if l.equipment.hands.iter().all(Option::is_none) {
+        COPPER_GOLEM_WALK.apply_at(millis, k, BONES, &mut nodes);
+    } else {
+        COPPER_GOLEM_WALK_ITEM.apply_at(millis, k, BONES, &mut nodes);
+        let [right, left] = [3, 4];
+        nodes[right].pose[3] = nodes[right].pose[3].min(-0.87266463);
+        nodes[left].pose[3] = nodes[left].pose[3].min(-0.87266463);
+        nodes[right].pose[4] = nodes[right].pose[4].min(-0.1134464);
+        nodes[left].pose[4] = nodes[left].pose[4].max(0.1134464);
+        nodes[right].pose[5] = nodes[right].pose[5].min(-0.064577185);
+        nodes[left].pose[5] = nodes[left].pose[5].max(0.064577185);
+    }
+    let animations = [
+        &COPPER_GOLEM_IDLE,
+        &COPPER_GOLEM_CHEST_INTERACTION_NOITEM_GET,
+        &COPPER_GOLEM_CHEST_INTERACTION_NOITEM_NOGET,
+        &COPPER_GOLEM_CHEST_INTERACTION_ITEM_DROP,
+        &COPPER_GOLEM_CHEST_INTERACTION_ITEM_NODROP,
+    ];
+    for (anim, t) in animations.iter().zip(anims) {
+        if let Some(t) = t {
+            anim.apply(t, BONES, &mut nodes);
+        }
+    }
+    nodes
+}
+
+/// `NautilusModel.setupAnim` on `createBodyLayer` (128 × 128), `createBabyBodyLayer`
+/// (64 × 64) or `ZombieNautilusCoralModel`'s layer: its body turns with its look, at most
+/// 10° each way, and it swims all the time, faster as it moves.
+#[allow(clippy::approx_constant)]
+fn nautilus(l: &Living, corals: bool) -> Vec<Node> {
+    const SHELL: &[Cube] = &[
+        cube([-7.0, -10.0, -7.0], [14.0, 10.0, 16.0], [0.0, 0.0]),
+        cube([-7.0, 0.0, -7.0], [14.0, 8.0, 20.0], [0.0, 26.0]),
+        cube([-7.0, 0.0, 6.0], [14.0, 8.0, 0.0], [48.0, 26.0]),
+    ];
+    const BODY: &[Cube] = &[
+        cube([-5.0, -4.51, -3.0], [10.0, 8.0, 14.0], [0.0, 54.0]),
+        cube([-5.0, -4.51, 7.0], [10.0, 8.0, 0.0], [0.0, 76.0]),
+    ];
+    const UPPER_MOUTH: &[Cube] = &[grown(
+        cube([-5.0, -2.0, 0.0], [10.0, 4.0, 4.0], [54.0, 54.0]),
+        -0.001,
+    )];
+    const INNER_MOUTH: &[Cube] = &[cube([-3.0, -2.0, -0.5], [6.0, 4.0, 4.0], [54.0, 70.0])];
+    const LOWER_MOUTH: &[Cube] = &[grown(
+        cube([-5.0, -1.98, 0.0], [10.0, 4.0, 4.0], [54.0, 62.0]),
+        -0.001,
+    )];
+    const YELLOW: &[Cube] = &[cube([-4.5, -3.5, 0.0], [6.0, 8.0, 0.0], [0.0, 85.0])];
+    const PINK: &[Cube] = &[cube([-4.5, 4.5, 0.0], [6.0, 0.0, 8.0], [-8.0, 94.0])];
+    const PINK_SECOND: &[Cube] = &[cube([-3.0, 0.0, -4.0], [6.0, 0.0, 8.0], [-8.0, 94.0])];
+    const BLUE: &[Cube] = &[cube([-3.5, -5.5, 0.0], [5.0, 10.0, 0.0], [0.0, 102.0])];
+    const RED_SECOND: &[Cube] = &[cube([-2.5, -5.5, 0.0], [4.0, 10.0, 0.0], [0.0, 112.0])];
+    const RED_FIRST: &[Cube] = &[cube([-4.5, -5.5, 0.0], [6.0, 10.0, 0.0], [0.0, 112.0])];
+    const BABY_SHELL: &[Cube] = &[
+        cube([-6.0, -4.0, -1.0], [7.0, 4.0, 7.0], [0.0, 0.0]),
+        cube([-6.0, 0.0, -1.0], [7.0, 4.0, 9.0], [0.0, 11.0]),
+        cube([-6.0, 0.0, 5.0], [7.0, 4.0, 0.0], [23.0, 11.0]),
+    ];
+    const BABY_BODY: &[Cube] = &[
+        cube([-2.5, -3.01, -1.0], [5.0, 4.0, 7.0], [0.0, 24.0]),
+        cube([-2.5, -3.01, 4.1], [5.0, 4.0, 0.0], [0.0, 35.0]),
+    ];
+    const BABY_UPPER_MOUTH: &[Cube] = &[grown(
+        cube([-2.5, -1.0, 0.0], [5.0, 2.0, 2.0], [24.0, 24.0]),
+        -0.001,
+    )];
+    const BABY_INNER_MOUTH: &[Cube] = &[cube([-1.5, -1.0, -1.0], [3.0, 2.0, 2.0], [24.0, 32.0])];
+    const BABY_LOWER_MOUTH: &[Cube] = &[grown(
+        cube([-2.5, -1.0, 0.0], [5.0, 2.0, 2.0], [24.0, 28.0]),
+        -0.001,
+    )];
+    // Its own root part is called "root"; the animation is baked on the layer's.
+    const BONES: &[&str] = &[
+        "",
+        "shell",
+        "body",
+        "upper_mouth",
+        "inner_mouth",
+        "lower_mouth",
+    ];
+    let baby = baby_model(l);
+    let mut nodes = if baby {
+        vec![
+            part(None, [-0.5, 28.0, -0.5], [0.0; 3], &[]),
+            part(Some(0), [3.0, -8.0, -2.0], [0.0; 3], BABY_SHELL),
+            part(Some(0), [0.5, -5.0, 3.0], [0.0; 3], BABY_BODY),
+            part(Some(2), [0.0, -2.01, 3.9], [0.0; 3], BABY_UPPER_MOUTH),
+            part(Some(2), [0.0, -1.01, 4.9], [0.0; 3], BABY_INNER_MOUTH),
+            part(Some(2), [0.0, -0.01, 3.9], [0.0; 3], BABY_LOWER_MOUTH),
+        ]
+    } else {
+        vec![
+            part(None, [0.0, 29.0, -6.0], [0.0; 3], &[]),
+            part(Some(0), [0.0, -13.0, 5.0], [0.0; 3], SHELL),
+            part(Some(0), [0.0, -8.5, 12.3], [0.0; 3], BODY),
+            part(Some(2), [0.0, -2.51, 7.0], [0.0; 3], UPPER_MOUTH),
+            part(Some(2), [0.0, -0.51, 7.5], [0.0; 3], INNER_MOUTH),
+            part(Some(2), [0.0, 1.49, 7.0], [0.0; 3], LOWER_MOUTH),
+        ]
+    };
+    if corals {
+        let quarter = 0.7854;
+        nodes.extend([
+            part(Some(1), [8.0, 4.5, -8.0], [0.0; 3], &[]),
+            part(Some(6), [0.0, -11.0, 11.0], [0.0; 3], &[]),
+            part(Some(7), [0.0, 0.0, 2.0], [0.0, -quarter, 0.0], YELLOW),
+            part(Some(7), [0.0; 3], [0.0, quarter, 0.0], YELLOW),
+            part(Some(6), [-12.5, -18.0, 11.0], [0.0; 3], PINK),
+            part(Some(10), [-1.5, 4.5, 4.0], [0.0, 0.0, 1.5708], PINK_SECOND),
+            part(Some(6), [-14.0, 0.0, 5.5], [0.0; 3], &[]),
+            part(Some(12), [0.0, 0.0, -2.0], [0.0, quarter, 0.0], BLUE),
+            part(Some(12), [0.0; 3], [0.0, -quarter, 0.0], BLUE),
+            part(Some(6), [0.0; 3], [0.0; 3], &[]),
+            part(Some(15), [-0.5, -1.0, 1.5], [0.0, -0.829, 0.0], RED_SECOND),
+            part(Some(15), [0.0; 3], [0.0, quarter, 0.0], RED_FIRST),
+        ]);
+    }
+    // `applyBodyRotation`.
+    nodes[2].pose[4] = l.head_yaw.clamp(-10.0, 10.0).to_radians();
+    nodes[2].pose[3] = l.pitch.clamp(-10.0, 10.0).to_radians();
+    let (millis, k) = crate::animation::Animation::walk_millis(
+        l.walk_pos + l.age / 5.0,
+        l.walk_speed + 0.2,
+        2.0,
+        3.0,
+    );
+    crate::animations::NAUTILUS_SWIMMING.apply_at(millis, k, BONES, &mut nodes);
+    nodes
+}
+
+/// `AdultAxolotlModel.setupAnim`: its body turns with its head; then it swims, hovers in
+/// water, crawls, lies still, plays dead, each as far as its factors say, and its right
+/// legs follow its left ones while it isn't crawling.
+#[allow(clippy::approx_constant)]
+fn axolotl(l: &Living, [dead, in_water, on_ground, moving]: [f32; 4]) -> Vec<Node> {
+    const BODY: &[Cube] = &[
+        cube([-4.0, -2.0, -9.0], [8.0, 4.0, 10.0], [0.0, 11.0]),
+        cube([0.0, -3.0, -8.0], [0.0, 5.0, 9.0], [2.0, 17.0]),
+    ];
+    const HEAD: &[Cube] = &[grown(
+        cube([-4.0, -3.0, -5.0], [8.0, 5.0, 5.0], [0.0, 1.0]),
+        0.001,
+    )];
+    const TOP_GILLS: &[Cube] = &[grown(
+        cube([-4.0, -3.0, 0.0], [8.0, 3.0, 0.0], [3.0, 37.0]),
+        0.001,
+    )];
+    const LEFT_GILLS: &[Cube] = &[grown(
+        cube([-3.0, -5.0, 0.0], [3.0, 7.0, 0.0], [0.0, 40.0]),
+        0.001,
+    )];
+    const RIGHT_GILLS: &[Cube] = &[grown(
+        cube([0.0, -5.0, 0.0], [3.0, 7.0, 0.0], [11.0, 40.0]),
+        0.001,
+    )];
+    const LEFT_LEG: &[Cube] = &[grown(
+        cube([-1.0, 0.0, 0.0], [3.0, 5.0, 0.0], [2.0, 13.0]),
+        0.001,
+    )];
+    const RIGHT_LEG: &[Cube] = &[grown(
+        cube([-2.0, 0.0, 0.0], [3.0, 5.0, 0.0], [2.0, 13.0]),
+        0.001,
+    )];
+    const TAIL: &[Cube] = &[cube([0.0, -3.0, 0.0], [0.0, 5.0, 12.0], [2.0, 19.0])];
+    let mut n = vec![
+        part(None, [0.0, 19.5, 5.0], [0.0; 3], BODY),
+        part(Some(0), [0.0, 0.0, -9.0], [0.0; 3], HEAD),
+        part(Some(1), [0.0, -3.0, -1.0], [0.0; 3], TOP_GILLS),
+        part(Some(1), [-4.0, 0.0, -1.0], [0.0; 3], LEFT_GILLS),
+        part(Some(1), [4.0, 0.0, -1.0], [0.0; 3], RIGHT_GILLS),
+        part(Some(0), [-3.5, 1.0, -1.0], [0.0; 3], RIGHT_LEG),
+        part(Some(0), [3.5, 1.0, -1.0], [0.0; 3], LEFT_LEG),
+        part(Some(0), [-3.5, 1.0, -8.0], [0.0; 3], RIGHT_LEG),
+        part(Some(0), [3.5, 1.0, -8.0], [0.0; 3], LEFT_LEG),
+        part(Some(0), [0.0, 0.0, 1.0], [0.0; 3], TAIL),
+    ];
+    let [
+        body,
+        head,
+        top,
+        left_gills,
+        right_gills,
+        right_hind,
+        left_hind,
+        right_front,
+        left_front,
+        tail,
+    ] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    const X: usize = 3;
+    const Y: usize = 4;
+    const Z: usize = 5;
+    let age = l.age;
+    let still = 1.0 - moving;
+    n[body].pose[Y] += l.head_yaw.to_radians();
+    // `setupSwimmingAnimation`.
+    let f = moving.min(in_water);
+    if f > 1.0e-5 {
+        let t = age * 0.33;
+        let (sin, cos) = t.sin_cos();
+        let sway = 0.13 * sin;
+        n[body].pose[X] += (l.pitch.to_radians() + sway) * f;
+        n[head].pose[X] -= sway * 1.8 * f;
+        n[body].pose[1] -= 0.45 * cos * f;
+        n[top].pose[X] += (-0.5 * sin - 0.8) * f;
+        let gill = (0.3 * sin + 0.9) * f;
+        n[left_gills].pose[Y] += gill;
+        n[right_gills].pose[Y] -= gill;
+        n[tail].pose[Y] += 0.3 * (t * 0.9).cos() * f;
+        n[left_hind].pose[X] += 1.8849558 * f;
+        n[left_hind].pose[Y] += -0.4 * sin * f;
+        n[left_hind].pose[Z] += PI / 2.0 * f;
+        n[left_front].pose[X] += 1.8849558 * f;
+        n[left_front].pose[Y] += (-0.2 * cos - 0.1) * f;
+        n[left_front].pose[Z] += PI / 2.0 * f;
+    }
+    // `setupWaterHoveringAnimation`.
+    let f = still.min(in_water);
+    if f > 1.0e-5 {
+        let t = age * 0.075;
+        let cos = t.cos();
+        let sin = t.sin() * 0.15;
+        let body_x = (-0.15 + 0.075 * cos) * f;
+        n[body].pose[X] += body_x;
+        n[body].pose[1] -= sin * f;
+        n[head].pose[X] -= body_x;
+        n[top].pose[X] += 0.2 * cos * f;
+        let gill = (-0.3 * cos - 0.19) * f;
+        n[left_gills].pose[Y] += gill;
+        n[right_gills].pose[Y] -= gill;
+        n[left_hind].pose[X] += (PI * 3.0 / 4.0 - cos * 0.11) * f;
+        n[left_hind].pose[Y] += 0.47123894 * f;
+        n[left_hind].pose[Z] += 1.7278761 * f;
+        n[left_front].pose[X] += (PI / 4.0 - cos * 0.2) * f;
+        n[left_front].pose[Y] += 2.042035 * f;
+        n[tail].pose[Y] += 0.5 * cos * f;
+    }
+    // `setupGroundCrawlingAnimation`.
+    let f = moving.min(on_ground);
+    if f > 1.0e-5 {
+        let t = age * 0.11;
+        let cos = t.cos();
+        let hind_sway = (cos * cos - 2.0 * cos) / 5.0;
+        let front_sway = 0.7 * cos;
+        let turn = 0.09 * cos * f;
+        n[head].pose[Y] += turn;
+        n[tail].pose[Y] += turn;
+        let gill = (0.6 - 0.08 * (cos * cos + 2.0 * t.sin())) * f;
+        n[top].pose[X] += gill;
+        n[left_gills].pose[Y] -= gill;
+        n[right_gills].pose[Y] += gill;
+        let (hind_x, front_x) = (0.9424779 * f, 1.0995574 * f);
+        n[left_hind].pose[X] += hind_x;
+        n[left_hind].pose[Y] += (1.5 - hind_sway) * f;
+        n[left_hind].pose[Z] += -0.1 * f;
+        n[left_front].pose[X] += front_x;
+        n[left_front].pose[Y] += (PI / 2.0 - front_sway) * f;
+        n[right_hind].pose[X] += hind_x;
+        n[right_hind].pose[Y] += (-1.0 - hind_sway) * f;
+        n[right_front].pose[X] += front_x;
+        n[right_front].pose[Y] += (-PI / 2.0 - front_sway) * f;
+    }
+    // `setupLayStillOnGroundAnimation`.
+    let f = still.min(on_ground);
+    if f > 1.0e-5 {
+        let t = age * 0.09;
+        let (sin, cos) = t.sin_cos();
+        let movement = sin * sin - 2.0 * sin;
+        let movement2 = cos * cos - 3.0 * sin;
+        n[head].pose[X] += -0.09 * movement * f;
+        n[head].pose[Z] += -0.2 * f;
+        n[tail].pose[Y] += (-0.1 + 0.1 * movement) * f;
+        let gill = (0.6 + 0.05 * movement2) * f;
+        n[top].pose[X] += gill;
+        n[left_gills].pose[Y] -= gill;
+        n[right_gills].pose[Y] += gill;
+        n[left_hind].pose[X] += 1.1 * f;
+        n[left_hind].pose[Y] += f;
+        n[left_front].pose[X] += 0.8 * f;
+        n[left_front].pose[Y] += 2.3 * f;
+        n[left_front].pose[Z] -= 0.5 * f;
+    }
+    // `setupPlayDeadAnimation`.
+    if dead > 1.0e-5 {
+        n[left_hind].pose[X] += 1.4137167 * dead;
+        n[left_hind].pose[Y] += 1.0995574 * dead;
+        n[left_hind].pose[Z] += PI / 4.0 * dead;
+        n[left_front].pose[X] += PI / 4.0 * dead;
+        n[left_front].pose[Y] += 2.042035 * dead;
+        n[body].pose[X] += -0.15 * dead;
+        n[body].pose[Z] += 0.35 * dead;
+    }
+    // `applyMirrorLegRotations`.
+    let f = 1.0 - on_ground.min(moving);
+    if f > 1.0e-5 {
+        for (right, left) in [(right_hind, left_hind), (right_front, left_front)] {
+            n[right].pose[X] += n[left].pose[X] * f;
+            n[right].pose[Y] += -n[left].pose[Y] * f;
+            n[right].pose[Z] += -n[left].pose[Z] * f;
+        }
+    }
+    n
+}
+
+/// `BabyAxolotlModel.setupAnim`: it walks (as fast as it goes) while its walk animation
+/// runs, then swims, walks under water (on its walk's state, as vanilla has it), idles on
+/// the ground, under water, or on the ground under water, and plays dead.
+#[allow(clippy::approx_constant)]
+fn baby_axolotl(l: &Living, anims: [Option<f32>; 7]) -> Vec<Node> {
+    const BODY: &[Cube] = &[
+        cube([-2.0, -0.75, -2.75], [4.0, 2.0, 6.0], [0.0, 0.0]),
+        cube([0.0, -1.75, -2.75], [0.0, 3.0, 5.0], [0.0, 12.0]),
+    ];
+    const RIGHT_FRONT: &[Cube] = &[cube([-3.0, 0.0, -0.5], [3.0, 0.0, 1.0], [20.0, 16.0])];
+    const RIGHT_HIND: &[Cube] = &[cube([0.0, 0.0, -0.5], [3.0, 0.0, 1.0], [20.0, 14.0])];
+    const LEFT_FRONT: &[Cube] = &[cube([0.0, 0.0, -0.5], [3.0, 0.0, 1.0], [20.0, 13.0])];
+    const LEFT_HIND: &[Cube] = &[cube([0.0, 0.0, -0.5], [3.0, 0.0, 1.0], [20.0, 14.0])];
+    const TAIL: &[Cube] = &[cube([0.0, -1.5, -1.0], [0.0, 3.0, 8.0], [10.0, 9.0])];
+    const HEAD: &[Cube] = &[cube([-3.0, -2.0, -4.0], [6.0, 3.0, 4.0], [0.0, 8.0])];
+    const LEFT_GILLS: &[Cube] = &[cube([0.0, -3.5, 0.0], [3.0, 5.0, 0.0], [20.0, 8.0])];
+    const RIGHT_GILLS: &[Cube] = &[cube([-3.0, -3.5, 0.0], [3.0, 5.0, 0.0], [20.0, 3.0])];
+    const TOP_GILLS: &[Cube] = &[cube([-3.0, -3.0, 0.0], [6.0, 3.0, 0.0], [20.0, 0.0])];
+    // Its own root part is called "root"; the play dead animation's "root" channel is the
+    // layer's, and moves nothing.
+    const BONES: &[&str] = &[
+        "",
+        "body",
+        "right_front_leg",
+        "right_hind_leg",
+        "right_leg_r1",
+        "left_front_leg",
+        "left_hind_leg",
+        "tail",
+        "head",
+        "left_gills",
+        "right_gills",
+        "top_gills",
+    ];
+    let half = 1.5708;
+    let mut nodes = vec![
+        part(None, [0.0, 24.0, 0.0], [0.0; 3], &[]),
+        part(Some(0), [0.0, -1.25, 1.75], [0.0; 3], BODY),
+        part(Some(1), [-2.0, 0.25, -1.25], [0.0; 3], RIGHT_FRONT),
+        part(Some(1), [-2.0, 0.25, 1.75], [0.0, half, half], &[]),
+        part(Some(3), [0.0; 3], [-half, 0.0, half], RIGHT_HIND),
+        part(Some(1), [2.0, 0.25, -1.25], [0.0; 3], LEFT_FRONT),
+        part(Some(1), [2.0, 0.25, 1.75], [0.0; 3], LEFT_HIND),
+        part(Some(1), [0.0, -0.25, 3.25], [0.0; 3], TAIL),
+        part(Some(1), [0.0, 0.25, -2.75], [0.0; 3], HEAD),
+        part(Some(8), [3.0, -0.5, -2.0], [0.0; 3], LEFT_GILLS),
+        part(Some(8), [-3.0, -0.5, -2.0], [0.0; 3], RIGHT_GILLS),
+        part(Some(8), [0.0, -2.0, -2.0], [0.0; 3], TOP_GILLS),
+    ];
+    use crate::animations::*;
+    let [
+        swim,
+        walk,
+        _walk_under_water,
+        idle_water,
+        idle_water_ground,
+        idle_ground,
+        dead,
+    ] = anims;
+    if walk.is_some() {
+        let (millis, k) =
+            crate::animation::Animation::walk_millis(l.walk_pos, l.walk_speed, 15.0, 30.0);
+        BABY_AXOLOTL_WALK_FLOOR.apply_at(millis, k, BONES, &mut nodes);
+    }
+    for (anim, t) in [
+        (&BABY_AXOLOTL_SWIM, swim),
+        (&BABY_AXOLOTL_WALK_FLOOR_UNDERWATER, walk),
+        (&BABY_AXOLOTL_IDLE_FLOOR, idle_ground),
+        (&BABY_AXOLOTL_IDLE_UNDERWATER, idle_water),
+        (&BABY_AXOLOTL_IDLE_FLOOR_UNDERWATER, idle_water_ground),
+        (&BABY_AXOLOTL_PLAY_DEAD, dead),
+    ] {
+        if let Some(t) = t {
+            anim.apply(t, BONES, &mut nodes);
+        }
+    }
+    nodes
+}
+
+/// Where `breeze`'s eyes and wind start among its parts; the wind's parts come last.
+const BREEZE_EYES_PART: usize = 6;
+const BREEZE_WIND_BODY: usize = 7;
+
+/// `BreezeModel.createBaseMesh` with `setupAnim`: it idles, shoots, slides, slides back,
+/// inhales and long jumps. Its head doesn't follow its look.
+#[allow(clippy::approx_constant)]
+fn breeze(anims: [Option<f32>; 6]) -> Vec<Node> {
+    const ROD: &[Cube] = &[cube([-1.0, 0.0, -3.0], [2.0, 8.0, 2.0], [0.0, 17.0])];
+    const HEAD: &[Cube] = &[
+        cube([-5.0, -5.0, -4.2], [10.0, 3.0, 4.0], [4.0, 24.0]),
+        cube([-4.0, -8.0, -4.0], [8.0, 8.0, 8.0], [0.0, 0.0]),
+    ];
+    const WIND_BOTTOM: &[Cube] = &[cube([-2.5, -7.0, -2.5], [5.0, 7.0, 5.0], [1.0, 83.0])];
+    const WIND_MID: &[Cube] = &[
+        cube([-6.0, -6.0, -6.0], [12.0, 6.0, 12.0], [74.0, 28.0]),
+        cube([-4.0, -6.0, -4.0], [8.0, 6.0, 8.0], [78.0, 32.0]),
+        cube([-2.5, -6.0, -2.5], [5.0, 6.0, 5.0], [49.0, 71.0]),
+    ];
+    const WIND_TOP: &[Cube] = &[
+        cube([-9.0, -8.0, -9.0], [18.0, 8.0, 18.0], [0.0, 0.0]),
+        cube([-6.0, -8.0, -6.0], [12.0, 8.0, 12.0], [6.0, 6.0]),
+        cube([-2.5, -8.0, -2.5], [5.0, 8.0, 5.0], [105.0, 57.0]),
+    ];
+    const BONES: &[&str] = &[
+        "body",
+        "rods",
+        "rod_1",
+        "rod_2",
+        "rod_3",
+        "head",
+        "eyes",
+        "wind_body",
+        "wind_bottom",
+        "wind_mid",
+        "wind_top",
+    ];
+    let mut nodes = vec![
+        part(None, [0.0; 3], [0.0; 3], &[]),
+        part(Some(0), [0.0, 8.0, 0.0], [0.0; 3], &[]),
+        part(
+            Some(1),
+            [2.5981, -3.0, 1.5],
+            [-2.7489, -1.0472, 3.1416],
+            ROD,
+        ),
+        part(
+            Some(1),
+            [-2.5981, -3.0, 1.5],
+            [-2.7489, 1.0472, 3.1416],
+            ROD,
+        ),
+        part(Some(1), [0.0, -3.0, -3.0], [0.3927, 0.0, 0.0], ROD),
+        part(Some(0), [0.0, 4.0, 0.0], [0.0; 3], HEAD),
+        part(Some(5), [0.0; 3], [0.0; 3], HEAD),
+        part(None, [0.0; 3], [0.0; 3], &[]),
+        part(Some(7), [0.0, 24.0, 0.0], [0.0; 3], WIND_BOTTOM),
+        part(Some(8), [0.0, -7.0, 0.0], [0.0; 3], WIND_MID),
+        part(Some(9), [0.0, -6.0, 0.0], [0.0; 3], WIND_TOP),
+    ];
+    use crate::animations::*;
+    let animations = [
+        &BREEZE_IDLE,
+        &BREEZE_SHOOT,
+        &BREEZE_SLIDE,
+        &BREEZE_SLIDE_BACK,
+        &BREEZE_INHALE,
+        &BREEZE_JUMP,
+    ];
+    for (anim, t) in animations.iter().zip(anims) {
+        if let Some(t) = t {
+            anim.apply(t, BONES, &mut nodes);
+        }
+    }
+    nodes
+}
+
+/// Quads with texture coordinates in 0..1 of their texture, moved `offset` along u and
+/// wrapped as a repeating sampler would: a quad that crosses the texture's right edge is
+/// cut there in two, the part past it starting again from the left.
+fn scrolled(quads: &[Quad], offset: f32) -> Vec<([Vec3; 4], [[f32; 2]; 4])> {
+    let mut out = Vec::new();
+    for q in quads {
+        let mut uv = q.uv;
+        for c in &mut uv {
+            c[0] += offset;
+        }
+        let lo = uv.iter().map(|c| c[0]).fold(f32::MAX, f32::min);
+        let hi = uv.iter().map(|c| c[0]).fold(f32::MIN, f32::max);
+        if hi <= 1.0 {
+            out.push((q.pos, uv));
+            continue;
+        }
+        if lo >= 1.0 {
+            out.push((q.pos, uv.map(|[u, v]| [u - 1.0, v])));
+            continue;
+        }
+        // Each corner's partner across the u direction: the neighbour it doesn't share u
+        // with.
+        let partner = |i: usize| {
+            let next = (i + 1) % 4;
+            if (q.uv[i][0] - q.uv[next][0]).abs() > 1.0e-6 {
+                next
+            } else {
+                (i + 3) % 4
+            }
+        };
+        let cut = |i: usize| {
+            let j = partner(i);
+            let t = (1.0 - uv[i][0]) / (uv[j][0] - uv[i][0]);
+            q.pos[i].lerp(q.pos[j], t)
+        };
+        let (mut left, mut right) = ((q.pos, uv), (q.pos, uv));
+        for i in 0..4 {
+            if uv[i][0] > 1.0 {
+                left.0[i] = cut(i);
+                left.1[i][0] = 1.0;
+                right.1[i][0] -= 1.0;
+            } else {
+                right.0[i] = cut(i);
+                right.1[i][0] = 0.0;
+            }
+        }
+        out.push(left);
+        out.push(right);
+    }
+    out
 }
 
 /// `AdultFelineModel.createBodyMesh`'s cubes, grown by its deformation: head (with nose
@@ -5131,6 +6734,8 @@ mod tests {
             burning: None,
             hurt: false,
             death_time: 0.0,
+            invisible: false,
+            invisible_to_player: false,
         }
     }
 

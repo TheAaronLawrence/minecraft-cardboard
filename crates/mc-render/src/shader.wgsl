@@ -143,6 +143,16 @@ fn fs_translucent(in: VertexOut) -> @location(0) vec4<f32> {
     return shade(in);
 }
 
+// `ALPHA_CUTOUT` 0.1: blended, but nothing (not even depth) where it's almost clear.
+@fragment
+fn fs_translucent_cutout(in: VertexOut) -> @location(0) vec4<f32> {
+    let c = shade(in);
+    if c.a < 0.1 {
+        discard;
+    }
+    return c;
+}
+
 // Sky: one full-screen triangle that draws vanilla's sky disc, a fan 16 blocks overhead with a
 // 512-block radius, fogged by the distance its vertices interpolate (16 at the centre, 512 at
 // the rim). Below the disc's edge only the fog colour shows, as vanilla's clear colour.

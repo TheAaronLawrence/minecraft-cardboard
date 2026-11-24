@@ -136,6 +136,7 @@ impl Hands {
         pitch: f32,
         (skin, slim): (String, bool),
         using: Option<mc_render::entity::Using>,
+        invisible: bool,
     ) -> mc_render::entity::FirstPerson {
         let lerp = |[old, now]: [f32; 2]| old + (now - old) * pt;
         mc_render::entity::FirstPerson {
@@ -150,6 +151,7 @@ impl Hands {
                 .map(|(hand, kind, _)| (hand as usize, kind, self.swing.animation(pt))),
             sway: [pitch - lerp(self.bob[0]), yaw - lerp(self.bob[1])],
             using,
+            invisible,
         }
     }
 }

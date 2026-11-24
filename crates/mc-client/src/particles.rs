@@ -2,7 +2,8 @@
 //! of smoke dying mobs leave (`ExplodeParticle`), the sparks and dark hearts of hits
 //! (`CritParticle`), the crumbs of food being eaten (`BreakingItemParticle`), potion
 //! swirls (`SpellParticle`), a glow squid's glow (`GlowParticle`), squids' ink
-//! (`SquidInkParticle`), and bits of blocks broken, mined and run on (`TerrainParticle`).
+//! (`SquidInkParticle`), bits of blocks broken, mined and run on (`TerrainParticle`), and
+//! the purple specks about endermen and teleports (`PortalParticle`).
 
 use glam::DVec3;
 
@@ -30,6 +31,16 @@ pub enum Kind {
     /// `ParticleTypes.SQUID_INK` and `GLOW_SQUID_INK` (`SquidInkParticle`): a puff of
     /// black or teal ink that shrinks as it fades, sinking through air, always fully lit.
     Ink,
+    /// `ParticleTypes.CLOUD` (`PlayerCloudParticle`): a big pale puff that swells into
+    /// view, blended.
+    Cloud,
+    /// `ParticleTypes.PORTAL` (`PortalParticle`): a purple speck that sweeps back in to
+    /// `start` from its offset, dropping a block as it goes, glowing brighter until it's
+    /// gone; it keeps the one `generic_<sprite>` it's given.
+    Portal {
+        start: DVec3,
+        sprite: u8,
+    },
 }
 
 /// A particle: where it is now and last tick, its motion, and how far through its life.
@@ -135,35 +146,39 @@ impl Particles {
                 self.random() as f64 * height as f64,
                 (2.0 * self.random() as f64 - 1.0) * width as f64,
             );
-            let pos = feet + spot - drift * 10.0;
-            // `ExplodeParticle`'s constructor.
-            let jitter = DVec3::new(
-                (self.random() * 2.0 - 1.0) as f64,
-                (self.random() * 2.0 - 1.0) as f64,
-                (self.random() * 2.0 - 1.0) as f64,
-            ) * 0.05;
-            let grey = self.random() * 0.3 + 0.7;
-            let size = 0.1 * (self.random() * self.random() * 6.0 + 1.0);
-            let lifetime = (16.0 / (self.random() as f64 * 0.8 + 0.2)) as u32 + 2;
-            self.particles.push(Particle {
-                kind: Kind::Poof,
-                old: pos,
-                pos,
-                velocity: drift + jitter,
-                on_ground: false,
-                stopped: false,
-                age: 0,
-                lifetime,
-                size,
-                color: [grey; 3],
-                rect: None,
-                alpha: 1.0,
-                // Smoke rises.
-                gravity: -0.1,
-                friction: 0.9,
-                physics: true,
-            });
+            self.explode(feet + spot - drift * 10.0, drift);
         }
+    }
+
+    /// `ExplodeParticle.Provider` (`ParticleTypes.POOF`): a puff of smoke at `pos`, moving
+    /// at `velocity` give or take a little, rising as it slows.
+    pub fn explode(&mut self, pos: DVec3, velocity: DVec3) {
+        let jitter = DVec3::new(
+            (self.random() * 2.0 - 1.0) as f64,
+            (self.random() * 2.0 - 1.0) as f64,
+            (self.random() * 2.0 - 1.0) as f64,
+        ) * 0.05;
+        let grey = self.random() * 0.3 + 0.7;
+        let size = 0.1 * (self.random() * self.random() * 6.0 + 1.0);
+        let lifetime = (16.0 / (self.random() as f64 * 0.8 + 0.2)) as u32 + 2;
+        self.particles.push(Particle {
+            kind: Kind::Poof,
+            old: pos,
+            pos,
+            velocity: velocity + jitter,
+            on_ground: false,
+            stopped: false,
+            age: 0,
+            lifetime,
+            size,
+            color: [grey; 3],
+            rect: None,
+            alpha: 1.0,
+            // Smoke rises.
+            gravity: -0.1,
+            friction: 0.9,
+            physics: true,
+        });
     }
 
     /// `CritParticle`'s providers: a spark (or dark heart) at `pos`, thrown by `aux`.
@@ -385,6 +400,98 @@ impl Particles {
         self.drift(Kind::Effect, pos, aux, |_| tint);
     }
 
+    /// `PlayerCloudParticle.Provider`: a cloud at `pos`, drifting a little and moving at
+    /// `aux`. (It isn't pulled down onto players within two blocks yet.)
+    pub fn cloud(&mut self, pos: DVec3, aux: DVec3) {
+        // `Particle`'s constructor: its lifetime (replaced below), then a random direction
+        // at a random speed, a little upward, slowed to a tenth.
+        self.random();
+        let mut d = DVec3::new(
+            ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+            ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+            ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+        );
+        let speed = ((self.random() + self.random() + 1.0) * 0.15) as f64;
+        d = d / d.length() * speed * f64::from(0.4f32);
+        d.y += f64::from(0.1f32);
+        let size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 * 1.875;
+        let grey = 1.0 - self.random() * 0.3;
+        let base = (8.0 / (self.random() as f64 * 0.8 + 0.3)) as i32;
+        let lifetime = (base as f32 * 2.5).max(1.0) as u32;
+        self.particles.push(Particle {
+            kind: Kind::Cloud,
+            old: pos,
+            pos,
+            velocity: d * f64::from(0.1f32) + aux,
+            on_ground: false,
+            stopped: false,
+            age: 0,
+            lifetime,
+            size,
+            color: [grey; 3],
+            alpha: 1.0,
+            rect: None,
+            gravity: 0.0,
+            friction: 0.96,
+            physics: false,
+        });
+    }
+
+    /// `PortalParticle.Provider`: a speck at `pos` that sweeps through `offset` back to
+    /// `pos` over its life.
+    pub fn portal(&mut self, pos: DVec3, offset: DVec3) {
+        // `Particle`'s and `SingleQuadParticle`'s lifetime and size, both replaced, and
+        // `SpriteSet.get(random)`.
+        self.random();
+        self.random();
+        let sprite = (self.random() * 8.0).min(7.0) as u8;
+        let size = 0.1 * (self.random() * 0.2 + 0.5);
+        let br = self.random() * 0.6 + 0.4;
+        let lifetime = (self.random() * 10.0) as u32 + 40;
+        self.particles.push(Particle {
+            kind: Kind::Portal { start: pos, sprite },
+            old: pos,
+            pos,
+            velocity: offset,
+            on_ground: false,
+            stopped: false,
+            age: 0,
+            lifetime,
+            size,
+            color: [br * 0.9, br * 0.3, br],
+            alpha: 1.0,
+            rect: None,
+            gravity: 0.0,
+            friction: 1.0,
+            physics: false,
+        });
+    }
+
+    /// `ClientLevel.addParticle(PORTAL)` 128 times along a teleport, from `from` to `to`, about a
+    /// box `width` × `height` (`LivingEntity.handleEntityEvent(46)` and
+    /// `LevelEventHandler`'s 2018).
+    pub fn teleport(&mut self, from: DVec3, to: DVec3, [width, height]: [f64; 2], spread: bool) {
+        for i in 0..128 {
+            // An entity's spreads evenly along the way; level event 2018's at random.
+            let d = if spread {
+                f64::from(i) / 127.0
+            } else {
+                f64::from(self.random())
+            };
+            let mut r = || f64::from((self.random() - 0.5) * 0.2);
+            let offset = DVec3::new(r(), r(), r());
+            let at = from.lerp(to, d)
+                + DVec3::new(
+                    (f64::from(self.random()) - 0.5) * width * 2.0,
+                    f64::from(self.random()) * height,
+                    (f64::from(self.random()) - 0.5) * width * 2.0,
+                );
+            if self.allowed(false, false) {
+                self.portal(at, offset);
+            }
+        }
+    }
+
     /// `SquidInkParticle.Provider` (`glow` false, black) and `GlowInkProvider` (teal): a
     /// puff at `pos` moving at `velocity`, half a block across.
     pub fn ink(&mut self, pos: DVec3, velocity: DVec3, glow: bool) {
@@ -516,10 +623,22 @@ impl Particles {
             .iter()
             .map(|p| mc_render::particle::Particle {
                 pos: p.old.lerp(p.pos, pt as f64).as_vec3(),
-                size: p.size,
+                // `PlayerCloudParticle.getQuadSize`: it swells to full size over the first
+                // thirty-second of its life.
+                size: match p.kind {
+                    Kind::Cloud => {
+                        p.size * ((p.age as f32 + pt) / p.lifetime as f32 * 32.0).clamp(0.0, 1.0)
+                    }
+                    // `PortalParticle.getQuadSize`: it grows in, quickly at first.
+                    Kind::Portal { .. } => {
+                        let s = 1.0 - (p.age as f32 + pt) / p.lifetime as f32;
+                        p.size * (1.0 - s * s)
+                    }
+                    _ => p.size,
+                },
                 sprite: match p.kind {
                     // `SpriteSet.get(age, lifetime)`.
-                    Kind::Poof | Kind::Ink => {
+                    Kind::Poof | Kind::Ink | Kind::Cloud => {
                         POOF[(p.age as usize * (POOF.len() - 1)) / p.lifetime.max(1) as usize]
                     }
                     Kind::Crit => CRIT,
@@ -530,12 +649,13 @@ impl Particles {
                         EFFECT[(p.age as usize * (EFFECT.len() - 1)) / p.lifetime as usize]
                     }
                     Kind::Glow => GLOW,
+                    Kind::Portal { sprite, .. } => POOF[POOF.len() - 1 - sprite as usize],
                 },
                 rect: p.rect,
                 color: p.color,
                 alpha: p.alpha,
                 // `SimpleAnimatedParticle`: blended, and always fully lit.
-                translucent: matches!(p.kind, Kind::Effect | Kind::Ink),
+                translucent: matches!(p.kind, Kind::Effect | Kind::Ink | Kind::Cloud),
                 light: if p.kind == Kind::Ink {
                     [15, 15]
                 } else {
@@ -544,6 +664,8 @@ impl Particles {
                 // `GlowParticle.getLightCoords`: block light grows to full over its life.
                 emission: match p.kind {
                     Kind::Glow => (p.age as f32 + pt) / p.lifetime as f32,
+                    // `PortalParticle.getLightCoords`: brighter by its age to the fourth.
+                    Kind::Portal { .. } => (p.age as f32 / p.lifetime as f32).powi(4),
                     _ => 0.0,
                 },
             })
@@ -560,6 +682,13 @@ impl Particle {
             return false;
         }
         self.age += 1;
+        // `PortalParticle.tick`: not moved by its motion but placed along its curve.
+        if let Kind::Portal { start, .. } = self.kind {
+            let t = self.age as f32 / self.lifetime as f32;
+            let back = 1.0 - (-t + t * t * 2.0);
+            self.pos = start + self.velocity * f64::from(back) + DVec3::Y * f64::from(1.0 - t);
+            return true;
+        }
         self.velocity.y -= 0.04 * self.gravity;
         // `Particle.move`: its position is its box's bottom middle.
         match collide.filter(|_| self.physics) {

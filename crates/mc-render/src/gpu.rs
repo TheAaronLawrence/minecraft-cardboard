@@ -236,6 +236,8 @@ pub struct Renderer {
     cutout: wgpu::RenderPipeline,
     entity: wgpu::RenderPipeline,
     translucent: wgpu::RenderPipeline,
+    /// Translucent entity layers that write depth where their alpha is at least 0.1.
+    entity_translucent: wgpu::RenderPipeline,
     see_through: wgpu::RenderPipeline,
     portal: wgpu::RenderPipeline,
     outline: wgpu::RenderPipeline,
@@ -251,7 +253,9 @@ pub struct Renderer {
     crack_vertices: Option<(wgpu::Buffer, u32)>,
     /// Players, mobs and dropped items, and their index count.
     entity_vertices: Option<(wgpu::Buffer, u32)>,
-    /// Entities' glowing layers, and their index count.
+    /// Entities' translucent layers that write depth, and their glowing layers, with
+    /// index counts.
+    entity_translucent_vertices: Option<(wgpu::Buffer, u32)>,
     eye_vertices: Option<(wgpu::Buffer, u32)>,
     /// Name tags' see-through parts, and their opaque text, with index counts.
     see_through_vertices: Option<(wgpu::Buffer, u32)>,
@@ -747,6 +751,13 @@ impl Renderer {
         // `RenderPipelines.ENTITY_CUTOUT`: entities show their boxes' back faces too, which
         // some textures paint where the front is clear, such as a chicken's legs.
         let entity = pipeline("fs_cutout", None, true, false, false);
+        let entity_translucent = pipeline(
+            "fs_translucent_cutout",
+            Some(wgpu::BlendState::ALPHA_BLENDING),
+            true,
+            false,
+            false,
+        );
         let translucent = pipeline(
             "fs_translucent",
             Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1015,6 +1026,7 @@ impl Renderer {
             cutout,
             entity,
             translucent,
+            entity_translucent,
             see_through,
             portal,
             outline,
@@ -1027,6 +1039,7 @@ impl Renderer {
             screen: None,
             crack_vertices: None,
             entity_vertices: None,
+            entity_translucent_vertices: None,
             eye_vertices: None,
             see_through_vertices: None,
             tag_vertices: None,
@@ -1142,6 +1155,8 @@ impl Renderer {
     /// Draws these entity quads (from `entity::vertices`) after the cutout blocks.
     pub fn set_entities(&mut self, meshes: &crate::entity::Meshes) {
         self.entity_vertices = self.quads_buffer("entities", &meshes.cutout);
+        self.entity_translucent_vertices =
+            self.quads_buffer("translucent entity layers", &meshes.translucent);
         self.eye_vertices = self.quads_buffer("entity eyes", &meshes.eyes);
         self.see_through_vertices = self.quads_buffer("name tags behind", &meshes.see_through);
         self.tag_vertices = self.quads_buffer("name tags", &meshes.tags);
@@ -1701,14 +1716,20 @@ impl Renderer {
                         pass.set_vertex_buffer(0, buffer.slice(..));
                         pass.draw_indexed(0..*count, 0, 0..1);
                     }
+                    // Translucent layers that write depth, such as a breeze's wind; then
                     // `RenderPipelines.EYES`: blended over the bodies, fully bright, without
                     // writing depth.
-                    if slot == 1
-                        && let Some((buffer, count)) = &self.eye_vertices
-                    {
-                        pass.set_pipeline(&self.translucent);
-                        pass.set_vertex_buffer(0, buffer.slice(..));
-                        pass.draw_indexed(0..*count, 0, 0..1);
+                    if slot == 1 {
+                        for (pipeline, vertices) in [
+                            (&self.entity_translucent, &self.entity_translucent_vertices),
+                            (&self.translucent, &self.eye_vertices),
+                        ] {
+                            if let Some((buffer, count)) = vertices {
+                                pass.set_pipeline(pipeline);
+                                pass.set_vertex_buffer(0, buffer.slice(..));
+                                pass.draw_indexed(0..*count, 0, 0..1);
+                            }
+                        }
                     }
                     // Name tags: their text where nothing hides it (`RenderPipelines.TEXT`),
                     // then their see-through parts over everything so far, the text too, as

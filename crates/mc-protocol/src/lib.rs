@@ -1702,15 +1702,16 @@ fn entity_data(r: &mut Reader, registry: &Registry, config: &Config) -> Vec<(u8,
                         level,
                     }
                 }
-                // Cat, cow, wolf, frog, pig and chicken variants: ids in their synced
-                // registries.
-                serializer @ (21 | 23 | 25 | 27 | 28 | 30) => {
+                // Cat, cow, wolf, frog, pig, chicken and zombie nautilus variants: ids in
+                // their synced registries.
+                serializer @ (21 | 23 | 25 | 27 | 28 | 30 | 32) => {
                     let registry = match serializer {
                         21 => "minecraft:cat_variant",
                         23 => "minecraft:cow_variant",
                         25 => "minecraft:wolf_variant",
                         27 => "minecraft:frog_variant",
                         28 => "minecraft:pig_variant",
+                        32 => "minecraft:zombie_nautilus_variant",
                         _ => "minecraft:chicken_variant",
                     };
                     let id = r.count()?;
