@@ -1,6 +1,8 @@
 //! Draws a world: block models baked into quads, meshed per chunk section with vanilla-style
 //! lighting, and rendered with wgpu.
 
+mod animation;
+mod animations;
 pub mod atlas;
 pub mod bake;
 pub mod chest;

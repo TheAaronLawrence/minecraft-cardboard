@@ -46,6 +46,20 @@ pub fn block_tint(name: &str, properties: &[(&str, &str)]) -> Option<Tint> {
     })
 }
 
+/// `BlockTintSource.color`: a tinted block's colour outside a level (in an enderman's
+/// hands), where grass takes `GrassColor.getDefaultColor`, `grass`.
+pub fn color_in_hand(name: &str, tint: Tint, grass: [f32; 3]) -> [f32; 3] {
+    match tint {
+        // `BlockTintSources.sugarCane`.
+        Tint::Grass if name == "minecraft:sugar_cane" => [1.0; 3],
+        Tint::Grass => grass,
+        Tint::Foliage => rgb(0x48B518),
+        Tint::DryFoliage => rgb(0x5C3C32),
+        Tint::Water => [1.0; 3],
+        Tint::Fixed(c) => c,
+    }
+}
+
 /// `RedstoneWireBlock.COLORS`: dark red when unpowered, brightening to orange-red at 15.
 fn redstone(power: u32) -> [f32; 3] {
     let f = power as f32 / 15.0;

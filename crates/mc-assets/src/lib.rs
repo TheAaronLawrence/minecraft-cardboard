@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The purple and black sprite the game draws in code; it has no texture file.
@@ -47,6 +47,36 @@ impl Resources {
             .join(namespace)
             .join(kind)
             .join(format!("{path}.{extension}"))
+    }
+
+    /// A tag's entries, with the tags it includes expanded: `kind` is the registry's
+    /// folder under `tags/`, such as `block` or `item`, and an entry is a name or
+    /// `{"id": name, "required": false}` (`TagEntry`).
+    pub fn tag(&self, kind: &str, tag: &str) -> Result<HashSet<String>> {
+        let mut names = HashSet::new();
+        let mut pending = vec![tag.to_owned()];
+        let mut seen = HashSet::new();
+        while let Some(tag) = pending.pop() {
+            if !seen.insert(tag.clone()) {
+                continue;
+            }
+            let path = self.data_path(&format!("tags/{kind}"), &tag, "json");
+            let json: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&path).with_context(|| format!("{kind} tag {tag}"))?,
+            )?;
+            for value in json["values"].as_array().into_iter().flatten() {
+                let Some(id) = value.as_str().or(value["id"].as_str()) else {
+                    continue;
+                };
+                match id.strip_prefix('#') {
+                    Some(inner) => pending.push(inner.to_owned()),
+                    None => {
+                        names.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(names)
     }
 
     /// `kind` is the folder under `data/<namespace>/`, such as `worldgen/biome`.

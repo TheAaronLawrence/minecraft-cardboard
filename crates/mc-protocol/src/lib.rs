@@ -62,6 +62,9 @@ pub enum Event {
     /// The player respawned, in this game mode.
     Respawn {
         game_mode: u8,
+        /// `KEEP_ATTRIBUTE_MODIFIERS`: the attributes keep their modifiers, not only their
+        /// base values.
+        keep_attributes: bool,
     },
     /// The `immediate_respawn` game rule changed: whether dying shows the death screen.
     ShowDeathScreen(bool),
@@ -92,6 +95,13 @@ pub enum Event {
     HurtAnimation {
         id: i32,
         yaw: f32,
+    },
+    /// An entity's attributes that changed (`ClientboundUpdateAttributesPacket`), by name,
+    /// each with its base value and its value after its modifiers
+    /// (`AttributeInstance.calculateValue`), before the attribute's range clamps it.
+    Attributes {
+        id: i32,
+        values: Vec<(String, f64, f64)>,
     },
     /// The player's health, food level and saturation.
     Health {
@@ -341,18 +351,29 @@ pub enum DataValue {
     Bool(bool),
     /// An item stack: its item and count, or nothing.
     Item(Option<(String, i32)>),
-    /// A cow, pig or chicken variant, by name, such as `minecraft:warm`.
+    /// A cow, pig, chicken or wolf variant, by name, such as `minecraft:warm`.
     Variant(String),
+    /// A villager's type and profession, by name, and its level (`VillagerData`).
+    Villager {
+        kind: String,
+        profession: String,
+        level: i32,
+    },
     /// A living entity's effect particles (`DATA_EFFECT_PARTICLES`): the ARGB colour of
     /// each potion swirl (`entity_effect`) among them.
     Effects(Vec<u32>),
+    /// An optional text component, such as `Entity.DATA_CUSTOM_NAME`: its plain text, or
+    /// empty when there's none.
+    Text(String),
 }
 
-/// An item an entity holds or wears: its name, and its `dyed_color` if it has one.
+/// An item an entity holds or wears: its name, its `dyed_color` if it has one, and
+/// whether it's a loaded crossbow (`CrossbowItem.isCharged`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Equipped {
     pub item: String,
     pub dye: Option<u32>,
+    pub charged: bool,
 }
 
 /// A `PositionPath`: where an entity moves to, straight there, or through positions each
@@ -870,8 +891,10 @@ fn play(
                 r.varint()?;
                 // The server waits for the client to load again before the player can move.
                 loaded = false;
+                let game_mode = spawn_game_mode(&mut r)?.0;
                 tx.send(Event::Respawn {
-                    game_mode: spawn_game_mode(&mut r)?.0,
+                    game_mode,
+                    keep_attributes: r.u8()? & 1 != 0,
                 })
                 .is_ok()
             }
@@ -934,7 +957,11 @@ fn play(
                 match registry.particle_type(kind).filter(|n| {
                     matches!(
                         *n,
-                        "minecraft:crit" | "minecraft:enchanted_hit" | "minecraft:damage_indicator"
+                        "minecraft:crit"
+                            | "minecraft:enchanted_hit"
+                            | "minecraft:damage_indicator"
+                            | "minecraft:squid_ink"
+                            | "minecraft:glow_squid_ink"
                     )
                 }) {
                     Some(name) => {
@@ -972,13 +999,10 @@ fn play(
                 // slots before it still count.
                 loop {
                     let slot = r.u8()?;
-                    let Ok(stack) = item_stack_dyed(&mut r, registry) else {
+                    let Ok(stack) = item_stack_full(&mut r, registry) else {
                         break;
                     };
-                    slots.push((
-                        slot & 0x7f,
-                        stack.map(|(item, _, dye)| Equipped { item, dye }),
-                    ));
+                    slots.push((slot & 0x7f, stack.map(|(stack, _)| stack)));
                     if slot & 0x80 == 0 {
                         break;
                     }
@@ -1155,6 +1179,25 @@ fn play(
             "hurt_animation" => {
                 let id = r.varint()?;
                 tx.send(Event::HurtAnimation { id, yaw: r.f32()? }).is_ok()
+            }
+            // Each attribute's base, then its modifiers: an id, an amount and an operation
+            // (add 0, multiply the base 1, multiply the total 2), which replace all it had.
+            "update_attributes" => {
+                let id = r.varint()?;
+                let mut values = Vec::new();
+                for _ in 0..r.count()? {
+                    let attribute = r.count()? as u32;
+                    let base = r.f64()?;
+                    let mut modifiers = Vec::new();
+                    for _ in 0..r.count()? {
+                        r.string()?;
+                        modifiers.push((r.f64()?, r.varint()?));
+                    }
+                    if let Some(name) = registry.attribute(attribute) {
+                        values.push((name.to_owned(), base, attribute_value(base, &modifiers)));
+                    }
+                }
+                tx.send(Event::Attributes { id, values }).is_ok()
             }
             "set_health" => tx
                 .send(Event::Health {
@@ -1582,7 +1625,9 @@ fn entity_data(r: &mut Reader, registry: &Registry, config: &Config) -> Vec<(u8,
                 0 => DataValue::Byte(r.u8()?),
                 // Ints, directions, optional ints, poses, the sound variants, sniffer,
                 // armadillo and copper states, arms and dye colours.
-                1 | 12 | 19 | 20 | 24 | 29 | 31 | 35..=38 | 42 | 43 => DataValue::Int(r.varint()?),
+                1 | 12 | 19 | 20 | 22 | 24 | 26 | 29 | 31 | 35..=38 | 42 | 43 => {
+                    DataValue::Int(r.varint()?)
+                }
                 2 => DataValue::Int(r.varlong()? as i32),
                 3 => DataValue::Float(r.f32()?),
                 4 => {
@@ -1593,12 +1638,13 @@ fn entity_data(r: &mut Reader, registry: &Registry, config: &Config) -> Vec<(u8,
                     r.nbt()?;
                     continue;
                 }
-                6 => {
-                    if r.bool()? {
-                        r.nbt()?;
-                    }
-                    continue;
-                }
+                6 => DataValue::Text(if r.bool()? {
+                    let tag = r.nbt()?;
+                    let json = tag.as_ref().map_or(serde_json::Value::Null, nbt_json);
+                    component_text(&json, &Default::default())
+                } else {
+                    String::new()
+                }),
                 7 => DataValue::Item(item_stack(r, registry)?),
                 8 => DataValue::Bool(r.bool()?),
                 9 | 39 => {
@@ -1645,17 +1691,25 @@ fn entity_data(r: &mut Reader, registry: &Registry, config: &Config) -> Vec<(u8,
                     }
                     DataValue::Effects(colors)
                 }
-                // A villager's type, profession and level.
+                // A villager's type, profession and level: ids in the built-in registries.
                 18 => {
-                    for _ in 0..3 {
-                        r.varint()?;
+                    let (kind, profession) = (r.varint()? as u32, r.varint()? as u32);
+                    let level = r.varint()?;
+                    let name = |n: Option<&str>| n.unwrap_or("minecraft:none").to_owned();
+                    DataValue::Villager {
+                        kind: name(registry.villager_type(kind)),
+                        profession: name(registry.villager_profession(profession)),
+                        level,
                     }
-                    continue;
                 }
-                // Cow, pig and chicken variants: ids in their synced registries.
-                serializer @ (23 | 28 | 30) => {
+                // Cat, cow, wolf, frog, pig and chicken variants: ids in their synced
+                // registries.
+                serializer @ (21 | 23 | 25 | 27 | 28 | 30) => {
                     let registry = match serializer {
+                        21 => "minecraft:cat_variant",
                         23 => "minecraft:cow_variant",
+                        25 => "minecraft:wolf_variant",
+                        27 => "minecraft:frog_variant",
                         28 => "minecraft:pig_variant",
                         _ => "minecraft:chicken_variant",
                     };
@@ -1761,14 +1815,11 @@ fn spawn_game_mode(r: &mut Reader) -> Result<(u8, bool, i32)> {
 /// slot. Its data components follow without lengths, so each must be read to reach the
 /// next stack; the common ones are, and any other fails the read.
 fn item_stack(r: &mut Reader, registry: &Registry) -> Result<Option<(String, i32)>> {
-    Ok(item_stack_dyed(r, registry)?.map(|(item, count, _)| (item, count)))
+    Ok(item_stack_full(r, registry)?.map(|(stack, count)| (stack.item, count)))
 }
 
-/// [`item_stack`], with its `dyed_color` (RGB) if it has one.
-fn item_stack_dyed(
-    r: &mut Reader,
-    registry: &Registry,
-) -> Result<Option<(String, i32, Option<u32>)>> {
+/// [`item_stack`], with what [`component_patch`] reads of its components.
+fn item_stack_full(r: &mut Reader, registry: &Registry) -> Result<Option<(Equipped, i32)>> {
     let count = r.varint()?;
     if count <= 0 {
         return Ok(None);
@@ -1778,8 +1829,20 @@ fn item_stack_dyed(
         .item_name(item)
         .with_context(|| format!("unknown item {item}"))?
         .to_owned();
+    let (dye, charged) = component_patch(r, registry)?;
+    let stack = Equipped {
+        item: name,
+        dye,
+        charged,
+    };
+    Ok(Some((stack, count)))
+}
+
+/// A `DataComponentPatch.STREAM_CODEC`: its `dyed_color` (RGB) if it has one, and whether
+/// it has `charged_projectiles` (a loaded crossbow).
+fn component_patch(r: &mut Reader, registry: &Registry) -> Result<(Option<u32>, bool)> {
     let (added, removed) = (r.count()?, r.count()?);
-    let mut dye = None;
+    let (mut dye, mut charged) = (None, false);
     for _ in 0..added {
         let kind = r.count()? as u32;
         let kind = registry.component_type(kind).unwrap_or_default();
@@ -1789,6 +1852,16 @@ fn item_stack_dyed(
             }
             "unbreakable" => {}
             "dyed_color" => dye = Some(r.i32()? as u32 & 0xff_ffff),
+            // `ChargedProjectiles.STREAM_CODEC`: a list of `ItemStackTemplate`s.
+            "charged_projectiles" => {
+                let n = r.count()?;
+                for _ in 0..n {
+                    r.varint()?; // item
+                    r.varint()?; // count
+                    component_patch(r, registry)?;
+                }
+                charged = n > 0;
+            }
             "enchantment_glint_override" => {
                 r.bool()?;
             }
@@ -1812,7 +1885,7 @@ fn item_stack_dyed(
     for _ in 0..removed {
         r.varint()?;
     }
-    Ok(Some((name, count, dye)))
+    Ok((dye, charged))
 }
 
 /// A disconnect reason as a player reads it: the chat component in English, plus how to
@@ -1889,9 +1962,32 @@ fn nbt_json(tag: &mc_nbt::Tag) -> serde_json::Value {
     }
 }
 
+/// `AttributeInstance.calculateValue`: the base plus every added amount; then that sum
+/// times each base multiplier added on; then the total times one more than each total
+/// multiplier.
+fn attribute_value(base: f64, modifiers: &[(f64, i32)]) -> f64 {
+    let sum = |op: i32| modifiers.iter().filter(move |m| m.1 == op).map(|m| m.0);
+    let added = base + sum(0).sum::<f64>();
+    let mut value = added + sum(1).map(|a| added * a).sum::<f64>();
+    for amount in sum(2) {
+        value *= 1.0 + amount;
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Additions come first; base multipliers scale the sum of the additions, not the bare
+    /// base; total multipliers compound on the result.
+    #[test]
+    fn attribute_modifiers_apply_in_vanilla_order() {
+        let modifiers = [(1.0, 2), (0.5, 1), (3.0, 0), (0.5, 2)];
+        // (2 + 3) = 5; 5 + 5 × 0.5 = 7.5; 7.5 × 2 × 1.5 = 22.5.
+        assert_eq!(attribute_value(2.0, &modifiers), 22.5);
+        assert_eq!(attribute_value(4.0, &[]), 4.0);
+    }
 
     /// Offline UUIDs as vanilla's `UUIDUtil.createOfflinePlayerUUID` makes them.
     #[test]

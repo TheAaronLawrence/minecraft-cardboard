@@ -384,6 +384,7 @@ fn shield_model(atlas: &Atlas) -> BakedModel {
     let nodes = [PLATE, HANDLE].map(|cubes| Node {
         parent: None,
         pose: [0.0; 6],
+        scale: [1.0; 3],
         cubes,
     });
     b.nodes(

@@ -36,6 +36,8 @@ pub const EFFECT: [&str; 8] = [
 pub const CRIT: &str = "minecraft:particle/critical_hit";
 pub const ENCHANTED_HIT: &str = "minecraft:particle/enchanted_hit";
 pub const DAMAGE: &str = "minecraft:particle/damage";
+/// `particles/glow.json`'s one sprite.
+pub const GLOW: &str = "minecraft:particle/glow";
 
 /// A particle as drawn this frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +58,9 @@ pub struct Particle {
     pub translucent: bool,
     /// The sky and block light where it is.
     pub light: [u8; 2],
+    /// How much block light it gives itself, 0 to 1
+    /// (`LightCoordsUtil.addSmoothBlockEmission`).
+    pub emission: f32,
 }
 
 /// `QuadParticleRenderState.renderRotatedQuad`: each particle as a square facing the
@@ -70,6 +75,8 @@ pub fn vertices(atlas: &Atlas, camera: &crate::gpu::Camera, particles: &[Particl
         let [r, g, b, a] = [p.color[0], p.color[1], p.color[2], p.alpha]
             .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
         let [sky, block] = p.light;
+        let block = (u32::from(block.min(15)) * 16 + (p.emission.clamp(0.0, 1.0) * 240.0) as u32)
+            .min(240) as u8;
         for ([x, y], uv) in [
             ([1.0, -1.0], [u1, v1]),
             ([1.0, 1.0], [u1, v0]),
@@ -80,7 +87,7 @@ pub fn vertices(atlas: &Atlas, camera: &crate::gpu::Camera, particles: &[Particl
                 pos: (p.pos + rotation * Vec3::new(x, y, 0.0) * p.size).to_array(),
                 uv,
                 color: [r, g, b, a],
-                light: [sky.min(15) * 16, block.min(15) * 16, 0, 0],
+                light: [sky.min(15) * 16, block, 0, 0],
             });
         }
     }

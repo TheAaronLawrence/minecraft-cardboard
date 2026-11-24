@@ -113,7 +113,7 @@ pub fn sprites(res: &Resources) -> Vec<String> {
     out.extend(SKULLS.iter().map(|(_, s)| s.to_string()));
     out.extend([POT_BASE, POT_SIDE, CONDUIT, PORTAL].map(str::to_owned));
     out.extend(DEFAULT_SKINS.map(str::to_owned));
-    out.extend(crate::entity::SPRITES.map(str::to_owned));
+    out.extend(crate::entity::sprites());
     out.extend(crate::particle::POOF.map(str::to_owned));
     out.extend(crate::particle::EFFECT.map(str::to_owned));
     out.extend(
@@ -121,6 +121,7 @@ pub fn sprites(res: &Resources) -> Vec<String> {
             crate::particle::CRIT,
             crate::particle::ENCHANTED_HIT,
             crate::particle::DAMAGE,
+            crate::particle::GLOW,
         ]
         .map(str::to_owned),
     );
@@ -147,6 +148,7 @@ fn dye_rgb(color: &str) -> Option<[f32; 3]> {
 }
 
 /// One `addBox`, in model pixels, with its texture offset.
+#[derive(Clone, Copy)]
 pub(crate) struct Cube {
     pub(crate) from: [f32; 3],
     pub(crate) size: [f32; 3],
@@ -183,9 +185,13 @@ const NORTH: usize = 3;
 
 /// One part of a model: its parent (an earlier index), `PartPose` offset in pixels and
 /// rotation in radians, and its cubes.
+#[derive(Clone)]
 pub(crate) struct Node {
     pub(crate) parent: Option<usize>,
     pub(crate) pose: [f32; 6],
+    /// `ModelPart.xScale`, `yScale` and `zScale`, applied after its turn, to it and its
+    /// children.
+    pub(crate) scale: [f32; 3],
     pub(crate) cubes: &'static [Cube],
 }
 
@@ -214,7 +220,7 @@ impl Builder {
         for n in nodes {
             let [x, y, z, rx, ry, rz] = n.pose;
             let parent = n.parent.map_or(root, |i| placed[i]);
-            let m = parent * pose([x, y, z], [rx, ry, rz]);
+            let m = parent * pose([x, y, z], [rx, ry, rz]) * Mat4::from_scale(n.scale.into());
             for c in n.cubes {
                 self.cube(m, c);
             }
@@ -482,6 +488,7 @@ const POT: &[Node] = &[
     Node {
         parent: None,
         pose: [0.0, 37.0, 16.0, PI, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[
             Cube {
                 grow: -0.1,
@@ -496,11 +503,13 @@ const POT: &[Node] = &[
     Node {
         parent: None,
         pose: [1.0, 16.0, 1.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[POT_LID],
     },
     Node {
         parent: None,
         pose: [1.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[POT_LID],
     },
 ];
@@ -513,21 +522,25 @@ const POT_SIDES: &[Node] = &[
     Node {
         parent: None,
         pose: [15.0, 16.0, 1.0, 0.0, 0.0, PI],
+        scale: [1.0; 3],
         cubes: &[POT_SIDE_FACE],
     },
     Node {
         parent: None,
         pose: [1.0, 16.0, 1.0, 0.0, -FRAC_PI_2, PI],
+        scale: [1.0; 3],
         cubes: &[POT_SIDE_FACE],
     },
     Node {
         parent: None,
         pose: [15.0, 16.0, 15.0, 0.0, FRAC_PI_2, PI],
+        scale: [1.0; 3],
         cubes: &[POT_SIDE_FACE],
     },
     Node {
         parent: None,
         pose: [1.0, 16.0, 15.0, PI, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[POT_SIDE_FACE],
     },
 ];
@@ -916,6 +929,7 @@ const GOLEM_STANDING: &[Node] = &[
     Node {
         parent: None,
         pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-4.0, -6.0, -3.0],
             size: [8.0, 6.0, 6.0],
@@ -928,6 +942,7 @@ const GOLEM_STANDING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [0.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[
             Cube {
                 from: [-4.0, -5.0, -5.0],
@@ -966,6 +981,7 @@ const GOLEM_STANDING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [-4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-3.0, -1.0, -2.0],
             size: [3.0, 10.0, 4.0],
@@ -978,6 +994,7 @@ const GOLEM_STANDING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [0.0, -1.0, -2.0],
             size: [3.0, 10.0, 4.0],
@@ -990,6 +1007,7 @@ const GOLEM_STANDING: &[Node] = &[
     Node {
         parent: None,
         pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-4.0, 0.0, -2.0],
             size: [4.0, 5.0, 4.0],
@@ -1002,6 +1020,7 @@ const GOLEM_STANDING: &[Node] = &[
     Node {
         parent: None,
         pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [0.0, 0.0, -2.0],
             size: [4.0, 5.0, 4.0],
@@ -1017,11 +1036,13 @@ const GOLEM_RUNNING: &[Node] = &[
     Node {
         parent: None,
         pose: [-1.064, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // body
     Node {
         parent: Some(0),
         pose: [1.1, 0.1, 0.7, 0.1204, -0.0064, -0.0779],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-4.02, -6.116, -3.5],
             size: [8.0, 6.0, 6.0],
@@ -1034,6 +1055,7 @@ const GOLEM_RUNNING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [0.7, -5.6, -1.8, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[
             Cube {
                 from: [-4.0, -5.1, -5.0],
@@ -1072,11 +1094,13 @@ const GOLEM_RUNNING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [-4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // right_arm
     Node {
         parent: Some(3),
         pose: [0.7, -0.248, -1.62, 1.0036, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-3.052, -1.11, -2.036],
             size: [3.0, 10.0, 4.0],
@@ -1089,11 +1113,13 @@ const GOLEM_RUNNING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // left_arm
     Node {
         parent: Some(5),
         pose: [0.732, 0.0, 0.0, -0.8715, -0.0535, -0.0449],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [0.032, -1.1, -2.0],
             size: [3.0, 10.0, 4.0],
@@ -1106,11 +1132,13 @@ const GOLEM_RUNNING: &[Node] = &[
     Node {
         parent: None,
         pose: [-3.064, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // right_leg
     Node {
         parent: Some(7),
         pose: [1.048, 0.0, -0.9, -0.8727, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-1.856, -0.1, -1.09],
             size: [4.0, 5.0, 4.0],
@@ -1123,11 +1151,13 @@ const GOLEM_RUNNING: &[Node] = &[
     Node {
         parent: None,
         pose: [0.936, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // left_leg
     Node {
         parent: Some(9),
         pose: [1.0, 0.0, 0.0, 0.7854, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-2.088, -0.1, -2.0],
             size: [4.0, 5.0, 4.0],
@@ -1143,6 +1173,7 @@ const GOLEM_SITTING: &[Node] = &[
     Node {
         parent: None,
         pose: [0.0, -3.0, 2.325, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[
             Cube {
                 from: [-3.0, -4.0, -4.525],
@@ -1165,6 +1196,7 @@ const GOLEM_SITTING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [0.0, -1.0, -4.325, 0.0, 0.0, -3.1416],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-4.0, -3.0, -2.2],
             size: [8.0, 6.0, 3.0],
@@ -1177,6 +1209,7 @@ const GOLEM_SITTING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [0.0, -6.0, -0.2, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[
             Cube {
                 from: [-1.0, -7.0, -3.3],
@@ -1215,11 +1248,13 @@ const GOLEM_SITTING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [-4.0, -5.6, -1.8, 0.4363, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // right_arm
     Node {
         parent: Some(3),
         pose: [0.0, 0.0893, 0.1198, -1.0472, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-3.075, -0.9733, -1.9966],
             size: [3.0, 10.0, 4.0],
@@ -1232,11 +1267,13 @@ const GOLEM_SITTING: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [4.0, -5.6, -1.7, 0.4363, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // left_arm
     Node {
         parent: Some(5),
         pose: [0.0, -0.0015, -0.0808, -1.0472, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [0.075, -1.0443, -1.8997],
             size: [3.0, 10.0, 4.0],
@@ -1249,11 +1286,13 @@ const GOLEM_SITTING: &[Node] = &[
     Node {
         parent: None,
         pose: [-2.1, -2.1, -2.075, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // right_leg
     Node {
         parent: Some(7),
         pose: [0.05, -1.9, 1.075, -1.5708, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-2.0, 0.975, 0.0],
             size: [4.0, 5.0, 4.0],
@@ -1266,11 +1305,13 @@ const GOLEM_SITTING: &[Node] = &[
     Node {
         parent: None,
         pose: [2.0, -2.0, -2.075, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // left_leg
     Node {
         parent: Some(9),
         pose: [0.05, -2.0, 1.075, -1.5708, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-2.0, 0.975, 0.0],
             size: [4.0, 5.0, 4.0],
@@ -1286,6 +1327,7 @@ const GOLEM_STAR: &[Node] = &[
     Node {
         parent: None,
         pose: [0.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-4.0, -6.0, -3.0],
             size: [8.0, 6.0, 6.0],
@@ -1298,6 +1340,7 @@ const GOLEM_STAR: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [0.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[
             Cube {
                 from: [-4.0, -5.0, -5.0],
@@ -1336,11 +1379,13 @@ const GOLEM_STAR: &[Node] = &[
     Node {
         parent: Some(0),
         pose: [-4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // right_arm
     Node {
         parent: Some(2),
         pose: [1.0, 1.0, 0.0, 0.0, 0.0, 1.9199],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-1.5, -5.0, -2.0],
             size: [3.0, 10.0, 4.0],
@@ -1353,16 +1398,19 @@ const GOLEM_STAR: &[Node] = &[
     Node {
         parent: Some(2),
         pose: [-1.0, 7.4, -1.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // rightItem
     Node {
         parent: Some(0),
         pose: [4.0, -6.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // left_arm
     Node {
         parent: Some(5),
         pose: [-1.0, 1.0, 0.0, 0.0, 0.0, -1.9199],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-1.5, -5.0, -2.0],
             size: [3.0, 10.0, 4.0],
@@ -1375,11 +1423,13 @@ const GOLEM_STAR: &[Node] = &[
     Node {
         parent: None,
         pose: [-3.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // right_leg
     Node {
         parent: Some(7),
         pose: [0.35, 2.0, 0.01, 0.0, 0.0, 0.2618],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-2.0, -2.5, -2.0],
             size: [4.0, 5.0, 4.0],
@@ -1392,11 +1442,13 @@ const GOLEM_STAR: &[Node] = &[
     Node {
         parent: None,
         pose: [1.0, -5.0, 0.0, 0.0, 0.0, 0.0],
+        scale: [1.0; 3],
         cubes: &[],
     }, // left_leg
     Node {
         parent: Some(9),
         pose: [1.65, 2.0, 0.0, 0.0, 0.0, -0.2618],
+        scale: [1.0; 3],
         cubes: &[Cube {
             from: [-2.0, -2.5, -2.0],
             size: [4.0, 5.0, 4.0],

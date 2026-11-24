@@ -8,7 +8,7 @@
 use glam::DVec3;
 use mc_protocol::{DataValue, Event, Path};
 use mc_render::entity::{Armor, Dropped, Entity, Equipment, Kind, Lit, Living, NameTag, Swing};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// `Mth.wrapDegrees`.
 fn wrap(a: f32) -> f32 {
@@ -214,9 +214,49 @@ enum MobType {
     Pig,
     Sheep,
     Chicken,
+    Enderman,
+    Slime,
+    Villager,
+    Witch,
+    Wolf,
+    Husk,
+    Drowned,
+    Stray,
+    ZombieVillager,
+    CaveSpider,
+    IronGolem,
+    Squid,
+    GlowSquid,
+    Phantom,
+    Cat,
+    Ocelot,
+    Fox,
+    Bogged,
+    SnowGolem,
+    MagmaCube,
+    Blaze,
+    Ghast,
+    Silverfish,
+    Endermite,
+    PolarBear,
+    Goat,
+    Piglin,
+    PiglinBrute,
+    ZombifiedPiglin,
+    Hoglin,
+    Zoglin,
+    Strider,
+    WitherSkeleton,
+    Bat,
+    Rabbit,
+    Frog,
+    Camel,
+    Armadillo,
 }
 
 struct Tracked {
+    /// Its entity id, which sets how fast a witch's nose twitches.
+    id: i32,
     sort: Sort,
     uuid: u128,
     /// `VecDeltaCodec`'s base: where the server last said the entity was.
@@ -248,6 +288,10 @@ struct Tracked {
     flap: [f32; 2],
     flap_speed: [f32; 2],
     flapping: f32,
+    /// A slime's `oSquish`, `squish`, `targetSquish` and `wasOnGround`.
+    squish: [f32; 2],
+    target_squish: f32,
+    was_on_ground: bool,
     data: HashMap<u8, DataValue>,
     /// What it holds and wears, by `EquipmentSlot` id.
     equipment: HashMap<u8, mc_protocol::Equipped>,
@@ -256,6 +300,10 @@ struct Tracked {
     hurt_time: i32,
     /// `LivingEntity.deathTime`: ticks since its health ran out.
     death_time: u32,
+    /// `LivingEntity.getMaxHealth`, once the server has sent its attributes.
+    max_health: Option<f32>,
+    /// A mob's own animation state, ticked as vanilla ticks it on the client.
+    anim: MobAnim,
     /// The item it's using (`useItem`): its hand (0 main, 1 off), the item, and the ticks
     /// left (`useItemRemaining`).
     using: Option<(u8, String, i32)>,
@@ -264,6 +312,61 @@ struct Tracked {
     in_ground: bool,
     /// `AbstractArrow.inGroundTime`: ticks it's been stuck.
     in_ground_time: i32,
+}
+
+/// Animation state some mobs keep on the client, this tick's and last tick's.
+#[derive(Default)]
+struct MobAnim {
+    /// `IronGolem.attackAnimationTick`, and a hoglin's `attackAnimationRemainingTicks`.
+    golem_attack: i32,
+    /// `Squid`'s `tentacleMovement`, `tentacleSpeed`, `rotateSpeed`, and last and this
+    /// tick's `tentacleAngle`, `xBodyRot` and `zBodyRot`.
+    tentacle_movement: f32,
+    tentacle_speed: f32,
+    rotate_speed: f32,
+    tentacle_angle: [f32; 2],
+    x_body_rot: [f32; 2],
+    z_body_rot: [f32; 2],
+    /// `Cat`'s `lieDownAmount`, `lieDownAmountTail` and `relaxStateOneAmount`.
+    lie: [f32; 2],
+    lie_tail: [f32; 2],
+    relax: [f32; 2],
+    /// Ticks a piglin has been charging its crossbow.
+    crossbow: i32,
+    /// `PolarBear.clientSideStandAnimation`, 0 to 6.
+    stand: [f32; 2],
+    /// `Fox`'s `crouchAmount` and `interestedAngle`.
+    crouch: [f32; 2],
+    interested: [f32; 2],
+    /// The ticks its `AnimationState`s started, while they run: `Bat`'s fly and rest; a
+    /// rabbit's hop and idle head tilt; a frog's jump, croak, tongue and swim idle; a
+    /// camel's sit, sit pose, sit up, idle and dash; an armadillo's roll out, roll up and
+    /// peek.
+    started: [Option<i64>; 5],
+    /// Whether a frog is in water (`isInWater`), where it swims.
+    in_water: bool,
+    /// `Armadillo.inStateTicks`, and whether it peeked since (`peekReceivedClient`).
+    in_state: i64,
+    peeked: bool,
+    /// `Rabbit`'s (and a camel's) `idleAnimationTimeout`; a rabbit's `jumpTicks`,
+    /// `jumpDuration`, and whether it
+    /// kicked up dust as it hopped (`handleEntityEvent(1)`) since that was last taken.
+    jump_ticks: i32,
+    jump_duration: i32,
+    idle_timeout: i32,
+    hop_dust: bool,
+    /// The mob's own `random`, as an xorshift.
+    random: u64,
+}
+
+impl MobAnim {
+    /// `random.nextInt(bound)`.
+    fn next_int(&mut self, bound: u32) -> i32 {
+        self.random ^= self.random << 13;
+        self.random ^= self.random >> 7;
+        self.random ^= self.random << 17;
+        ((self.random >> 32) % u64::from(bound)) as i32
+    }
 }
 
 /// `Projectile.lerpRotation`: a fifth of the way from `old` to `new`, the short way round.
@@ -291,7 +394,7 @@ fn skin(skins: &HashMap<u128, (String, bool)>, uuid: u128) -> (String, bool) {
 
 /// `LivingEntity.SwingState`: the swing an arm is in, as its hand, `SwingAnimationType` and
 /// length in ticks; ticks since it started; and its progress, 0 to 1, last tick and now.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SwingState {
     pub(crate) current: Option<(u8, u8, i32)>,
     ticks: i32,
@@ -349,6 +452,16 @@ impl SwingState {
 /// `SynchedEntityData` indices: `Entity` has 8, `LivingEntity` 7, `Mob` 1 (its flags),
 /// `AgeableMob` and `Zombie` start with the baby flag, then each type's own.
 const SHARED_FLAGS: u8 = 0;
+/// `Entity.DATA_CUSTOM_NAME`.
+const CUSTOM_NAME: u8 = 2;
+/// `Pose.SITTING`'s id.
+const SITTING: i32 = 10;
+/// `Camel.DASH` and `LAST_POSE_CHANGE_TICK`, after `AbstractHorse.DATA_ID_FLAGS`.
+const CAMEL_DASH: u8 = 19;
+const CAMEL_POSE_TICK: u8 = 20;
+/// `Armadillo.ARMADILLO_STATE` (0 idle, 1 rolling, 2 scared, 3 unrolling), after
+/// `AgeableMob`'s two.
+const MONSTER_STATE: u8 = 18;
 /// `Entity.DATA_NO_GRAVITY`.
 const NO_GRAVITY: u8 = 5;
 const POSE: u8 = 6;
@@ -375,6 +488,53 @@ const SHEEP_WOOL: u8 = 18;
 /// boost time.
 const VARIANT: u8 = 18;
 const PIG_VARIANT: u8 = 19;
+/// `AbstractCubeMob.ID_SIZE`, after `AgeableMob`'s two, as slimes are ageable.
+const SLIME_SIZE: u8 = 18;
+/// `Enderman.DATA_CARRY_STATE` (a state id, 0 for none) and `DATA_CREEPY`.
+const CARRY_STATE: u8 = 16;
+const CREEPY: u8 = 17;
+/// `AbstractVillager.DATA_UNHAPPY_COUNTER` and `Villager.DATA_VILLAGER_DATA`, after
+/// `AgeableMob`'s two.
+const UNHAPPY: u8 = 18;
+const VILLAGER_DATA: u8 = 19;
+/// `TamableAnimal.DATA_FLAGS_ID` (1 sitting, 4 tame), after `AgeableMob`'s two, and
+/// `Wolf`'s collar, anger end time and variant.
+const TAME_FLAGS: u8 = 18;
+const COLLAR: u8 = 21;
+const ANGER_END: u8 = 22;
+const WOLF_VARIANT: u8 = 23;
+/// `ZombieVillager.DATA_VILLAGER_DATA`, after `Zombie`'s three and its converting flag.
+const ZOMBIE_VILLAGER_DATA: u8 = 20;
+/// `Phantom.ID_SIZE`, straight after `Mob`'s.
+const PHANTOM_SIZE: u8 = 16;
+/// `Cat`'s variant, `IS_LYING`, `RELAX_STATE_ONE` and collar, after `TamableAnimal`'s two.
+const CAT_VARIANT: u8 = 20;
+const CAT_LYING: u8 = 21;
+const CAT_RELAX: u8 = 22;
+const CAT_COLLAR: u8 = 23;
+/// `Fox.DATA_TYPE_ID` (0 red, 1 snow) and `DATA_FLAGS_ID`, after `AgeableMob`'s two.
+const FOX_TYPE: u8 = 18;
+const FOX_FLAGS: u8 = 19;
+/// `GlowSquid.DATA_DARK_TICKS_REMAINING`, after `AgeableMob`'s two.
+const DARK_TICKS: u8 = 18;
+/// The first field a `Monster`, golem or `Mob` of its own adds, straight after `Mob`'s:
+/// `Bogged.DATA_SHEARED`, `SnowGolem.DATA_PUMPKIN_ID` (16 has a pumpkin),
+/// `Blaze.DATA_FLAGS_ID` (1 charged, which shows it on fire) and
+/// `Ghast.DATA_IS_CHARGING`; and `Bat.DATA_ID_FLAGS` (1 resting), as an
+/// `AmbientCreature` adds none.
+const MONSTER_DATA: u8 = 16;
+/// `PolarBear.DATA_STANDING_ID`, and `Goat`'s horns, after `AgeableMob`'s two and its
+/// screaming flag.
+const BEAR_STANDING: u8 = 18;
+const GOAT_LEFT_HORN: u8 = 19;
+const GOAT_RIGHT_HORN: u8 = 20;
+/// `Piglin.DATA_BABY_ID`, `DATA_IS_CHARGING_CROSSBOW` and `DATA_IS_DANCING`, after
+/// `AbstractPiglin`'s immunity to zombification.
+const PIGLIN_BABY: u8 = 17;
+const PIGLIN_CHARGING: u8 = 18;
+const PIGLIN_DANCING: u8 = 19;
+/// `Strider.DATA_SUFFOCATING`, after `AgeableMob`'s two and its boost time.
+const STRIDER_COLD: u8 = 19;
 
 pub struct Entities {
     /// Entity type names by protocol id.
@@ -390,6 +550,9 @@ pub struct Entities {
     /// What using each item looks like and how long it lasts, by item.
     uses: HashMap<String, (mc_render::entity::UseAnim, i32)>,
     tracked: HashMap<i32, Tracked>,
+    /// The player itself, which the server doesn't track for it, as the third-person
+    /// views draw it.
+    own: Option<Tracked>,
     /// Seeds items' bob offsets, as `Entity.random` would.
     seed: u64,
     /// The poofs of smoke dying mobs leave.
@@ -403,6 +566,15 @@ pub struct Entities {
     /// Where bolts struck since this was last taken, with their thunder's and impact's
     /// pitches (`LightningBolt.tick`).
     pub thunder: Vec<(DVec3, f32, f32)>,
+    /// The level's game time, which a wolf's anger lasts until (`NeutralMob.isAngry`).
+    pub game_time: i64,
+    /// A carved pumpkin's default state, which a snow golem wears.
+    pumpkin: u32,
+    /// Items with the `tool` component (`AbstractPiglin.isHoldingMeleeWeapon`): the
+    /// `swords`, `axes`, `pickaxes`, `shovels` and `hoes` tags, shears, the mace and the
+    /// trident; and the `piglin_loved` tag, which a piglin admires.
+    tools: HashSet<String>,
+    piglin_loved: HashSet<String>,
 }
 
 /// A lightning bolt: where it struck, the ticks it has left to show, the times it'll
@@ -420,6 +592,24 @@ impl Entities {
         icons: std::sync::Arc<HashMap<String, mc_render::item::ItemIcon>>,
     ) -> Self {
         Self {
+            pumpkin: registry
+                .block("minecraft:carved_pumpkin")
+                .map_or(0, |b| b.default_state),
+            tools: {
+                let res = mc_assets::Resources::new(mc_assets::default_root());
+                let tags = ["swords", "axes", "pickaxes", "shovels", "hoes"];
+                let mut tools: HashSet<String> = tags
+                    .iter()
+                    .flat_map(|t| res.tag("item", t).unwrap_or_default())
+                    .collect();
+                tools.extend(
+                    ["minecraft:shears", "minecraft:mace", "minecraft:trident"].map(String::from),
+                );
+                tools
+            },
+            piglin_loved: mc_assets::Resources::new(mc_assets::default_root())
+                .tag("item", "piglin_loved")
+                .unwrap_or_default(),
             types: (0..)
                 .map_while(|i| registry.entity_type(i).map(str::to_owned))
                 .collect(),
@@ -435,11 +625,13 @@ impl Entities {
             uses: crate::hands::use_animations(registry),
             icons,
             tracked: HashMap::new(),
+            own: None,
             seed: 0x5DEECE66D,
             particles: Default::default(),
             emitters: Vec::new(),
             bolts: HashMap::new(),
             thunder: Vec::new(),
+            game_time: 0,
             random: mc_render::bake::JavaRandom::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -509,6 +701,44 @@ impl Entities {
                     Some("pig") => Sort::Mob(MobType::Pig),
                     Some("sheep") => Sort::Mob(MobType::Sheep),
                     Some("chicken") => Sort::Mob(MobType::Chicken),
+                    Some("enderman") => Sort::Mob(MobType::Enderman),
+                    Some("slime") => Sort::Mob(MobType::Slime),
+                    Some("villager") => Sort::Mob(MobType::Villager),
+                    Some("witch") => Sort::Mob(MobType::Witch),
+                    Some("wolf") => Sort::Mob(MobType::Wolf),
+                    Some("husk") => Sort::Mob(MobType::Husk),
+                    Some("drowned") => Sort::Mob(MobType::Drowned),
+                    Some("stray") => Sort::Mob(MobType::Stray),
+                    Some("zombie_villager") => Sort::Mob(MobType::ZombieVillager),
+                    Some("cave_spider") => Sort::Mob(MobType::CaveSpider),
+                    Some("iron_golem") => Sort::Mob(MobType::IronGolem),
+                    Some("squid") => Sort::Mob(MobType::Squid),
+                    Some("glow_squid") => Sort::Mob(MobType::GlowSquid),
+                    Some("phantom") => Sort::Mob(MobType::Phantom),
+                    Some("cat") => Sort::Mob(MobType::Cat),
+                    Some("ocelot") => Sort::Mob(MobType::Ocelot),
+                    Some("fox") => Sort::Mob(MobType::Fox),
+                    Some("bogged") => Sort::Mob(MobType::Bogged),
+                    Some("snow_golem") => Sort::Mob(MobType::SnowGolem),
+                    Some("magma_cube") => Sort::Mob(MobType::MagmaCube),
+                    Some("blaze") => Sort::Mob(MobType::Blaze),
+                    Some("ghast") => Sort::Mob(MobType::Ghast),
+                    Some("silverfish") => Sort::Mob(MobType::Silverfish),
+                    Some("endermite") => Sort::Mob(MobType::Endermite),
+                    Some("polar_bear") => Sort::Mob(MobType::PolarBear),
+                    Some("goat") => Sort::Mob(MobType::Goat),
+                    Some("piglin") => Sort::Mob(MobType::Piglin),
+                    Some("piglin_brute") => Sort::Mob(MobType::PiglinBrute),
+                    Some("zombified_piglin") => Sort::Mob(MobType::ZombifiedPiglin),
+                    Some("hoglin") => Sort::Mob(MobType::Hoglin),
+                    Some("zoglin") => Sort::Mob(MobType::Zoglin),
+                    Some("strider") => Sort::Mob(MobType::Strider),
+                    Some("wither_skeleton") => Sort::Mob(MobType::WitherSkeleton),
+                    Some("bat") => Sort::Mob(MobType::Bat),
+                    Some("rabbit") => Sort::Mob(MobType::Rabbit),
+                    Some("frog") => Sort::Mob(MobType::Frog),
+                    Some("camel") => Sort::Mob(MobType::Camel),
+                    Some("armadillo") => Sort::Mob(MobType::Armadillo),
                     Some("arrow") => Sort::Arrow { spectral: false },
                     Some("spectral_arrow") => Sort::Arrow { spectral: true },
                     Some("snowball") => Sort::Thrown {
@@ -552,45 +782,21 @@ impl Entities {
                 self.seed ^= self.seed << 17;
                 let bob_offset =
                     (self.seed >> 40) as f32 / (1u64 << 24) as f32 * std::f32::consts::TAU;
-                // `LivingEntity.recreateFromPacket`: body and head both face the head's way.
-                self.tracked.insert(
-                    id,
-                    Tracked {
-                        sort,
-                        uuid,
-                        base: pos,
-                        now: place,
-                        old: place,
-                        interpolation: Interpolation::new(steps),
-                        velocity: DVec3::from(velocity),
-                        on_ground: false,
-                        head_yaw,
-                        old_head_yaw: head_yaw,
-                        body_yaw: head_yaw,
-                        old_body_yaw: head_yaw,
-                        head_target: head_yaw,
-                        head_steps: 0,
-                        head_stable_time: 0,
-                        last_stable_head_yaw: head_yaw,
-                        walk_speed_old: 0.0,
-                        walk_speed: 0.0,
-                        walk_pos: 0.0,
-                        age: 0,
-                        bob_offset,
-                        flap: [0.0; 2],
-                        flap_speed: [0.0; 2],
-                        flapping: 1.0,
-                        data: HashMap::new(),
-                        equipment: HashMap::new(),
-                        swing: SwingState::default(),
-                        hurt_time: 0,
-                        death_time: 0,
-                        using: None,
-                        shake: 0,
-                        in_ground: false,
-                        in_ground_time: 0,
-                    },
-                );
+                let mut tracked = Tracked::new(sort, uuid, place, head_yaw, steps);
+                tracked.velocity = DVec3::from(velocity);
+                tracked.bob_offset = bob_offset;
+                // `new Squid`: `1 / (nextFloat() + 1) * 0.2`, from the same xorshift.
+                tracked.anim.tentacle_speed =
+                    1.0 / ((self.seed >> 20 & 0xFFFFFF) as f32 / (1u32 << 24) as f32 + 1.0) * 0.2;
+                // `Rabbit.idleAnimationTimeout`'s first `random.nextInt(40) + 180`.
+                tracked.anim.random = self.seed | 1;
+                // A camel's starts at 0, so it idles at once.
+                tracked.anim.idle_timeout = tracked.anim.next_int(40) + 180;
+                if sort == Sort::Mob(MobType::Camel) {
+                    tracked.anim.idle_timeout = 0;
+                }
+                tracked.id = id;
+                self.tracked.insert(id, tracked);
             }
             Event::RemoveEntities(ids) => {
                 for id in ids {
@@ -710,7 +916,17 @@ impl Entities {
                 let kind = match name.as_str() {
                     "minecraft:crit" => Kind::Crit,
                     "minecraft:enchanted_hit" => Kind::EnchantedHit,
+                    "minecraft:squid_ink" | "minecraft:glow_squid_ink" => Kind::Ink,
                     _ => Kind::Damage,
+                };
+                let glow = name == "minecraft:glow_squid_ink";
+                // `ParticleEngine.createParticle` by kind.
+                let spawn = |p: &mut crate::particles::Particles, at: DVec3, aux: DVec3| {
+                    if kind == Kind::Ink {
+                        p.ink(at, aux, glow);
+                    } else {
+                        p.crit(kind, at, aux);
+                    }
                 };
                 let (pos, dist, speed) = (
                     DVec3::from(pos),
@@ -719,7 +935,7 @@ impl Entities {
                 );
                 let p = &mut self.particles;
                 if count == 0 && p.allowed(override_limiter, always_show) {
-                    p.crit(kind, pos, speed * dist);
+                    spawn(p, pos, speed * dist);
                 }
                 for _ in 0..count {
                     if !p.allowed(override_limiter, always_show) {
@@ -732,11 +948,11 @@ impl Entities {
                         if alternative == 2 {
                             aux *= DVec3::new(r(), r(), r());
                         }
-                        p.crit(kind, pos + offset, aux);
+                        spawn(p, pos + offset, aux);
                     } else {
                         let offset = DVec3::new(p.gaussian(), p.gaussian(), p.gaussian()) * dist;
                         let aux = DVec3::new(p.gaussian(), p.gaussian(), p.gaussian()) * speed;
-                        p.crit(kind, pos + offset, aux);
+                        spawn(p, pos + offset, aux);
                     }
                 }
             }
@@ -775,6 +991,7 @@ impl Entities {
                             e.in_ground = *stuck;
                         }
                     }
+                    e.data_changed(&values);
                     e.data.extend(values);
                 }
             }
@@ -813,6 +1030,16 @@ impl Entities {
             {
                 self.tracked.get_mut(&id).expect("checked").hurt_time = 10;
             }
+            // `ClientPacketListener.handleUpdateAttributes`: only max health matters here,
+            // clamped to `Attributes.MAX_HEALTH`'s range.
+            Event::Attributes { id, values } if self.tracked.contains_key(&id) => {
+                let e = self.tracked.get_mut(&id).expect("checked");
+                for (name, _, value) in values {
+                    if name == "minecraft:max_health" {
+                        e.max_health = Some(value.clamp(1.0, 1024.0) as f32);
+                    }
+                }
+            }
             // `LivingEntity.handleEntityEvent(60)`: the mob's gone in a poof, just before
             // the server removes it.
             // `Arrow.handleEntityEvent(0)`: a tipped arrow's potion has worn off, in a
@@ -833,9 +1060,55 @@ impl Entities {
                     }
                 }
             }
+            // `IronGolem.handleEntityEvent(4)`: its arms come down in an attack.
+            Event::EntityEvent { id, event: 4 }
+                if self.tracked.get(&id).is_some_and(|e| {
+                    matches!(
+                        e.sort,
+                        Sort::Mob(MobType::IronGolem | MobType::Hoglin | MobType::Zoglin)
+                    )
+                }) =>
+            {
+                self.tracked
+                    .get_mut(&id)
+                    .expect("checked")
+                    .anim
+                    .golem_attack = 10;
+            }
+            // `Rabbit.handleEntityEvent(1)`: a hop starts, kicking up dust.
+            Event::EntityEvent { id, event: 1 }
+                if self
+                    .tracked
+                    .get(&id)
+                    .is_some_and(|e| e.sort == Sort::Mob(MobType::Rabbit)) =>
+            {
+                let a = &mut self.tracked.get_mut(&id).expect("checked").anim;
+                (a.jump_duration, a.jump_ticks, a.hop_dust) = (15, 0, true);
+            }
+            // `Armadillo.handleEntityEvent(64)`: it peeks out of its shell again.
+            Event::EntityEvent { id, event: 64 }
+                if self
+                    .tracked
+                    .get(&id)
+                    .is_some_and(|e| e.sort == Sort::Mob(MobType::Armadillo)) =>
+            {
+                self.tracked.get_mut(&id).expect("checked").anim.peeked = true;
+            }
+            // `Squid.handleEntityEvent(19)`: the next stroke starts.
+            Event::EntityEvent { id, event: 19 }
+                if self.tracked.get(&id).is_some_and(|e| {
+                    matches!(e.sort, Sort::Mob(MobType::Squid | MobType::GlowSquid))
+                }) =>
+            {
+                self.tracked
+                    .get_mut(&id)
+                    .expect("checked")
+                    .anim
+                    .tentacle_movement = 0.0;
+            }
             Event::EntityEvent { id, event: 60 } => {
                 if let Some(e) = self.tracked.get(&id) {
-                    let baby = matches!(e.data.get(&BABY), Some(DataValue::Bool(true)));
+                    let baby = e.baby();
                     self.particles.poof(e.now.pos, e.size(baby));
                 }
             }
@@ -853,7 +1126,7 @@ impl Entities {
             let Some(e) = tracked.get(id) else {
                 return false;
             };
-            let baby = matches!(e.data.get(&BABY), Some(DataValue::Bool(true)));
+            let baby = e.baby();
             let [width, height] = e.size(baby).map(f64::from);
             for _ in 0..16 {
                 let mut r = || f64::from(particles.random() * 2.0 - 1.0);
@@ -885,7 +1158,13 @@ impl Entities {
         blocks: &mc_physics::BlockPhysics,
     ) -> bool {
         for e in self.tracked.values_mut() {
-            e.tick(world, blocks, &self.uses, &mut self.particles);
+            e.tick(
+                world,
+                blocks,
+                &self.uses,
+                &mut self.particles,
+                self.game_time,
+            );
         }
         self.particles.tick(world, blocks);
         self.emit();
@@ -928,7 +1207,7 @@ impl Entities {
             if !e.living() {
                 continue;
             }
-            let baby = matches!(e.data.get(&BABY), Some(DataValue::Bool(true)));
+            let baby = e.baby();
             let [width, height] = e.size(baby);
             let bb = mc_physics::Aabb::at_feet(e.now.pos, f64::from(width), f64::from(height));
             let clip = bb.clip(from, to).map(|(t, _)| from + (to - from) * t);
@@ -967,6 +1246,45 @@ impl Entities {
         self.particles.status = status;
     }
 
+    /// `Entity.canSpawnSprintParticle` for each other entity: where those sprinting (shared
+    /// flag 3), not crouching (flag 1), alive and out of water and lava stand, how they
+    /// move, and how wide they are, for `spawnSprintParticle`; and rabbits that hopped
+    /// since this was last called (`Rabbit.handleEntityEvent(1)`).
+    pub fn sprinters(
+        &mut self,
+        world: &impl mc_physics::World,
+        blocks: &mc_physics::BlockPhysics,
+    ) -> Vec<(DVec3, DVec3, f64)> {
+        let mut hops = Vec::new();
+        for e in self.tracked.values_mut() {
+            if std::mem::take(&mut e.anim.hop_dust) {
+                hops.push((e.now.pos, e.velocity, f64::from(e.size(e.baby())[0])));
+            }
+        }
+        hops.extend(self.sprinting(world, blocks));
+        hops
+    }
+
+    fn sprinting<'a>(
+        &'a self,
+        world: &'a impl mc_physics::World,
+        blocks: &'a mc_physics::BlockPhysics,
+    ) -> impl Iterator<Item = (DVec3, DVec3, f64)> + 'a {
+        self.tracked
+            .values()
+            .filter(|e| e.living())
+            .filter(|e| matches!(e.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 0x08 != 0 && f & 0x02 == 0))
+            .filter(|e| !matches!(e.data.get(&HEALTH), Some(DataValue::Float(h)) if *h <= 0.0))
+            .filter(|e| {
+                let at = e.now.pos.floor().as_ivec3().to_array();
+                mc_physics::fluid::fluid_at(world, blocks, at).is_none()
+            })
+            .map(|e| {
+                let baby = e.baby();
+                (e.now.pos, e.velocity, f64::from(e.size(baby)[0]))
+            })
+    }
+
     /// `LivingEntity.tickEffects` for the player itself, with the effect colours, ambience
     /// and invisibility the server gave it, its feet at `feet` and its box `size`.
     pub fn own_effects(
@@ -996,28 +1314,178 @@ impl Entities {
     pub fn render(&self, partial: f32, light: impl Fn(DVec3) -> [u8; 2]) -> Vec<Lit> {
         self.tracked
             .values()
-            .filter_map(|e| {
-                let entity =
-                    e.render(partial, &self.skins, &self.names, &self.armor, &self.uses)?;
-                let (feet, baby) = match &entity {
-                    Entity::Living(l) => (l.pos, l.baby),
-                    Entity::Item(d) => (d.pos, false),
-                    Entity::Arrow(a) => (a.pos, false),
-                    Entity::Thrown(t) => (t.pos, false),
-                };
-                let eye = e.eye_height() * if baby { 0.5 } else { 1.0 };
-                let [sky, mut block] = light(feet.as_dvec3() + DVec3::Y * eye);
-                // `Entity.isOnFire`: bit 0 of the shared flags.
-                if matches!(e.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 1 != 0) {
-                    block = 15;
-                }
-                Some((entity, [sky, block]))
-            })
+            .filter_map(|e| self.lit(e, partial, &light))
             .collect()
+    }
+
+    fn lit(&self, e: &Tracked, partial: f32, light: impl Fn(DVec3) -> [u8; 2]) -> Option<Lit> {
+        let entity = e.render(partial, self)?;
+        let (feet, baby) = match &entity {
+            Entity::Living(l) => (l.pos, l.baby),
+            Entity::Item(d) => (d.pos, false),
+            Entity::Arrow(a) => (a.pos, false),
+            Entity::Thrown(t) => (t.pos, false),
+        };
+        let eye = e.eye_height() * if baby { 0.5 } else { 1.0 };
+        let [sky, mut block] = light(feet.as_dvec3() + DVec3::Y * eye);
+        // `Entity.isOnFire`: bit 0 of the shared flags.
+        if matches!(e.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 1 != 0) {
+            block = 15;
+        }
+        // `BlazeRenderer` and `MagmaCubeRenderer.getBlockLightLevel`.
+        if matches!(e.sort, Sort::Mob(MobType::Blaze | MobType::MagmaCube)) {
+            block = 15;
+        }
+        // `GlowSquidRenderer.getBlockLightLevel`: it glows at 15, dimming for ten ticks
+        // after it's hurt.
+        if e.sort == Sort::Mob(MobType::GlowSquid) {
+            let dark = match e.data.get(&DARK_TICKS) {
+                Some(DataValue::Int(d)) => *d as f32,
+                _ => 0.0,
+            };
+            let glow = (15.0 * (1.0 - dark / 10.0)).clamp(0.0, 15.0) as u8;
+            block = if glow == 15 { 15 } else { glow.max(block) };
+        }
+        Some((entity, [sky, block]))
+    }
+
+    /// `ClientLevel.tickEntities` for the player itself, after it moved from `own.old` to
+    /// `own.pos`: `LivingEntity.tick` turns its body and swings its legs as it does for
+    /// other players, and `Player.serverAiStep` turns its head with its view.
+    pub(crate) fn tick_own(&mut self, uuid: u128, own: Own) {
+        let place = Place {
+            pos: own.pos,
+            yaw: own.yaw,
+            pitch: own.pitch,
+        };
+        let e = self
+            .own
+            .get_or_insert_with(|| Tracked::new(Sort::Player, uuid, place, own.yaw, 0));
+        e.uuid = uuid;
+        e.old = Place {
+            pos: own.old,
+            ..e.now
+        };
+        e.now = place;
+        e.old_head_yaw = e.head_yaw;
+        e.old_body_yaw = e.body_yaw;
+        e.head_yaw = own.yaw;
+        e.on_ground = own.on_ground;
+        e.age += 1;
+        e.data.insert(SHARED_FLAGS, DataValue::Byte(own.flags));
+        e.data.insert(POSE, DataValue::Int(own.pose));
+        e.data.insert(HEALTH, DataValue::Float(own.health));
+        if own.health > 0.0 {
+            e.death_time = 0;
+        }
+        e.tick_living();
+        e.swing = own.swing;
+        e.hurt_time = own.hurt_time;
+        e.using = own.using;
+        e.equipment = own
+            .equipment
+            .into_iter()
+            .enumerate()
+            .filter_map(|(slot, item)| {
+                Some((
+                    slot as u8,
+                    mc_protocol::Equipped {
+                        item: item?,
+                        dye: None,
+                        charged: false,
+                    },
+                ))
+            })
+            .collect();
+    }
+
+    /// The player itself, `partial` of the way to the next tick and looking down at
+    /// `pitch`, lit as other entities are; without the name tag the camera's own entity
+    /// never shows (`EntityRenderer.shouldShowName`).
+    pub fn render_own(
+        &self,
+        partial: f32,
+        pitch: f32,
+        light: impl Fn(DVec3) -> [u8; 2],
+    ) -> Option<Lit> {
+        let (mut entity, light) = self.lit(self.own.as_ref()?, partial, light)?;
+        if let Entity::Living(l) = &mut entity {
+            l.name_tag = None;
+            l.pitch = pitch;
+        }
+        Some((entity, light))
     }
 }
 
+/// The player itself as one tick left it, for `Entities::tick_own`.
+pub(crate) struct Own {
+    /// Its feet the tick before and now.
+    pub old: DVec3,
+    pub pos: DVec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub on_ground: bool,
+    /// As `Entity.DATA_SHARED_FLAGS_ID`: on fire 1, crouching 2, sprinting 8, invisible
+    /// 32.
+    pub flags: u8,
+    /// `Pose`'s id.
+    pub pose: i32,
+    pub health: f32,
+    /// What it holds and wears, by `EquipmentSlot` id: main hand, off hand, feet, legs,
+    /// chest and head.
+    pub equipment: [Option<String>; 6],
+    pub swing: SwingState,
+    pub hurt_time: i32,
+    /// The item it's using: its hand, the item and the ticks left.
+    pub using: Option<(u8, String, i32)>,
+}
+
 impl Tracked {
+    /// `LivingEntity.recreateFromPacket`: body and head both face the head's way.
+    fn new(sort: Sort, uuid: u128, place: Place, head_yaw: f32, steps: i32) -> Self {
+        Tracked {
+            id: 0,
+            sort,
+            uuid,
+            base: place.pos.to_array(),
+            now: place,
+            old: place,
+            interpolation: Interpolation::new(steps),
+            velocity: DVec3::ZERO,
+            on_ground: false,
+            head_yaw,
+            old_head_yaw: head_yaw,
+            body_yaw: head_yaw,
+            old_body_yaw: head_yaw,
+            head_target: head_yaw,
+            head_steps: 0,
+            head_stable_time: 0,
+            last_stable_head_yaw: head_yaw,
+            walk_speed_old: 0.0,
+            walk_speed: 0.0,
+            walk_pos: 0.0,
+            age: 0,
+            bob_offset: 0.0,
+            flap: [0.0; 2],
+            flap_speed: [0.0; 2],
+            flapping: 1.0,
+            squish: [0.0; 2],
+            target_squish: 0.0,
+            was_on_ground: false,
+            data: HashMap::new(),
+            equipment: HashMap::new(),
+            swing: SwingState::default(),
+            hurt_time: 0,
+            death_time: 0,
+            max_health: None,
+            anim: MobAnim::default(),
+            using: None,
+            shake: 0,
+            in_ground: false,
+            in_ground_time: 0,
+        }
+    }
+
     /// `EntityType`'s eye height, where light is read; types that don't set one have 85%
     /// of their height.
     fn eye_height(&self) -> f64 {
@@ -1033,7 +1501,42 @@ impl Tracked {
             Sort::Item | Sort::Thrown { .. } => 0.2125,
             Sort::Arrow { .. } => 0.13,
             Sort::Mob(mob) => match mob {
-                MobType::Zombie | MobType::Skeleton => 1.74,
+                MobType::Zombie
+                | MobType::Skeleton
+                | MobType::Husk
+                | MobType::Drowned
+                | MobType::Stray
+                | MobType::ZombieVillager => 1.74,
+                MobType::CaveSpider => 0.45,
+                MobType::IronGolem => 2.7 * 0.85,
+                MobType::Squid | MobType::GlowSquid => 0.4,
+                MobType::Phantom => 0.175 * (1.0 + 0.15 * f64::from(self.phantom_size())),
+                MobType::Cat => 0.35,
+                MobType::Ocelot => 0.7 * 0.85,
+                MobType::Fox => 0.4,
+                MobType::Bogged => 1.74,
+                MobType::SnowGolem => 1.7,
+                MobType::MagmaCube => 0.325 * f64::from(self.slime_size()),
+                MobType::Blaze => 1.8 * 0.85,
+                MobType::Ghast => 2.6,
+                MobType::Silverfish | MobType::Endermite => 0.13,
+                MobType::PolarBear => 1.4 * 0.85,
+                MobType::Goat => 1.3 * 0.85,
+                MobType::Piglin | MobType::PiglinBrute | MobType::ZombifiedPiglin => 1.79,
+                MobType::Hoglin | MobType::Zoglin => 1.4 * 0.85,
+                MobType::Strider => 1.7 * 0.85,
+                MobType::WitherSkeleton => 2.1,
+                MobType::Bat => 0.45,
+                MobType::Rabbit => 0.59,
+                MobType::Frog => 0.5 * 0.85,
+                // `Camel.ADULT_SITTING_DIMENSIONS` while it sits.
+                MobType::Camel if self.pose() == SITTING => 0.845,
+                MobType::Camel => 2.275,
+                MobType::Armadillo => 0.26,
+                MobType::Enderman => 2.55,
+                MobType::Slime => 0.325 * f64::from(self.slime_size()),
+                MobType::Villager | MobType::Witch => 1.62,
+                MobType::Wolf => 0.68,
                 MobType::Creeper => 1.7 * 0.85,
                 MobType::Spider => 0.65,
                 MobType::Cow => 1.3,
@@ -1044,11 +1547,28 @@ impl Tracked {
         }
     }
 
-    /// `Entity.displayFireAnimation`: the bounding box's size while shared flag 0 says
-    /// it's on fire. None of these types is immune to fire.
+    /// `Entity.displayFireAnimation`: the bounding box's size while it's on fire
+    /// (`isOnFire`): shared flag 0, unless it's immune to fire. A blaze is on fire while
+    /// it's charged.
     fn burning(&self, baby: bool) -> Option<[f32; 2]> {
-        matches!(self.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 1 != 0)
-            .then(|| self.size(baby))
+        let byte = |i: u8| match self.data.get(&i) {
+            Some(DataValue::Byte(f)) => *f,
+            _ => 0,
+        };
+        let on_fire = match self.sort {
+            Sort::Mob(MobType::Blaze) => byte(MONSTER_DATA) & 1 != 0,
+            // `EntityType.fireImmune`.
+            Sort::Mob(
+                MobType::MagmaCube
+                | MobType::Ghast
+                | MobType::ZombifiedPiglin
+                | MobType::Zoglin
+                | MobType::Strider
+                | MobType::WitherSkeleton,
+            ) => false,
+            _ => byte(SHARED_FLAGS) & 1 != 0,
+        };
+        on_fire.then(|| self.size(baby))
     }
 
     /// The bounding box's width and height (`getBbWidth` and `getBbHeight`).
@@ -1065,9 +1585,60 @@ impl Tracked {
             Sort::Item | Sort::Thrown { .. } => [0.25, 0.25],
             Sort::Arrow { .. } => [0.5, 0.5],
             Sort::Mob(mob) => match (mob, baby) {
-                (MobType::Zombie, false) => [0.6, 1.95],
-                (MobType::Zombie, true) => [0.49, 0.98],
-                (MobType::Skeleton, _) => [0.6, 1.99],
+                (
+                    MobType::Zombie | MobType::Husk | MobType::Drowned | MobType::ZombieVillager,
+                    false,
+                ) => [0.6, 1.95],
+                (
+                    MobType::Zombie | MobType::Husk | MobType::Drowned | MobType::ZombieVillager,
+                    true,
+                ) => [0.49, 0.98],
+                (MobType::CaveSpider, _) => [0.7, 0.5],
+                (MobType::IronGolem, _) => [1.4, 2.7],
+                (MobType::Squid | MobType::GlowSquid, false) => [0.8, 0.8],
+                (MobType::Squid | MobType::GlowSquid, true) => [0.5, 0.5],
+                (MobType::Phantom, _) => [0.9, 0.5].map(|d| d * (1.0 + 0.15 * self.phantom_size())),
+                (MobType::Cat | MobType::Ocelot | MobType::Fox, false) => [0.6, 0.7],
+                (MobType::Cat | MobType::Ocelot, true) => [0.3, 0.35],
+                (MobType::Fox, true) => [0.36, 0.42],
+                (MobType::Bogged, _) => [0.6, 1.99],
+                (MobType::SnowGolem, _) => [0.7, 1.9],
+                (MobType::MagmaCube, _) => [0.52 * self.slime_size(); 2],
+                (MobType::Blaze, _) => [0.6, 1.8],
+                (MobType::Ghast, _) => [4.0, 4.0],
+                (MobType::Silverfish | MobType::Endermite, _) => [0.4, 0.3],
+                (MobType::PolarBear, false) => [1.4, 1.4],
+                (MobType::PolarBear, true) => [0.7, 0.7],
+                (MobType::Goat, false) => [0.9, 1.3],
+                (MobType::Goat, true) => [0.45, 0.65],
+                (MobType::Piglin | MobType::PiglinBrute | MobType::ZombifiedPiglin, false) => {
+                    [0.6, 1.95]
+                }
+                (MobType::Piglin | MobType::PiglinBrute | MobType::ZombifiedPiglin, true) => {
+                    [0.49, 0.98]
+                }
+                (MobType::Hoglin | MobType::Zoglin, false) => [1.3964844, 1.4],
+                (MobType::Hoglin | MobType::Zoglin, true) => [0.75, 0.85],
+                (MobType::Strider, false) => [0.9, 1.7],
+                (MobType::Strider, true) => [0.45, 0.85],
+                (MobType::WitherSkeleton, _) => [0.7, 2.4],
+                (MobType::Bat, _) => [0.5, 0.9],
+                (MobType::Rabbit, false) => [0.49, 0.6],
+                (MobType::Rabbit, true) => [0.24, 0.4],
+                (MobType::Frog, _) => [0.5, 0.5],
+                (MobType::Camel, false) if self.pose() == SITTING => [1.7, 2.375 - 1.43],
+                (MobType::Camel, true) if self.pose() == SITTING => [0.95, 0.425],
+                (MobType::Camel, false) => [1.7, 2.375],
+                (MobType::Camel, true) => [0.95, 1.4],
+                (MobType::Armadillo, false) => [0.7, 0.65],
+                (MobType::Armadillo, true) => [0.7 * 0.6, 0.65 * 0.6],
+                (MobType::Skeleton | MobType::Stray, _) => [0.6, 1.99],
+                (MobType::Enderman, _) => [0.6, 2.9],
+                (MobType::Slime, _) => [0.52 * self.slime_size(); 2],
+                (MobType::Villager, false) | (MobType::Witch, _) => [0.6, 1.95],
+                (MobType::Villager, true) => [0.3, 0.975],
+                (MobType::Wolf, false) => [0.6, 0.85],
+                (MobType::Wolf, true) => [0.3, 0.425],
                 (MobType::Creeper, _) => [0.6, 1.7],
                 (MobType::Spider, _) => [1.4, 0.9],
                 (MobType::Cow, false) => [0.9, 1.4],
@@ -1079,6 +1650,33 @@ impl Tracked {
                 (MobType::Chicken, false) => [0.4, 0.7],
                 (MobType::Chicken, true) => [0.3, 0.4],
             },
+        }
+    }
+
+    /// `isBaby`: `AgeableMob`'s and `Zombie`'s `DATA_BABY_ID` are both 16; a piglin's
+    /// comes after its zombification immunity, and a brute is never one.
+    fn baby(&self) -> bool {
+        let index = match self.sort {
+            Sort::Mob(MobType::Piglin) => PIGLIN_BABY,
+            Sort::Mob(MobType::PiglinBrute) => return false,
+            _ => BABY,
+        };
+        matches!(self.data.get(&index), Some(DataValue::Bool(true)))
+    }
+
+    /// `Phantom.getPhantomSize`.
+    fn phantom_size(&self) -> f32 {
+        match self.data.get(&PHANTOM_SIZE) {
+            Some(DataValue::Int(size)) => *size as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// `AbstractCubeMob.getSize`.
+    fn slime_size(&self) -> f32 {
+        match self.data.get(&SLIME_SIZE) {
+            Some(DataValue::Int(size)) => *size as f32,
+            _ => 1.0,
         }
     }
 
@@ -1113,6 +1711,7 @@ impl Tracked {
         blocks: &mc_physics::BlockPhysics,
         uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>,
         particles: &mut crate::particles::Particles,
+        game_time: i64,
     ) {
         // `Entity.commonTick`.
         self.old = self.now;
@@ -1130,8 +1729,17 @@ impl Tracked {
             Sort::Thrown { gravity, .. } => self.tick_thrown(world, blocks, gravity),
             Sort::Player | Sort::Mob(_) => {
                 self.tick_living();
+                self.tick_mob(world, blocks, game_time);
                 self.tick_effects(particles);
                 self.tick_using(uses);
+            }
+        }
+        // `GlowSquid.aiStep`: a glow every tick somewhere about it (`getRandomX(0.6)`).
+        if self.sort == Sort::Mob(MobType::GlowSquid) {
+            let [width, height] = self.size(self.baby());
+            let at = particles.in_box(self.now.pos, [width * 1.2, height]);
+            if particles.allowed(false, false) {
+                particles.glow(at);
             }
         }
         // `Arrow.tick` on the client: a tipped arrow trails two swirls a tick in flight, and
@@ -1162,7 +1770,7 @@ impl Tracked {
         let invisible =
             matches!(self.data.get(&SHARED_FLAGS), Some(DataValue::Byte(f)) if f & 0x20 != 0);
         let ambient = matches!(self.data.get(&EFFECT_AMBIENCE), Some(DataValue::Bool(true)));
-        let baby = matches!(self.data.get(&BABY), Some(DataValue::Bool(true)));
+        let baby = self.baby();
         particles.mob_effects(colors, invisible, ambient, self.now.pos, self.size(baby));
     }
 
@@ -1221,6 +1829,24 @@ impl Tracked {
             );
             self.head_steps -= 1;
         }
+        if matches!(self.sort, Sort::Mob(MobType::Slime | MobType::MagmaCube)) {
+            // `AbstractCubeMob.tick`: squashed as it lands, stretched as it leaves the
+            // ground, easing back.
+            self.squish[0] = self.squish[1];
+            self.squish[1] += (self.target_squish - self.squish[1]) * 0.5;
+            if self.on_ground && !self.was_on_ground {
+                self.target_squish = -0.5;
+            } else if !self.on_ground && self.was_on_ground {
+                self.target_squish = 1.0;
+            }
+            self.was_on_ground = self.on_ground;
+            // `decreaseSquish`: a magma cube's eases back slower.
+            self.target_squish *= if self.sort == Sort::Mob(MobType::Slime) {
+                0.6
+            } else {
+                0.9
+            };
+        }
         if self.sort == Sort::Mob(MobType::Chicken) {
             // `Chicken.aiStep`.
             self.flap[0] = self.flap[1];
@@ -1237,7 +1863,18 @@ impl Tracked {
         let moved = self.now.pos - self.old.pos;
         let distance = (moved.x * moved.x + moved.z * moved.z).sqrt() as f32;
         self.walk_speed_old = self.walk_speed;
-        self.walk_speed += ((distance * 4.0).min(1.0) - self.walk_speed) * 0.4;
+        // `updateWalkAnimation`: a frog's walk stops while it jumps, and a camel's while it
+        // sits or dashes.
+        let (target, factor) = match self.sort {
+            Sort::Mob(MobType::Frog) if self.anim.started[0].is_some() => (0.0, 0.4),
+            Sort::Mob(MobType::Frog) => ((distance * 25.0).min(1.0), 0.4),
+            Sort::Mob(MobType::Camel) if self.pose() == 0 && self.anim.started[4].is_none() => {
+                ((distance * 6.0).min(1.0), 0.2)
+            }
+            Sort::Mob(MobType::Camel) => (0.0, 0.2),
+            _ => ((distance * 4.0).min(1.0), 0.4),
+        };
+        self.walk_speed += (target - self.walk_speed) * factor;
         self.walk_pos += self.walk_speed;
 
         let side = (moved.x * moved.x + moved.z * moved.z) as f32;
@@ -1280,6 +1917,232 @@ impl Tracked {
                     }
                 }
             }
+        }
+    }
+
+    /// The animation state some mobs tick on the client.
+    fn tick_mob(
+        &mut self,
+        world: &impl mc_physics::World,
+        blocks: &mc_physics::BlockPhysics,
+        game_time: i64,
+    ) {
+        let Sort::Mob(mob) = self.sort else {
+            return;
+        };
+        let a = &mut self.anim;
+        let shift = |v: &mut [f32; 2]| v[0] = v[1];
+        match mob {
+            // `IronGolem.aiStep`.
+            // `IronGolem.aiStep`, and `Hoglin` and `Zoglin`'s.
+            MobType::IronGolem | MobType::Hoglin | MobType::Zoglin => {
+                a.golem_attack = (a.golem_attack - 1).max(0)
+            }
+            // How long it's been charging its crossbow, for `getTicksUsingItem`.
+            MobType::Piglin => {
+                let charging =
+                    matches!(self.data.get(&PIGLIN_CHARGING), Some(DataValue::Bool(true)));
+                a.crossbow = if charging { a.crossbow + 1 } else { 0 };
+            }
+            // `Squid.aiStep` on the client: its tentacles stroke once per cycle and rest
+            // at the end until the server starts the next (event 19); in water it spins
+            // and tilts along how it's moving, and out of it it flops over.
+            MobType::Squid | MobType::GlowSquid => {
+                shift(&mut a.x_body_rot);
+                shift(&mut a.z_body_rot);
+                shift(&mut a.tentacle_angle);
+                a.tentacle_movement =
+                    (a.tentacle_movement + a.tentacle_speed).min(std::f32::consts::TAU);
+                let block = self.now.pos.floor().as_ivec3();
+                let in_water = mc_physics::fluid::fluid_at(world, blocks, block.to_array())
+                    .is_some_and(|f| f.kind == mc_physics::fluid::FluidKind::Water);
+                let pi = std::f32::consts::PI;
+                if in_water {
+                    if a.tentacle_movement < pi {
+                        let t = a.tentacle_movement / pi;
+                        a.tentacle_angle[1] = (t * t * pi).sin() * pi * 0.25;
+                        a.rotate_speed = if t > 0.75 { 1.0 } else { a.rotate_speed * 0.8 };
+                    } else {
+                        a.tentacle_angle[1] = 0.0;
+                        a.rotate_speed *= 0.99;
+                    }
+                    let v = self.velocity;
+                    let horizontal = (v.x * v.x + v.z * v.z).sqrt();
+                    a.z_body_rot[1] += pi * a.rotate_speed * 1.5;
+                    let target = -(horizontal.atan2(v.y) as f32).to_degrees();
+                    a.x_body_rot[1] += (target - a.x_body_rot[1]) * 0.1;
+                } else {
+                    a.tentacle_angle[1] = a.tentacle_movement.sin().abs() * pi * 0.25;
+                    a.x_body_rot[1] += (-90.0 - a.x_body_rot[1]) * 0.02;
+                }
+            }
+            // `PolarBear.tick` on the client.
+            MobType::PolarBear => {
+                shift(&mut a.stand);
+                let up = matches!(self.data.get(&BEAR_STANDING), Some(DataValue::Bool(true)));
+                a.stand[1] = (a.stand[1] + if up { 1.0 } else { -1.0 }).clamp(0.0, 6.0);
+            }
+            // `Cat.updateLieDownAmount` and `updateRelaxStateOneAmount`.
+            MobType::Cat => {
+                shift(&mut a.lie);
+                shift(&mut a.lie_tail);
+                shift(&mut a.relax);
+                let flag = |i: u8| matches!(self.data.get(&i), Some(DataValue::Bool(true)));
+                if flag(CAT_LYING) {
+                    a.lie[1] = (a.lie[1] + 0.15).min(1.0);
+                    a.lie_tail[1] = (a.lie_tail[1] + 0.08).min(1.0);
+                } else {
+                    a.lie[1] = (a.lie[1] - 0.22).max(0.0);
+                    a.lie_tail[1] = (a.lie_tail[1] - 0.13).max(0.0);
+                }
+                a.relax[1] = if flag(CAT_RELAX) {
+                    (a.relax[1] + 0.1).min(1.0)
+                } else {
+                    (a.relax[1] - 0.13).max(0.0)
+                };
+            }
+            // `Fox.tick`: its interested head tilt eases in and out, and its crouch deepens.
+            MobType::Fox => {
+                shift(&mut a.interested);
+                shift(&mut a.crouch);
+                let flags = match self.data.get(&FOX_FLAGS) {
+                    Some(DataValue::Byte(f)) => *f,
+                    _ => 0,
+                };
+                let target = if flags & 8 != 0 { 1.0 } else { 0.0 };
+                a.interested[1] += (target - a.interested[1]) * 0.4;
+                a.crouch[1] = if flags & 4 != 0 {
+                    (a.crouch[1] + 0.2).min(5.0)
+                } else {
+                    0.0
+                };
+            }
+            // `Bat.setupAnimationStates`, after its tick: resting (flag 1) or flying.
+            MobType::Bat => {
+                let resting =
+                    matches!(self.data.get(&MONSTER_DATA), Some(DataValue::Byte(f)) if f & 1 != 0);
+                let (run, stop) = if resting { (1, 0) } else { (0, 1) };
+                a.started[stop] = None;
+                a.started[run].get_or_insert(i64::from(self.age));
+            }
+            // `Rabbit.setupAnimationStates` in `baseTick`, then `aiStep`'s hop count. The
+            // idle head tilt waits for its timeout, and never comes while it has no AI
+            // (`Mob`'s flag 1); leashes aren't tracked yet.
+            MobType::Rabbit => {
+                let no_ai =
+                    matches!(self.data.get(&MOB_FLAGS), Some(DataValue::Byte(f)) if f & 1 != 0);
+                if a.idle_timeout <= 0 && !no_ai {
+                    a.idle_timeout = a.next_int(40) + 180;
+                    a.started[1] = Some(i64::from(self.age));
+                } else if a.jump_ticks > 0 {
+                    a.started[0].get_or_insert(i64::from(self.age));
+                    a.started[1] = None;
+                } else {
+                    a.idle_timeout -= 1;
+                    a.started[0] = None;
+                }
+                if a.jump_ticks != a.jump_duration {
+                    a.jump_ticks += 1;
+                } else if a.jump_duration != 0 {
+                    (a.jump_ticks, a.jump_duration) = (0, 0);
+                }
+            }
+            // `Frog.tick`, before its walk updates: it treads water while it's in water
+            // and not moving.
+            MobType::Frog => {
+                let block = self.now.pos.floor().as_ivec3();
+                a.in_water = mc_physics::fluid::fluid_at(world, blocks, block.to_array())
+                    .is_some_and(|f| f.kind == mc_physics::fluid::FluidKind::Water);
+                if a.in_water && self.walk_speed_old > 1.0e-5 {
+                    a.started[3] = None;
+                } else if a.in_water {
+                    a.started[3].get_or_insert(i64::from(self.age));
+                } else {
+                    a.started[3] = None;
+                }
+            }
+            // `Camel.setupAnimationStates`: it idles every 4 to 6 seconds; sitting down,
+            // sitting and standing up follow how long ago its pose changed (`getPoseTime`,
+            // from `LAST_POSE_CHANGE_TICK`, negative while it sits).
+            MobType::Camel => {
+                let age = i64::from(self.age);
+                if a.idle_timeout <= 0 {
+                    a.idle_timeout = a.next_int(40) + 80;
+                    a.started[3] = Some(age);
+                } else {
+                    a.idle_timeout -= 1;
+                }
+                let tick = match self.data.get(&CAMEL_POSE_TICK) {
+                    Some(DataValue::Int(t)) => i64::from(*t),
+                    _ => 0,
+                };
+                let sitting = tick < 0;
+                let pose_time = game_time - tick.abs();
+                if (pose_time < 0) != sitting {
+                    a.started[2] = None;
+                    a.started[4] = None;
+                    if sitting && (0..40).contains(&pose_time) {
+                        a.started[0].get_or_insert(age);
+                        a.started[1] = None;
+                    } else {
+                        a.started[0] = None;
+                        a.started[1].get_or_insert(age);
+                    }
+                } else {
+                    a.started[0] = None;
+                    a.started[1] = None;
+                    let dashing = matches!(self.data.get(&CAMEL_DASH), Some(DataValue::Bool(true)));
+                    // `isInPoseTransition() && getPoseTime() >= 0`.
+                    let in_transition = pose_time < if sitting { 40 } else { 52 };
+                    let standing_up = in_transition && pose_time >= 0;
+                    for (i, on) in [(4, dashing), (2, standing_up)] {
+                        if on {
+                            a.started[i].get_or_insert(age);
+                        } else {
+                            a.started[i] = None;
+                        }
+                    }
+                }
+            }
+            // `Armadillo.setupAnimationStates`, then `inStateTicks++`.
+            MobType::Armadillo => {
+                let age = i64::from(self.age);
+                let state = match self.data.get(&MONSTER_STATE) {
+                    Some(DataValue::Int(s)) => *s,
+                    _ => 0,
+                };
+                match state {
+                    // Rolling up.
+                    1 => {
+                        a.started[0] = None;
+                        a.started[1].get_or_insert(age);
+                        a.started[2] = None;
+                    }
+                    // Scared: peeking out every so often (event 64); one that's scared as
+                    // it's first seen is already a peek's length in.
+                    2 => {
+                        a.started[0] = None;
+                        a.started[1] = None;
+                        if std::mem::take(&mut a.peeked) {
+                            a.started[2] = None;
+                        }
+                        if a.in_state == 0 {
+                            a.started[2] = Some(age - 50);
+                        } else {
+                            a.started[2].get_or_insert(age);
+                        }
+                    }
+                    // Unrolling.
+                    3 => {
+                        a.started[0].get_or_insert(age);
+                        a.started[1] = None;
+                        a.started[2] = None;
+                    }
+                    _ => a.started[..3].fill(None),
+                }
+                a.in_state += 1;
+            }
+            _ => {}
         }
     }
 
@@ -1433,14 +2296,10 @@ impl Tracked {
         }
     }
 
-    fn render(
-        &self,
-        pt: f32,
-        skins: &HashMap<u128, (String, bool)>,
-        names: &HashMap<u128, String>,
-        armor: &HashMap<String, String>,
-        uses: &HashMap<String, (mc_render::entity::UseAnim, i32)>,
-    ) -> Option<Entity> {
+    /// Its render state, with what `all` knows about skins, names, items and the level.
+    fn render(&self, pt: f32, all: &Entities) -> Option<Entity> {
+        let (skins, names, armor, uses) = (&all.skins, &all.names, &all.armor, &all.uses);
+        let (game_time, pumpkin) = (all.game_time, all.pumpkin);
         let pos = self.old.pos.lerp(self.now.pos, pt as f64).as_vec3();
         let age = self.age as f32 + pt;
         match self.sort {
@@ -1488,6 +2347,44 @@ impl Tracked {
             };
             format!("minecraft:entity/{animal}/{animal}_{name}")
         };
+        let int = |i: u8| match self.data.get(&i) {
+            Some(DataValue::Int(v)) => *v,
+            _ => 0,
+        };
+        // `Mob.isAggressive`: bit 4 of its flags.
+        let aggressive =
+            matches!(self.data.get(&MOB_FLAGS), Some(DataValue::Byte(f)) if f & 4 != 0);
+        let mut layers = Vec::new();
+        // `VillagerProfessionLayer`'s textures: its type's clothes, then (for an adult with
+        // a profession) the profession's and, but for a nitwit, its level's badge, from
+        // stone at 1 to diamond at 5; under `entity/villager` or `entity/zombie_villager`.
+        let villager_layers = |index: u8, base: &str, layers: &mut Vec<String>| {
+            if let Some(DataValue::Villager {
+                kind,
+                profession,
+                level,
+            }) = self.data.get(&index)
+            {
+                let name = |n: &str| n.strip_prefix("minecraft:").unwrap_or(n).to_owned();
+                // `VillagerProfessionLayer`: a baby zombie villager's clothes are its own.
+                let dir = if self.baby() && base == "zombie_villager" {
+                    "baby"
+                } else {
+                    "type"
+                };
+                let base = format!("minecraft:entity/{base}");
+                layers.push(format!("{base}/{dir}/{}", name(kind)));
+                let profession = name(profession);
+                if profession != "none" && !self.baby() {
+                    layers.push(format!("{base}/profession/{profession}"));
+                    if profession != "nitwit" {
+                        let levels = mc_render::entity::VILLAGER_LEVELS;
+                        let level = levels[(*level).clamp(1, 5) as usize - 1];
+                        layers.push(format!("{base}/profession_level/{level}"));
+                    }
+                }
+            }
+        };
         let (kind, texture) = match self.sort {
             Sort::Player => {
                 let crouching = self.pose() == CROUCHING;
@@ -1495,16 +2392,431 @@ impl Tracked {
                 (Kind::Player { slim, crouching }, skin)
             }
             Sort::Mob(mob) => match mob {
-                MobType::Zombie => {
-                    // `Mob.isAggressive`: bit 4 of its flags.
-                    let aggressive =
-                        matches!(self.data.get(&MOB_FLAGS), Some(DataValue::Byte(f)) if f & 4 != 0);
-                    (
-                        Kind::Zombie { aggressive },
-                        mc_render::entity::ZOMBIE.into(),
-                    )
-                }
+                MobType::Zombie => (
+                    Kind::Zombie { aggressive },
+                    mc_render::entity::ZOMBIE.into(),
+                ),
                 MobType::Skeleton => (Kind::Skeleton, mc_render::entity::SKELETON.into()),
+                MobType::Husk => (Kind::Husk { aggressive }, mc_render::entity::HUSK.into()),
+                MobType::Drowned => (
+                    Kind::Drowned { aggressive },
+                    mc_render::entity::DROWNED.into(),
+                ),
+                MobType::Stray => (Kind::Stray, mc_render::entity::STRAY.into()),
+                MobType::Enderman => {
+                    let carried = u32::try_from(int(CARRY_STATE)).ok().filter(|&s| s != 0);
+                    let kind = Kind::Enderman {
+                        creepy: flag(CREEPY),
+                        carried,
+                    };
+                    (kind, mc_render::entity::ENDERMAN.into())
+                }
+                MobType::Slime => {
+                    let squish = self.squish[0] + (self.squish[1] - self.squish[0]) * pt;
+                    let kind = Kind::Slime {
+                        size: self.slime_size(),
+                        squish,
+                    };
+                    (kind, mc_render::entity::SLIME.into())
+                }
+                MobType::Villager => {
+                    villager_layers(VILLAGER_DATA, "villager", &mut layers);
+                    let kind = Kind::Villager {
+                        unhappy: int(UNHAPPY) > 0,
+                    };
+                    (kind, mc_render::entity::VILLAGER.into())
+                }
+                MobType::Witch => {
+                    let kind = Kind::Witch {
+                        id: self.id,
+                        holding: self.equipment.contains_key(&0),
+                    };
+                    (kind, mc_render::entity::WITCH.into())
+                }
+                // `Wolf.getTexture` and `getTailAngle`: angry, tame or wild.
+                MobType::Wolf => {
+                    let flags = match self.data.get(&TAME_FLAGS) {
+                        Some(DataValue::Byte(f)) => *f,
+                        _ => 0,
+                    };
+                    let tame = flags & 4 != 0;
+                    let end = i64::from(int(ANGER_END));
+                    let angry = end > 0 && end - game_time > 0;
+                    let tail = if angry {
+                        1.5393804
+                    } else if tame {
+                        // `Wolf.createAttributes`' 8 until the server says otherwise.
+                        let max = self.max_health.unwrap_or(8.0);
+                        let health = match self.data.get(&HEALTH) {
+                            Some(DataValue::Float(h)) => *h,
+                            _ => max,
+                        };
+                        (0.55 - (max - health) / max * 0.4) * std::f32::consts::PI
+                    } else {
+                        std::f32::consts::PI / 5.0
+                    };
+                    let variant = match self.data.get(&WOLF_VARIANT) {
+                        Some(DataValue::Variant(v)) => v.as_str(),
+                        _ => "pale",
+                    };
+                    let mood = match (angry, tame) {
+                        (true, _) => "_angry",
+                        (_, true) => "_tame",
+                        _ => "",
+                    };
+                    let kind = Kind::Wolf {
+                        angry,
+                        sitting: flags & 1 != 0,
+                        tail,
+                        // `Wolf.defineSynchedData`: red until dyed, which the server
+                        // doesn't send.
+                        collar: tame.then(|| match self.data.get(&COLLAR) {
+                            Some(DataValue::Int(c)) => *c as u8,
+                            _ => 14,
+                        }),
+                    };
+                    (kind, mc_render::entity::wolf_texture(variant, mood))
+                }
+                MobType::ZombieVillager => {
+                    villager_layers(ZOMBIE_VILLAGER_DATA, "zombie_villager", &mut layers);
+                    let kind = Kind::ZombieVillager { aggressive };
+                    let texture = if self.baby() {
+                        mc_render::entity::ZOMBIE_VILLAGER_BABY
+                    } else {
+                        mc_render::entity::ZOMBIE_VILLAGER
+                    };
+                    (kind, texture.into())
+                }
+                MobType::CaveSpider => (Kind::CaveSpider, mc_render::entity::CAVE_SPIDER.into()),
+                // `IronGolemRenderer.extractRenderState`, and `IronGolem.getCrackiness`
+                // (`Crackiness.GOLEM`) from its health over its max health, 100 by default.
+                MobType::IronGolem => {
+                    let max = self.max_health.unwrap_or(100.0);
+                    let health = match self.data.get(&HEALTH) {
+                        Some(DataValue::Float(h)) => *h,
+                        _ => max,
+                    };
+                    let fraction = health / max;
+                    let cracks = match fraction {
+                        f if f < 0.25 => 3,
+                        f if f < 0.5 => 2,
+                        f if f < 0.75 => 1,
+                        _ => 0,
+                    };
+                    let a = self.anim.golem_attack;
+                    let attack = if a > 0 { a as f32 - pt } else { 0.0 };
+                    let kind = Kind::IronGolem { attack, cracks };
+                    (kind, mc_render::entity::IRON_GOLEM.into())
+                }
+                MobType::Squid | MobType::GlowSquid => {
+                    let a = &self.anim;
+                    let lerp = |v: [f32; 2]| v[0] + (v[1] - v[0]) * pt;
+                    let kind = Kind::Squid {
+                        tentacles: lerp(a.tentacle_angle),
+                        tilt: lerp(a.x_body_rot),
+                        spin: lerp(a.z_body_rot),
+                    };
+                    // `SquidRenderer` and `GlowSquidRenderer.getTextureLocation`.
+                    let texture = match (mob == MobType::Squid, self.baby()) {
+                        (true, false) => mc_render::entity::SQUID,
+                        (true, true) => mc_render::entity::SQUID_BABY,
+                        (false, false) => mc_render::entity::GLOW_SQUID,
+                        (false, true) => mc_render::entity::GLOW_SQUID_BABY,
+                    };
+                    (kind, texture.into())
+                }
+                // `PhantomRenderer.extractRenderState`: `getUniqueFlapTickOffset` is three
+                // ticks per entity id.
+                MobType::Phantom => {
+                    let kind = Kind::Phantom {
+                        flap: self.id as f32 * 3.0 + age,
+                        size: self.phantom_size(),
+                    };
+                    (kind, mc_render::entity::PHANTOM.into())
+                }
+                // `CatRenderer.extractRenderState`: crouching (shared flag 1), sprinting
+                // (flag 3), or sitting (`TamableAnimal`'s flag 1).
+                MobType::Cat => {
+                    let shared = match self.data.get(&SHARED_FLAGS) {
+                        Some(DataValue::Byte(f)) => *f,
+                        _ => 0,
+                    };
+                    let tame = match self.data.get(&TAME_FLAGS) {
+                        Some(DataValue::Byte(f)) => *f,
+                        _ => 0,
+                    };
+                    let pose = if tame & 1 != 0 {
+                        mc_render::entity::FelinePose::Sitting
+                    } else if shared & 2 != 0 {
+                        mc_render::entity::FelinePose::Crouching
+                    } else if shared & 8 != 0 {
+                        mc_render::entity::FelinePose::Sprinting
+                    } else {
+                        mc_render::entity::FelinePose::Standing
+                    };
+                    let a = &self.anim;
+                    let lerp = |v: [f32; 2]| v[0] + (v[1] - v[0]) * pt;
+                    let name = match self.data.get(&CAT_VARIANT) {
+                        Some(DataValue::Variant(v)) => v.strip_prefix("minecraft:").unwrap_or(v),
+                        _ => "black",
+                    };
+                    let kind = Kind::Cat {
+                        pose,
+                        lie: lerp(a.lie),
+                        lie_tail: lerp(a.lie_tail),
+                        relax: lerp(a.relax),
+                        // `Cat.defineSynchedData`: red until dyed.
+                        collar: (tame & 4 != 0).then(|| match self.data.get(&CAT_COLLAR) {
+                            Some(DataValue::Int(c)) => *c as u8,
+                            _ => 14,
+                        }),
+                    };
+                    // `CatVariant.assetInfo`: babies have their own.
+                    let baby = if self.baby() { "_baby" } else { "" };
+                    (kind, format!("minecraft:entity/cat/cat_{name}{baby}"))
+                }
+                // `OcelotRenderer.extractRenderState`: crouching (shared flag 1) or
+                // sprinting (flag 3).
+                MobType::Ocelot => {
+                    let shared = match self.data.get(&SHARED_FLAGS) {
+                        Some(DataValue::Byte(f)) => *f,
+                        _ => 0,
+                    };
+                    let pose = if shared & 2 != 0 {
+                        mc_render::entity::FelinePose::Crouching
+                    } else if shared & 8 != 0 {
+                        mc_render::entity::FelinePose::Sprinting
+                    } else {
+                        mc_render::entity::FelinePose::Standing
+                    };
+                    let texture = if self.baby() {
+                        mc_render::entity::OCELOT_BABY
+                    } else {
+                        mc_render::entity::OCELOT
+                    };
+                    (Kind::Ocelot { pose }, texture.into())
+                }
+                // `FoxRenderer.getTextureLocation`: red or snow, asleep or not.
+                MobType::Fox => {
+                    let flags = match self.data.get(&FOX_FLAGS) {
+                        Some(DataValue::Byte(f)) => *f,
+                        _ => 0,
+                    };
+                    let a = &self.anim;
+                    let lerp = |v: [f32; 2]| v[0] + (v[1] - v[0]) * pt;
+                    let kind = Kind::Fox {
+                        flags,
+                        crouch: lerp(a.crouch),
+                        roll: lerp(a.interested) * 0.11 * std::f32::consts::PI,
+                    };
+                    let snow = if int(FOX_TYPE) == 1 { "_snow" } else { "" };
+                    let sleep = if flags & 32 != 0 { "_sleep" } else { "" };
+                    let baby = if self.baby() { "_baby" } else { "" };
+                    (kind, format!("minecraft:entity/fox/fox{snow}{sleep}{baby}"))
+                }
+                MobType::Bogged => {
+                    let kind = Kind::Bogged {
+                        sheared: flag(MONSTER_DATA),
+                    };
+                    (kind, mc_render::entity::BOGGED.into())
+                }
+                MobType::SnowGolem => {
+                    let byte = match self.data.get(&MONSTER_DATA) {
+                        Some(DataValue::Byte(b)) => *b,
+                        _ => 16,
+                    };
+                    let kind = Kind::SnowGolem {
+                        pumpkin: (byte & 16 != 0).then_some(pumpkin),
+                    };
+                    (kind, mc_render::entity::SNOW_GOLEM.into())
+                }
+                MobType::MagmaCube => {
+                    let kind = Kind::MagmaCube {
+                        size: self.slime_size(),
+                        squish: self.squish[0] + (self.squish[1] - self.squish[0]) * pt,
+                    };
+                    (kind, mc_render::entity::MAGMA_CUBE.into())
+                }
+                MobType::Blaze => (Kind::Blaze, mc_render::entity::BLAZE.into()),
+                // `GhastRenderer.getTextureLocation`: its mouth opens as it charges.
+                MobType::Ghast => {
+                    let texture = if flag(MONSTER_DATA) {
+                        mc_render::entity::GHAST_SHOOTING
+                    } else {
+                        mc_render::entity::GHAST
+                    };
+                    (Kind::Ghast, texture.into())
+                }
+                MobType::Silverfish => (Kind::Silverfish, mc_render::entity::SILVERFISH.into()),
+                MobType::Endermite => (Kind::Endermite, mc_render::entity::ENDERMITE.into()),
+                // `PolarBear.getStandingAnimationScale`.
+                MobType::PolarBear => {
+                    let a = &self.anim;
+                    let stand = (a.stand[0] + (a.stand[1] - a.stand[0]) * pt) / 6.0;
+                    let texture = if self.baby() {
+                        mc_render::entity::POLAR_BEAR_BABY
+                    } else {
+                        mc_render::entity::POLAR_BEAR
+                    };
+                    (Kind::PolarBear { stand }, texture.into())
+                }
+                // `Goat.defineSynchedData`: both horns until it loses one.
+                MobType::Goat => {
+                    let horn = |i: u8| !matches!(self.data.get(&i), Some(DataValue::Bool(false)));
+                    let kind = Kind::Goat {
+                        horns: [horn(GOAT_LEFT_HORN), horn(GOAT_RIGHT_HORN)],
+                    };
+                    let texture = if self.baby() {
+                        mc_render::entity::GOAT_BABY
+                    } else {
+                        mc_render::entity::GOAT
+                    };
+                    (kind, texture.into())
+                }
+                // `Piglin.getArmPose` (a brute only ever holds its weapon high).
+                MobType::Piglin | MobType::PiglinBrute => {
+                    use mc_render::entity::PiglinPose;
+                    let main = self.equipment.get(&0).map(|e| e.item.as_str());
+                    let off = self.equipment.get(&1).map(|e| e.item.as_str());
+                    let piglin = mob == MobType::Piglin;
+                    let melee = aggressive && main.is_some_and(|i| all.tools.contains(i));
+                    let pose = if piglin && flag(PIGLIN_DANCING) {
+                        PiglinPose::Dancing
+                    } else if piglin && off.is_some_and(|i| all.piglin_loved.contains(i)) {
+                        PiglinPose::Admiring
+                    } else if melee {
+                        PiglinPose::Melee
+                    } else if piglin && flag(PIGLIN_CHARGING) {
+                        // `CrossbowItem.getChargeDuration`: 1.25 seconds without Quick
+                        // Charge.
+                        let ticks = self.anim.crossbow as f32 + pt;
+                        PiglinPose::CrossbowCharge(ticks.clamp(0.0, 25.0) / 25.0)
+                    } else if piglin
+                        && self
+                            .equipment
+                            .get(&0)
+                            .is_some_and(|e| e.item == "minecraft:crossbow" && e.charged)
+                    {
+                        PiglinPose::CrossbowHold
+                    } else {
+                        PiglinPose::Default
+                    };
+                    // `PiglinRenderer.getTextureLocation`.
+                    let texture = if piglin && self.baby() {
+                        mc_render::entity::PIGLIN_BABY
+                    } else if piglin {
+                        mc_render::entity::PIGLIN
+                    } else {
+                        mc_render::entity::PIGLIN_BRUTE
+                    };
+                    (Kind::Piglin { pose }, texture.into())
+                }
+                // `ZombifiedPiglinRenderer.getTextureLocation`.
+                MobType::ZombifiedPiglin => {
+                    let texture = if self.baby() {
+                        mc_render::entity::ZOMBIFIED_PIGLIN_BABY
+                    } else {
+                        mc_render::entity::ZOMBIFIED_PIGLIN
+                    };
+                    (Kind::ZombifiedPiglin { aggressive }, texture.into())
+                }
+                MobType::Hoglin | MobType::Zoglin => {
+                    // `HoglinRenderer` and `ZoglinRenderer.getTextureLocation`.
+                    let texture = match (mob == MobType::Hoglin, self.baby()) {
+                        (true, false) => mc_render::entity::HOGLIN,
+                        (true, true) => mc_render::entity::HOGLIN_BABY,
+                        (false, false) => mc_render::entity::ZOGLIN,
+                        (false, true) => mc_render::entity::ZOGLIN_BABY,
+                    };
+                    let kind = Kind::Hoglin {
+                        attack: self.anim.golem_attack,
+                    };
+                    (kind, texture.into())
+                }
+                // `StriderRenderer.getTextureLocation`: cold and grey out of lava.
+                MobType::Strider => {
+                    let texture = match (flag(STRIDER_COLD), self.baby()) {
+                        (true, false) => mc_render::entity::STRIDER_COLD,
+                        (true, true) => mc_render::entity::STRIDER_COLD_BABY,
+                        (false, false) => mc_render::entity::STRIDER,
+                        (false, true) => mc_render::entity::STRIDER_BABY,
+                    };
+                    (Kind::Strider, texture.into())
+                }
+                MobType::WitherSkeleton => (
+                    Kind::WitherSkeleton,
+                    mc_render::entity::WITHER_SKELETON.into(),
+                ),
+                // `BatRenderer.extractRenderState`, with the animations' ticks since they
+                // started (`AnimationState.getTimeInMillis`).
+                MobType::Bat => {
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let kind = Kind::Bat {
+                        resting: matches!(self.data.get(&MONSTER_DATA), Some(DataValue::Byte(f)) if f & 1 != 0),
+                        fly: since[0],
+                        rest: since[1],
+                    };
+                    (kind, mc_render::entity::BAT.into())
+                }
+                // `RabbitRenderer.getTextureLocation`: its variant's texture, or Toast's if
+                // that's its name (`checkMagicName`).
+                MobType::Rabbit => {
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let kind = Kind::Rabbit {
+                        hop: since[0],
+                        tilt: since[1],
+                    };
+                    let toast = matches!(self.data.get(&CUSTOM_NAME), Some(DataValue::Text(t)) if t == "Toast");
+                    let name = if toast {
+                        "toast"
+                    } else {
+                        match self.data.get(&VARIANT) {
+                            Some(DataValue::Int(v @ 0..=5)) => {
+                                mc_render::entity::RABBIT_VARIANTS[*v as usize]
+                            }
+                            Some(DataValue::Int(99)) => "caerbannog",
+                            _ => "brown",
+                        }
+                    };
+                    let baby = if self.baby() { "_baby" } else { "" };
+                    (kind, format!("minecraft:entity/rabbit/rabbit_{name}{baby}"))
+                }
+                // `FrogRenderer`: its variant's texture.
+                MobType::Frog => {
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let kind = Kind::Frog {
+                        anims: [since[0], since[1], since[2], since[3]],
+                        swimming: self.anim.in_water,
+                    };
+                    (kind, variant(VARIANT, "frog"))
+                }
+                MobType::Camel => {
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let texture = match self.baby() {
+                        true => mc_render::entity::CAMEL_BABY,
+                        false => mc_render::entity::CAMEL,
+                    };
+                    (Kind::Camel { anims: since }, texture.into())
+                }
+                // `ArmadilloRenderer`, with `Armadillo.ArmadilloState.shouldHideInShell`.
+                MobType::Armadillo => {
+                    let since = self.anim.started.map(|s| s.map(|s| age - s as f32));
+                    let hiding = match self.data.get(&MONSTER_STATE) {
+                        Some(DataValue::Int(1)) => self.anim.in_state > 5,
+                        Some(DataValue::Int(2)) => true,
+                        Some(DataValue::Int(3)) => self.anim.in_state < 26,
+                        _ => false,
+                    };
+                    let kind = Kind::Armadillo {
+                        hiding,
+                        anims: [since[0], since[1], since[2]],
+                    };
+                    let texture = match self.baby() {
+                        true => mc_render::entity::ARMADILLO_BABY,
+                        false => mc_render::entity::ARMADILLO,
+                    };
+                    (kind, texture.into())
+                }
                 MobType::Creeper => (Kind::Creeper, mc_render::entity::CREEPER.into()),
                 MobType::Spider => (Kind::Spider, mc_render::entity::SPIDER.into()),
                 MobType::Cow => (Kind::Cow, variant(VARIANT, "cow")),
@@ -1538,17 +2850,20 @@ impl Tracked {
             body_yaw,
             head_yaw: wrap(head - body_yaw),
             pitch,
-            walk_pos: self.walk_pos - self.walk_speed * (1.0 - pt),
+            // `WalkAnimationState.position(partialTicks)`: a baby's walk runs 3 times as far
+            // (`updateWalkAnimation`'s `positionScale`).
+            walk_pos: (self.walk_pos - self.walk_speed * (1.0 - pt))
+                * if self.baby() { 3.0 } else { 1.0 },
             walk_speed: (self.walk_speed_old + (self.walk_speed - self.walk_speed_old) * pt)
                 .min(1.0),
             age,
             flap: self.flap[0] + (self.flap[1] - self.flap[0]) * pt,
             flap_speed: self.flap_speed[0] + (self.flap_speed[1] - self.flap_speed[0]) * pt,
-            baby: flag(BABY),
+            baby: self.baby(),
             name_tag: self.name_tag(names),
             equipment: self.equipment(armor, uses, pt),
             swing: self.swing(pt),
-            burning: self.burning(flag(BABY)),
+            burning: self.burning(self.baby()),
             // `hasRedOverlay`.
             hurt: self.hurt_time > 0 || self.death_time > 0,
             death_time: if self.death_time > 0 {
@@ -1556,6 +2871,7 @@ impl Tracked {
             } else {
                 0.0
             },
+            layers,
         }))
     }
 
@@ -1622,6 +2938,26 @@ impl Tracked {
     }
 
     /// `Entity.getPose`, as its `Pose` id.
+    /// `onSyncedDataUpdated` for the values that change: a frog's pose starts or stops
+    /// its jump, croak and tongue; an armadillo's state restarts `inStateTicks`.
+    fn data_changed(&mut self, values: &[(u8, DataValue)]) {
+        for (index, value) in values {
+            let changed = self.data.get(index) != Some(value);
+            match (self.sort, *index, value) {
+                (Sort::Mob(MobType::Frog), POSE, DataValue::Int(pose)) if changed => {
+                    let age = i64::from(self.age);
+                    for (slot, wanted) in [(0, 6), (1, 8), (2, 9)] {
+                        self.anim.started[slot] = (*pose == wanted).then_some(age);
+                    }
+                }
+                (Sort::Mob(MobType::Armadillo), MONSTER_STATE, _) if changed => {
+                    self.anim.in_state = 0
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn pose(&self) -> i32 {
         match self.data.get(&POSE) {
             Some(DataValue::Int(pose)) => *pose,
@@ -1705,6 +3041,10 @@ mod tests {
         let mut e = Entities {
             types: vec!["minecraft:cow".into()],
             tracked: HashMap::new(),
+            own: None,
+            pumpkin: 0,
+            tools: HashSet::new(),
+            piglin_loved: HashSet::new(),
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
@@ -1716,6 +3056,7 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            game_time: 0,
         };
         for (id, x) in [(1, 5.0), (2, 2.5), (3, -2.0)] {
             e.event(Event::AddEntity {
@@ -1746,6 +3087,10 @@ mod tests {
         let mut e = Entities {
             types: vec!["minecraft:cow".into()],
             tracked: HashMap::new(),
+            own: None,
+            pumpkin: 0,
+            tools: HashSet::new(),
+            piglin_loved: HashSet::new(),
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
@@ -1757,6 +3102,7 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            game_time: 0,
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1840,6 +3186,10 @@ mod tests {
         let mut e = Entities {
             types: vec!["minecraft:player".into()],
             tracked: HashMap::new(),
+            own: None,
+            pumpkin: 0,
+            tools: HashSet::new(),
+            piglin_loved: HashSet::new(),
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
@@ -1851,6 +3201,7 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            game_time: 0,
         };
         e.event(Event::AddEntity {
             id: 1,
@@ -1892,6 +3243,10 @@ mod tests {
         let mut e = Entities {
             types: vec!["minecraft:player".into()],
             tracked: HashMap::new(),
+            own: None,
+            pumpkin: 0,
+            tools: HashSet::new(),
+            piglin_loved: HashSet::new(),
             skins: HashMap::new(),
             names: HashMap::new(),
             armor: HashMap::new(),
@@ -1903,6 +3258,7 @@ mod tests {
             bolts: HashMap::new(),
             random: mc_render::bake::JavaRandom::new(1),
             thunder: Vec::new(),
+            game_time: 0,
         };
         e.event(Event::AddEntity {
             id: 1,

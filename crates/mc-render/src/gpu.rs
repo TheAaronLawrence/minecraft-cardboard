@@ -63,6 +63,9 @@ pub struct View {
     pub ticks: f32,
     /// Draw the crosshair (a window does; screenshots for comparison don't).
     pub hud: bool,
+    /// The camera is the player's eyes, not behind or in front of it, so the crosshair
+    /// and its attack indicator show (`Hud.extractCrosshair`).
+    pub first_person: bool,
     /// The video options the world draws with: the brightness (`gamma`), whether the
     /// vignette shows, the clouds, and how far they reach, in chunks.
     pub gamma: f32,
@@ -78,6 +81,7 @@ impl View {
             distance,
             ticks,
             hud,
+            first_person: true,
             gamma: 0.5,
             vignette: true,
             clouds: Default::default(),
@@ -269,6 +273,10 @@ pub struct Renderer {
     /// `RenderPipelines.VIGNETTE`, darkening the view by `misc/vignette.png`.
     vignette: wgpu::RenderPipeline,
     vignette_bind_group: wgpu::BindGroup,
+    /// The powder snow frost (`Hud.extractCameraOverlays`), and how strongly it shows.
+    frost: wgpu::RenderPipeline,
+    frost_bind_group: wgpu::BindGroup,
+    frost_alpha: f32,
     lightning: wgpu::RenderPipeline,
     lightning_vertices: Option<(wgpu::Buffer, u32)>,
     particle_vertices: Option<(wgpu::Buffer, u32)>,
@@ -550,6 +558,27 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&blur),
+                },
+            ],
+        });
+        let frost_view = portal_texture("frost", &portal_textures.frost);
+        // A GUI blit: nearest texels.
+        let nearest = device.create_sampler(&Default::default());
+        let frost_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frost"),
+            layout: &portal_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&frost_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&frost_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&nearest),
                 },
             ],
         });
@@ -861,6 +890,14 @@ impl Renderer {
             },
             wgpu::CompareFunction::Always,
         );
+        let frost = overlay(
+            &portal_pipeline_layout,
+            "vs_sky",
+            "fs_frost",
+            &[],
+            wgpu::BlendState::ALPHA_BLENDING,
+            wgpu::CompareFunction::Always,
+        );
         // The HUD has a depth buffer of its own, so items' faces hide each other.
         let gui_pipeline = |label: &str, blend: wgpu::BlendState| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1004,6 +1041,9 @@ impl Renderer {
             weather_vertices: [None, None],
             vignette,
             vignette_bind_group,
+            frost,
+            frost_bind_group,
+            frost_alpha: 0.0,
             lightning,
             lightning_vertices: None,
             particle_vertices: None,
@@ -1121,6 +1161,12 @@ impl Renderer {
     /// sees.
     pub fn set_in_fluid(&mut self, in_fluid: Option<InFluid>) {
         self.in_fluid = in_fluid;
+    }
+
+    /// `Entity.getPercentFrozen`: how strongly the powder snow's frost covers the view, 0
+    /// for not at all.
+    pub fn set_frost(&mut self, alpha: f32) {
+        self.frost_alpha = alpha;
     }
 
     pub fn set_fire_overlay(&mut self, vertices: &[Vertex]) {
@@ -1506,7 +1552,7 @@ impl Renderer {
                 f32::from(u8::from(
                     state.skybox == crate::environment::Skybox::Overworld,
                 )),
-                0.0,
+                self.frost_alpha,
                 0.0,
             ],
         };
@@ -1562,7 +1608,7 @@ impl Renderer {
         }
         let gui_buffer = self.quads_buffer("gui", &gui_mesh.vertices);
         // The attack indicator goes with the crosshair, which a screen hides.
-        let inverted_buffer = if view.hud && self.screen.is_none() {
+        let inverted_buffer = if view.hud && view.first_person && self.screen.is_none() {
             self.quads_buffer("gui inverted", &gui_mesh.inverted)
         } else {
             None
@@ -1722,7 +1768,7 @@ impl Renderer {
                 }
             }
             // Vanilla blurs the crosshair away under a screen; without the blur, it's hidden.
-            if view.hud && self.screen.is_none() {
+            if view.hud && view.first_person && self.screen.is_none() {
                 pass.set_pipeline(&self.crosshair);
                 pass.draw(0..3, 0..1);
             }
@@ -1774,7 +1820,8 @@ impl Renderer {
         }
         // `Hud.extractCameraOverlays`: the vignette first, under the rest of the HUD.
         let vignette = view.hud && view.vignette && state.vignette > 0.0;
-        if gui_buffer.is_some() || inverted_buffer.is_some() || vignette {
+        let frost = view.hud && self.frost_alpha > 0.0;
+        if gui_buffer.is_some() || inverted_buffer.is_some() || vignette || frost {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("hud"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1800,6 +1847,11 @@ impl Renderer {
             if vignette {
                 pass.set_pipeline(&self.vignette);
                 pass.set_bind_group(1, &self.vignette_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            if frost {
+                pass.set_pipeline(&self.frost);
+                pass.set_bind_group(1, &self.frost_bind_group, &[]);
                 pass.draw(0..3, 0..1);
             }
             if let (Some((buffer, count)), Some((indices, _))) = (&inverted_buffer, &self.indices) {

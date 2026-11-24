@@ -467,10 +467,6 @@ impl<'a> Mesher<'a> {
         Some(mesh)
     }
 
-    fn occludes(&self, state: u32) -> bool {
-        self.models.states[state as usize].occludes
-    }
-
     /// `getFaceOcclusionShape(dir)`: which sixteenths of the state's `dir` face it fills.
     fn face(&self, state: u32, dir: Dir) -> [u64; 4] {
         self.models.states[state as usize]
@@ -690,9 +686,9 @@ impl<'a> Mesher<'a> {
         diagonal[t2] += sign(corner[t2]);
 
         let sample = |p: [i32; 3]| {
-            let state = view.state(p[0], p[1], p[2]);
-            let shade = if self.occludes(state) { 0.2 } else { 1.0 };
-            (shade, view.light(p[0], p[1], p[2]), self.occludes(state))
+            let model = &self.models.states[view.state(p[0], p[1], p[2]) as usize];
+            let shade = if model.shades { 0.2 } else { 1.0 };
+            (shade, view.light(p[0], p[1], p[2]), model.blocks_light)
         };
         let center = sample(base);
         let s1 = sample(e1);

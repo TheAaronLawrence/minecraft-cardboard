@@ -28,7 +28,7 @@ struct Uniforms {
     // clouds' fog end (`FogCloudsEnd`) in w.
     cloud_color: vec4<f32>,
     cloud_offset: vec4<f32>,
-    // x: draw the dark disc; y: the sky is the overworld's.
+    // x: draw the dark disc; y: the sky is the overworld's; z: the frost overlay's opacity.
     sky_flags: vec4<f32>,
 };
 
@@ -363,6 +363,15 @@ fn fs_vignette(in: SkyOut) -> @location(0) vec4<f32> {
     let uv = vec2<f32>(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5);
     let texel = textureSample(portal_sky, portal_sampler, uv);
     return vec4<f32>(texel.rgb * u.light_tint.w, texel.a);
+}
+
+// The frost of powder snow (`Hud.extractTextureOverlay`): `misc/powder_snow_outline.png`
+// stretched over the screen, as see-through as the player is unfrozen.
+@fragment
+fn fs_frost(in: SkyOut) -> @location(0) vec4<f32> {
+    let uv = vec2<f32>(in.ndc.x * 0.5 + 0.5, 0.5 - in.ndc.y * 0.5);
+    let texel = textureSample(portal_sky, portal_sampler, uv);
+    return vec4<f32>(texel.rgb, texel.a * u.sky_flags.z);
 }
 
 // Rain and snow (`particle.fsh`): the texture in the portal's sky slot, repeating, times

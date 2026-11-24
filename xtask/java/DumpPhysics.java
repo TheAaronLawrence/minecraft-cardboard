@@ -4,7 +4,9 @@
 // speed factor and jump factor where they differ from the defaults, and every block's destroy
 // time and whether it drops only when mined with the right tool, and every state's fluid and
 // which of its faces are sturdy, for swimming, and whether rain stops on it, and how every
-// state affects light: its dampening and emission, and the faces of its occlusion shape as
+// state affects light: its dampening and emission, whether smooth lighting darkens beside it
+// (`getShadeBrightness`, 0.2 for most states whose collision shape is the whole block, but
+// 1 for glass and 0.2 for mud and soul sand, which override it), and the faces of its occlusion shape as
 // the light engine sees them (`LightEngine.getOcclusionShape`) and as faces are culled against
 // them (`BlockState.getFaceOcclusionShape`, `Block.shouldRenderFace`), and every state's
 // `SoundType`: its break, step, place, hit and fall sound events, volume and pitch, which the
@@ -92,9 +94,11 @@ public class DumpPhysics {
                 }
             }
             sturdy.append(faces);
-            // `getLightDampening`, `getLightEmission` times 16, and 256 for `useShapeForLightOcclusion`.
+            // `getLightDampening`, `getLightEmission` times 16, 256 for `useShapeForLightOcclusion`,
+            // and 512 where `getShadeBrightness` is below 1 (it's 0.2).
             light.append(state.getLightDampening() | state.getLightEmission() << 4
-                | (state.useShapeForLightOcclusion() ? 256 : 0));
+                | (state.useShapeForLightOcclusion() ? 256 : 0)
+                | (state.getShadeBrightness(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) < 1.0f ? 512 : 0));
             // 0 for `LightEngine.isEmptyShape`, else 1 + an index into `occlusion_faces`.
             // `render_occlusion` is the same for every state that `canOcclude`, which is all
             // `getFaceOcclusionShape` gives faces for.

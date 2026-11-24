@@ -39,7 +39,6 @@ pub fn collide_box(
 use glam::DVec3;
 use mc_registry::Registry;
 pub use pick::{BlockHit, clip_collider, pick, view_vector};
-use std::collections::HashSet;
 
 /// What movement needs to know about the world.
 pub trait World {
@@ -228,7 +227,7 @@ impl BlockPhysics {
 
         let tagged = |tag: &str| -> Result<Vec<bool>> {
             let mut states = vec![false; n];
-            for name in block_tag(tag)? {
+            for name in mc_assets::Resources::new(mc_assets::default_root()).tag("block", tag)? {
                 if let Some(block) = registry.block(&name) {
                     let first = block.first_state as usize;
                     states[first..first + block.state_count() as usize].fill(true);
@@ -419,6 +418,15 @@ impl BlockPhysics {
             .map_or(0, |&l| (l >> 4 & 15) as u8)
     }
 
+    /// `BlockState.getShadeBrightness` is 0.2: smooth lighting darkens the corners beside it.
+    /// That's most states whose collision shape is the whole block, except glass (1, as
+    /// `TransparentBlock` says), and mud, soul sand and full snow too.
+    pub fn shades(&self, state: u32) -> bool {
+        self.light
+            .get(state as usize)
+            .is_some_and(|&l| l & 512 != 0)
+    }
+
     /// `LightEngine.hasDifferentLightProperties`: whether replacing `old` with `new` can
     /// change the light around it.
     pub fn light_differs(&self, old: u32, new: u32) -> bool {
@@ -519,36 +527,6 @@ impl BlockPhysics {
         };
         speed / time / tool
     }
-}
-
-/// The blocks in a block tag, following tags it includes.
-fn block_tag(tag: &str) -> Result<HashSet<String>> {
-    let res = mc_assets::Resources::new(mc_assets::default_root());
-    let mut names = HashSet::new();
-    let mut pending = vec![tag.to_owned()];
-    let mut seen = HashSet::new();
-    while let Some(tag) = pending.pop() {
-        if !seen.insert(tag.clone()) {
-            continue;
-        }
-        let path = res.data_path("tags/block", &tag, "json");
-        let json: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&path).with_context(|| format!("block tag {tag}"))?,
-        )?;
-        for value in json["values"].as_array().into_iter().flatten() {
-            // An entry is a name, or `{"id": name, "required": false}`.
-            let Some(id) = value.as_str().or(value["id"].as_str()) else {
-                continue;
-            };
-            match id.strip_prefix('#') {
-                Some(inner) => pending.push(inner.to_owned()),
-                None => {
-                    names.insert(id.to_owned());
-                }
-            }
-        }
-    }
-    Ok(names)
 }
 
 /// The movement keys held this tick, as vanilla's `Input` record.
@@ -776,7 +754,8 @@ impl Player {
         a * 0.6 + b * 0.39999998
     }
 
-    fn in_lava(&self) -> bool {
+    /// `Entity.isInLava`: the box touches lava.
+    pub fn in_lava(&self) -> bool {
         self.touching.lava_height > 0.0
     }
 

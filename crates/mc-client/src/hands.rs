@@ -195,6 +195,11 @@ pub struct ViewBob {
 }
 
 impl ViewBob {
+    /// `LivingEntity.hurtTime`: ticks left of the hurt tilt and the red flash.
+    pub fn hurt_time(&self) -> i32 {
+        self.hurt_time
+    }
+
     /// `LivingEntity.handleDamageEvent` and `LocalPlayer.hurtTo`: the view tilts.
     pub fn hurt(&mut self) {
         self.hurt_time = 10;

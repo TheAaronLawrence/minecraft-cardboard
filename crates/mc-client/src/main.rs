@@ -313,6 +313,7 @@ fn run() -> Result<()> {
             let registry = mc_registry::Registry::vanilla()?;
             let menu_models = Arc::new(BlockModels::bake(&res, &registry, &[])?);
             let event_loop = winit::event_loop::EventLoop::new()?;
+            let start_camera = args.camera;
             let mut app = App {
                 start: args.clone(),
                 args,
@@ -332,6 +333,8 @@ fn run() -> Result<()> {
                 outlined: None,
                 shown_hotbar: None,
                 shown_cracks: Vec::new(),
+                perspective: 0,
+                shown_camera: start_camera,
                 state: None,
                 keys: Default::default(),
                 last_frame: Instant::now(),
@@ -596,6 +599,12 @@ struct App {
     /// What the hotbar and the cracks last showed.
     shown_hotbar: Option<mc_render::hud::Hotbar>,
     shown_cracks: Vec<([i32; 3], u32, u8)>,
+    /// `Options.cameraType`, which F5 cycles: first person 0, behind 1, in front 2. Like
+    /// vanilla's, it lasts until the game closes.
+    perspective: u8,
+    /// The camera the world was last drawn from, behind or in front of the player in the
+    /// third-person views, which sounds are heard from.
+    shown_camera: Camera,
     last_frame: Instant,
     /// The sound engine and the music.
     sounds: sound::Sounds,
@@ -803,6 +812,7 @@ impl App {
                 mc_protocol::offline_uuid(&self.args.name),
                 self.vignette,
                 scene.models.hud.items.clone(),
+                walk::terrain_particles(&scene.models, &scene.registry),
             )?),
             None => None,
         };
@@ -1114,7 +1124,7 @@ impl App {
             }
         }
         if self.streamer.is_some() {
-            let camera = &self.args.camera;
+            let camera = &self.shown_camera;
             let look = |pitch: f32| mc_physics::view_vector(camera.yaw, pitch).as_vec3();
             self.sounds
                 .listener(camera.eye, look(camera.pitch), look(camera.pitch - 90.0));
@@ -2114,6 +2124,10 @@ impl App {
         if let Some(slot) = b.hotbar(key) {
             walker.select(slot);
         }
+        // `Minecraft.handleKeybinds`: `CameraType.cycle`.
+        if b.is("key.togglePerspective", key) {
+            self.perspective = (self.perspective + 1) % 3;
+        }
         let screen = if b.is("key.inventory", key) {
             walker.open_inventory();
             walker.inventory_open()
@@ -2536,6 +2550,28 @@ impl winit::application::ApplicationHandler for App {
                             camera.eye = eye;
                             camera.bob = walker.view_bob();
                         }
+                        // The player looks and aims with `camera`; the world is drawn from
+                        // `view`, which the third-person views move behind or in front.
+                        let look = *camera;
+                        let first_person = self.perspective == 0;
+                        let camera = &if first_person {
+                            look
+                        } else {
+                            let (eye, yaw, pitch) = walker.detached_camera(
+                                look.eye,
+                                look.yaw,
+                                look.pitch,
+                                self.perspective == 2,
+                            );
+                            Camera {
+                                eye,
+                                yaw,
+                                pitch,
+                                ..look
+                            }
+                        };
+                        self.shown_camera = *camera;
+                        self.view.first_person = first_person;
                         if let Some(state) = &mut self.state {
                             let mut hotbar = walker.hotbar();
                             hotbar.chat = self.chat.view(self.view.ticks as i32);
@@ -2580,7 +2616,10 @@ impl winit::application::ApplicationHandler for App {
                             for (sprite, skin) in walker.new_skins() {
                                 renderer.write_sprite(self.models.atlas.sprite(&sprite), &skin);
                             }
-                            let entities = walker.entities();
+                            let mut entities = walker.entities();
+                            if !first_person {
+                                entities.extend(walker.own_entity(look.pitch));
+                            }
                             let mut meshes = mc_render::entity::vertices(
                                 &self.models,
                                 camera,
@@ -2611,10 +2650,11 @@ impl winit::application::ApplicationHandler for App {
                                 }
                             }
                             renderer.set_entities(&meshes);
-                            // F1 hides the hands with the HUD.
+                            // F1 hides the hands with the HUD; so do the third-person views
+                            // (`GameRenderer.renderItemInHand`).
                             let hand = walker
-                                .first_person(camera.yaw, camera.pitch, camera.eye)
-                                .filter(|_| self.view.hud)
+                                .first_person(look.yaw, look.pitch, look.eye)
+                                .filter(|_| self.view.hud && first_person)
                                 .map(|(hands, light)| {
                                     mc_render::entity::first_person(
                                         &self.models,
@@ -2624,16 +2664,25 @@ impl winit::application::ApplicationHandler for App {
                                     )
                                 });
                             renderer.set_hand(&hand.unwrap_or_default());
-                            let fire = walker.sees_fire().then(|| {
+                            // `ScreenEffectRenderer` only draws in first person.
+                            let fire = (first_person && walker.sees_fire()).then(|| {
                                 mc_render::entity::fire_overlay(&self.models.atlas, camera)
                             });
                             renderer.set_fire_overlay(&fire.unwrap_or_default());
+                            renderer.set_frost(walker.frozen());
                             renderer.set_smart_cull(walker.smart_cull(camera.eye));
-                            renderer.set_in_fluid(walker.in_fluid(
+                            let mut fluid = walker.in_fluid(
                                 camera.eye,
                                 camera.yaw,
                                 camera.pitch,
-                            ));
+                                self.view.distance,
+                            );
+                            if let Some(fluid) = &mut fluid
+                                && !first_person
+                            {
+                                fluid.overlay = None;
+                            }
+                            renderer.set_in_fluid(fluid);
                             renderer.set_sky(walker.sky(camera.eye).unwrap_or_default());
                             renderer.set_weather(&walker.weather(camera.eye));
                             let cracks = walker.cracks();
@@ -2649,8 +2698,11 @@ impl winit::application::ApplicationHandler for App {
                             }
                         }
                     }
-                    None if self.streamer.is_some() => self.fly(dt),
-                    None => {}
+                    None if self.streamer.is_some() => {
+                        self.fly(dt);
+                        self.shown_camera = self.args.camera;
+                    }
+                    None => self.shown_camera = self.args.camera,
                 }
                 if let Some(streamer) = &mut self.streamer {
                     streamer.follow(self.args.camera.eye);
@@ -2711,7 +2763,7 @@ impl winit::application::ApplicationHandler for App {
                 let fov = self.walker.as_ref().map_or(1.0, |w| w.fov_modifier());
                 let camera = Camera {
                     fov: self.args.camera.fov * fov,
-                    ..self.args.camera
+                    ..self.shown_camera
                 };
                 state.renderer.render(
                     &target,

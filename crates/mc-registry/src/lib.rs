@@ -26,6 +26,9 @@ pub struct Registry {
     component_types: Vec<String>,
     entity_types: Vec<String>,
     mob_effects: Vec<String>,
+    attributes: Vec<String>,
+    villager_types: Vec<String>,
+    villager_professions: Vec<String>,
     particle_types: Vec<String>,
     sound_events: Vec<String>,
     /// What the inventory needs to know of each item, by name.
@@ -269,6 +272,10 @@ impl Registry {
             names_by_id(&protocol_ids(&registries, "minecraft:data_component_type")?);
         let entity_types = names_by_id(&protocol_ids(&registries, "minecraft:entity_type")?);
         let mob_effects = names_by_id(&protocol_ids(&registries, "minecraft:mob_effect")?);
+        let attributes = names_by_id(&protocol_ids(&registries, "minecraft:attribute")?);
+        let villager_types = names_by_id(&protocol_ids(&registries, "minecraft:villager_type")?);
+        let villager_professions =
+            names_by_id(&protocol_ids(&registries, "minecraft:villager_profession")?);
         let particle_types = names_by_id(&protocol_ids(&registries, "minecraft:particle_type")?);
         let sound_events = names_by_id(&protocol_ids(&registries, "minecraft:sound_event")?);
 
@@ -309,6 +316,9 @@ impl Registry {
             component_types,
             entity_types,
             mob_effects,
+            attributes,
+            villager_types,
+            villager_professions,
             particle_types,
             sound_events,
         })
@@ -373,6 +383,23 @@ impl Registry {
     /// A particle type's name, such as `minecraft:crit`, from its protocol id.
     pub fn particle_type(&self, id: u32) -> Option<&str> {
         self.particle_types.get(id as usize).map(String::as_str)
+    }
+
+    /// A villager type's name, such as `minecraft:plains`, from its protocol id.
+    pub fn villager_type(&self, id: u32) -> Option<&str> {
+        self.villager_types.get(id as usize).map(String::as_str)
+    }
+
+    /// A villager profession's name, such as `minecraft:farmer`, from its protocol id.
+    pub fn villager_profession(&self, id: u32) -> Option<&str> {
+        self.villager_professions
+            .get(id as usize)
+            .map(String::as_str)
+    }
+
+    /// An attribute's name, such as `minecraft:armor`, from its protocol id.
+    pub fn attribute(&self, id: u32) -> Option<&str> {
+        self.attributes.get(id as usize).map(String::as_str)
     }
 
     /// A mob effect's name, such as `minecraft:fire_resistance`, from its protocol id.

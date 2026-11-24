@@ -3,7 +3,7 @@
 use crate::atlas::{Atlas, Layer};
 use anyhow::{Context, Result};
 use glam::{Mat3, Quat, Vec3};
-use mc_assets::{Axis, BlockState, Direction, ElementRotation, Model, Resources, Variant};
+use mc_assets::{Axis, Direction, ElementRotation, Model, Resources, Variant};
 use mc_registry::Registry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -112,8 +112,12 @@ pub struct BakedModel {
 #[derive(Debug, Default)]
 pub struct StateModel {
     pub parts: Vec<Vec<(u32, Arc<BakedModel>)>>,
-    /// A full opaque cube, which darkens its neighbors' corners.
-    pub occludes: bool,
+    /// `getShadeBrightness` is 0.2 (for most, as its collision shape is the whole block),
+    /// so smooth lighting darkens the corners beside it.
+    pub shades: bool,
+    /// Not `isLightPermeable`: it's solid-render and dampens light, so smooth lighting
+    /// doesn't see a corner's diagonal neighbour past it.
+    pub blocks_light: bool,
     /// `getFaceOcclusionShape` for each `Dir`, as `BlockPhysics::face_occlusion` gives
     /// them: what of its neighbours' faces it hides. None when it can't occlude.
     pub faces: Option<Arc<[[u64; 4]; 6]>>,
@@ -121,6 +125,12 @@ pub struct StateModel {
     /// the lid to draw then.
     pub body: Option<Arc<BakedModel>>,
     pub lid: Option<Arc<crate::chest::Lid>>,
+    /// `BlockStateModelSet.getParticleMaterial`: the sprite its terrain particles are cut
+    /// from, its first model's `particle` texture, in atlas coordinates.
+    pub particle: Option<[f32; 4]>,
+    /// `BlockTintSource.color`: its tinted faces' colour outside a level, such as in an
+    /// enderman's hands.
+    pub hand_tint: Option<[f32; 3]>,
 }
 
 pub struct BlockModels {
@@ -134,6 +144,8 @@ pub struct BlockModels {
     pub portal_textures: PortalTextures,
     /// Armour's layers, by equipment asset (`entity::equipment_assets`).
     pub equipment: HashMap<String, crate::entity::EquipmentLayers>,
+    /// Villager clothes' hats (`VillagerMetadataSection`), by sprite: partial 1, full 2.
+    pub villager_hats: HashMap<String, u8>,
 }
 
 /// `TheEndPortalRenderer`'s two textures: the sky behind, and the stars on every layer.
@@ -149,6 +161,8 @@ pub struct PortalTextures {
     pub snow: image::RgbaImage,
     /// `Hud.VIGNETTE_LOCATION`.
     pub vignette: image::RgbaImage,
+    /// `Hud.POWDER_SNOW_OUTLINE_LOCATION`.
+    pub frost: image::RgbaImage,
 }
 
 impl PortalTextures {
@@ -167,6 +181,7 @@ impl PortalTextures {
             rain: load("minecraft:environment/rain")?,
             snow: load("minecraft:environment/snow")?,
             vignette: load("minecraft:misc/vignette")?,
+            frost: load("minecraft:misc/powder_snow_outline")?,
         })
     }
 }
@@ -211,6 +226,7 @@ impl BlockModels {
                             sprites.extend(model.sprite(&face.texture).map(str::to_owned));
                         }
                     }
+                    sprites.extend(model.sprite("particle").map(str::to_owned));
                     models.insert(variant.model.clone(), model);
                 }
             }
@@ -231,6 +247,8 @@ impl BlockModels {
         let atlas = Atlas::build(res, sprites, &extra)?;
 
         let mut baked: HashMap<(String, i32, i32, bool), Arc<BakedModel>> = HashMap::new();
+        // `GrassColor.getDefaultColor`: `GrassColor.get(0.5, 1.0)`.
+        let default_grass = crate::tint::lookup(&crate::tint::colormap(res, "grass")?, 0.5, 1.0);
         let mut states = Vec::with_capacity(registry.state_count() as usize);
         states.resize_with(registry.state_count() as usize, StateModel::default);
         for (block, file) in registry.blocks().iter().zip(&files) {
@@ -257,15 +275,22 @@ impl BlockModels {
                             .collect()
                     })
                     .collect();
-                let occludes = matches!(file, BlockState::Variants(_))
-                    && parts.len() == 1
-                    && parts[0].iter().all(|(_, m)| is_full_opaque_cube(m));
+                let shades = physics.shades(state);
+                let blocks_light =
+                    physics.solid_render(state) && physics.light_dampening(state) > 0;
                 let faces = physics.face_occlusion(state).map(|f| {
                     shared_faces
                         .entry(*f)
                         .or_insert_with(|| Arc::new(*f))
                         .clone()
                 });
+                let particle = selected
+                    .first()
+                    .and_then(|variants| variants.as_slice().first())
+                    .and_then(|v| models[&v.model].sprite("particle"))
+                    .map(|id| atlas.sprite(id).rect);
+                let hand_tint = crate::tint::block_tint(&block.name, &values)
+                    .map(|t| crate::tint::color_in_hand(&block.name, t, default_grass));
                 let entity = crate::chest::model(&block.name, &values, &atlas)
                     .or_else(|| crate::entity_model::model(&block.name, &values, &atlas));
                 let body = crate::chest::body(&block.name, &values, &atlas).map(Arc::new);
@@ -273,17 +298,23 @@ impl BlockModels {
                 states[state as usize] = match entity {
                     Some(model) => StateModel {
                         parts: vec![vec![(1, Arc::new(model))]],
-                        occludes: false,
+                        shades,
+                        blocks_light,
                         faces,
                         body,
                         lid,
+                        particle,
+                        hand_tint,
                     },
                     None => StateModel {
                         parts,
-                        occludes,
+                        shades,
+                        blocks_light,
                         faces,
                         body,
                         lid,
+                        particle,
+                        hand_tint,
                     },
                 };
             }
@@ -297,6 +328,7 @@ impl BlockModels {
             hud,
             portal_textures: PortalTextures::load(res)?,
             equipment,
+            villager_hats: crate::entity::villager_hats(res),
         })
     }
 }
@@ -321,31 +353,11 @@ impl BlockModels {
                 rain: blank(),
                 snow: blank(),
                 vignette: blank(),
+                frost: blank(),
             },
             equipment: HashMap::new(),
+            villager_hats: HashMap::new(),
         })
-    }
-}
-
-/// Six opaque faces covering the whole block, each culled by the neighbor it faces.
-fn is_full_opaque_cube(model: &BakedModel) -> bool {
-    Dir::ALL.iter().all(|&d| {
-        model
-            .quads
-            .iter()
-            .any(|q| q.cull == Some(d) && q.on_face && q.layer == Layer::Opaque && covers_face(q))
-    }) && model.quads.iter().all(|q| q.layer == Layer::Opaque)
-}
-
-fn covers_face(q: &Quad) -> bool {
-    let min = q.pos.iter().copied().reduce(Vec3::min).unwrap();
-    let max = q.pos.iter().copied().reduce(Vec3::max).unwrap();
-    let span = max - min;
-    let full = |v: f32| (v - 1.0).abs() < 1e-4;
-    match q.dir {
-        Dir::Down | Dir::Up => full(span.x) && full(span.z),
-        Dir::North | Dir::South => full(span.x) && full(span.y),
-        Dir::West | Dir::East => full(span.z) && full(span.y),
     }
 }
 

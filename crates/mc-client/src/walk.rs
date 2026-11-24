@@ -235,6 +235,9 @@ pub struct Walker {
     /// icon).
     effects: HashMap<String, (i32, i32, u8)>,
     blocks: BlockPhysics,
+    /// Each block state's particle sprite (atlas coordinates) and the tint its terrain
+    /// particles take, if it has a sprite.
+    terrain: TerrainSprites,
     outbox: mc_protocol::Outbox,
     entity_id: i32,
     /// What the server last heard: position, rotation, input, sprinting, flying.
@@ -291,6 +294,8 @@ pub struct Walker {
     clicks: [u32; 3],
     /// Air, cave air and void air.
     airs: [u32; 3],
+    /// Powder snow's state, which fogs the view from inside it.
+    powder_snow: Option<u32>,
     /// `GameType`'s id; survival and adventure (0 and 2) show the hearts, food and XP.
     game_mode: u8,
     hardcore: bool,
@@ -320,6 +325,14 @@ pub struct Walker {
     swirls: (Vec<u32>, bool, bool),
     /// The player's air supply in ticks (data 1), which the server counts down under water.
     air: i32,
+    /// `Player.getAbsorptionAmount` (data 17): the extra health golden apples and the
+    /// absorption effect give, drawn as yellow hearts.
+    absorption: f32,
+    /// `Entity.getTicksFrozen` (data 7): ticks spent in powder snow.
+    ticks_frozen: i32,
+    /// The attributes the server has sent, by name: each one's base value and its value
+    /// with its modifiers. Those not sent yet have their defaults.
+    attributes: HashMap<String, (f64, f64)>,
     /// Items that place a block (`BlockItem`s, named as their block is), and the block's id.
     block_items: HashMap<String, u32>,
     /// Each state's block id.
@@ -501,6 +514,32 @@ impl Health {
     }
 }
 
+/// Each block state's terrain particle sprite (atlas coordinates) and the tint its terrain
+/// particles take, if it has a sprite.
+pub type TerrainSprites = std::sync::Arc<Vec<Option<([f32; 4], Option<mc_render::tint::Tint>)>>>;
+
+/// Each block state's terrain particle sprite and tint source (`BlockColors.getTintSource`
+/// for layer 0), for `Walker::new`.
+pub fn terrain_particles(
+    models: &mc_render::bake::BlockModels,
+    registry: &mc_registry::Registry,
+) -> TerrainSprites {
+    let mut out = vec![None; models.states.len()];
+    for block in registry.blocks() {
+        for state in block.first_state..block.first_state + block.state_count() {
+            let Some(sprite) = models.states.get(state as usize).and_then(|s| s.particle) else {
+                continue;
+            };
+            // `BlockTintSources.grassBlock`'s colour as a terrain particle is white.
+            let tint = (block.name != "minecraft:grass_block")
+                .then(|| mc_render::tint::block_tint(&block.name, &block.property_values(state)))
+                .flatten();
+            out[state as usize] = Some((sprite, tint));
+        }
+    }
+    std::sync::Arc::new(out)
+}
+
 impl Walker {
     /// A player with this UUID, who has joined with `outbox`.
     pub fn new(
@@ -510,6 +549,7 @@ impl Walker {
         uuid: u128,
         vignette: f32,
         item_icons: std::sync::Arc<HashMap<String, mc_render::item::ItemIcon>>,
+        terrain: TerrainSprites,
     ) -> anyhow::Result<Self> {
         let state = |name: &str| registry.block(name).map(|b| b.default_state);
         let air = state("minecraft:air").expect("air");
@@ -518,10 +558,12 @@ impl Walker {
             state("minecraft:cave_air").unwrap_or(air),
             state("minecraft:void_air").unwrap_or(air),
         ];
+        let powder_snow = state("minecraft:powder_snow");
         Ok(Self {
             player: Player::new(DVec3::ZERO, 0.0, 0.0),
             previous: DVec3::ZERO,
             camera_eye: [1.62; 2],
+            powder_snow,
             placed: false,
             since_tick: 0.0,
             collision: Collision {
@@ -532,6 +574,7 @@ impl Walker {
             biomes: HashMap::new(),
             biome_data: biomes,
             effects: Default::default(),
+            terrain,
             blocks: BlockPhysics::vanilla(registry)?,
             outbox,
             entity_id: 0,
@@ -617,6 +660,9 @@ impl Walker {
             on_fire: false,
             swirls: Default::default(),
             air: 300,
+            attributes: HashMap::new(),
+            absorption: 0.0,
+            ticks_frozen: 0,
             block_items: (0..registry.item_count())
                 .filter_map(|id| registry.item_name(id))
                 .filter(|name| {
@@ -832,7 +878,14 @@ impl Walker {
     fn level_event(&mut self, kind: i32, pos: [i32; 3], data: i32) {
         match kind {
             2001 => self.break_sound(pos, data as u32),
-            2020 => self.hit_sound(IVec3::from(pos)),
+            // `ClientLevel.addBreakingBlockEffects`: another player mining; every fourth
+            // tick with a sound.
+            2019 | 2020 => {
+                if kind == 2020 {
+                    self.hit_sound(IVec3::from(pos));
+                }
+                self.crack_particles(IVec3::from(pos), data.clamp(0, 5) as u8);
+            }
             _ => {
                 if let Some((event, category, volume, pitch)) =
                     crate::sound::level_event(kind, data, &mut self.sound_random)
@@ -937,6 +990,120 @@ impl Walker {
         }
     }
 
+    /// The sprite and tint of `state`'s terrain particles at `pos`
+    /// (`TerrainParticle`'s constructor): its tint source's colour as a terrain particle,
+    /// the biomes' blend around it, but a grass block's sides are dirt, so untinted.
+    fn terrain(&self, state: u32, pos: IVec3) -> Option<([f32; 4], [f32; 3])> {
+        let (sprite, tint) = (*self.terrain.get(state as usize)?)?;
+        let color = match tint {
+            None => [1.0; 3],
+            Some(t @ mc_render::tint::Tint::Fixed(_)) => self.biome_data.color(t, None, [0, 0]),
+            // `BiomeColors.getAverage...`: the 5 × 5 columns around it.
+            Some(t) => {
+                let mut sum = [0.0; 3];
+                for dx in -2..=2 {
+                    for dz in -2..=2 {
+                        let [x, z] = [pos.x + dx, pos.z + dz];
+                        let biome = self.biome_at_quart([x >> 2, pos.y >> 2, z >> 2]);
+                        let c = self.biome_data.color(t, Some(biome), [x, z]);
+                        (0..3).for_each(|i| sum[i] += c[i]);
+                    }
+                }
+                sum.map(|s| s / 25.0)
+            }
+        };
+        Some((sprite, color))
+    }
+
+    /// `ClientLevel.addDestroyBlockEffect`: a broken block bursts into bits, two to four
+    /// across each of its outline's boxes, flung out from its middle.
+    fn destroy_particles(&mut self, pos: IVec3, state: u32) {
+        let Some((sprite, tint)) = self.terrain(state, pos) else {
+            return;
+        };
+        let boxes = self.blocks.outline(state).to_vec();
+        let p = &mut self.entities.particles;
+        for b in boxes {
+            let size = (b.max - b.min).min(DVec3::ONE);
+            let count = (size / 0.25).ceil().max(DVec3::splat(2.0)).as_uvec3();
+            for xx in 0..count.x {
+                for yy in 0..count.y {
+                    for zz in 0..count.z {
+                        let rel =
+                            (DVec3::new(xx as f64, yy as f64, zz as f64) + 0.5) / count.as_dvec3();
+                        let at = pos.as_dvec3() + rel * size + b.min;
+                        p.terrain(sprite, tint, at, rel - 0.5, false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `ClientLevel.addBreakingParticles`: a bit chipped off the face being mined, just
+    /// outside it, slow and small.
+    fn crack_particles(&mut self, pos: IVec3, face: u8) {
+        let state = mc_physics::World::state(&self.collision, pos.x, pos.y, pos.z);
+        if self.blocks.is_air(state) {
+            return;
+        }
+        let Some((sprite, tint)) = self.terrain(state, pos) else {
+            return;
+        };
+        // `VoxelShape.bounds`.
+        let boxes = self.blocks.outline(state);
+        let Some(min) = boxes.iter().map(|b| b.min).reduce(DVec3::min) else {
+            return;
+        };
+        let max = boxes.iter().map(|b| b.max).fold(min, DVec3::max);
+        let p = &mut self.entities.particles;
+        let edge = f64::from(0.1f32);
+        let mut r = || f64::from(p.random());
+        let block = pos.as_dvec3();
+        let mut at = DVec3::new(
+            block.x + r() * (max.x - min.x - f64::from(0.2f32)) + edge + min.x,
+            block.y + r() * (max.y - min.y - f64::from(0.2f32)) + edge + min.y,
+            block.z + r() * (max.z - min.z - f64::from(0.2f32)) + edge + min.z,
+        );
+        // `Direction`'s order: down, up, north, south, west, east.
+        match face {
+            0 => at.y = block.y + min.y - edge,
+            1 => at.y = block.y + max.y + edge,
+            2 => at.z = block.z + min.z - edge,
+            3 => at.z = block.z + max.z + edge,
+            4 => at.x = block.x + min.x - edge,
+            _ => at.x = block.x + max.x + edge,
+        }
+        p.terrain(sprite, tint, at, DVec3::ZERO, true);
+    }
+
+    /// `Entity.spawnSprintParticle` for an entity whose feet are at `feet`, moving at
+    /// `velocity`, `width` wide: a bit of the block it runs on, kicked back.
+    fn sprint_particle(&mut self, feet: DVec3, velocity: DVec3, width: f64) {
+        // `getOnPosLegacy`: the block 0.2 below the feet.
+        let on = DVec3::new(feet.x, feet.y - 0.2, feet.z).floor().as_ivec3();
+        let state = mc_physics::World::state(&self.collision, on.x, on.y, on.z);
+        if self.blocks.is_air(state) {
+            return;
+        }
+        let Some((sprite, tint)) = self.terrain(state, on) else {
+            return;
+        };
+        let p = &mut self.entities.particles;
+        let mut x = feet.x + (f64::from(p.random()) - 0.5) * width;
+        let mut z = feet.z + (f64::from(p.random()) - 0.5) * width;
+        let standing = feet.floor().as_ivec3();
+        if standing.x != on.x {
+            x = x.clamp(on.x as f64, on.x as f64 + 1.0);
+        }
+        if standing.z != on.z {
+            z = z.clamp(on.z as f64, on.z as f64 + 1.0);
+        }
+        if p.allowed(false, false) {
+            let aux = DVec3::new(velocity.x * -4.0, 1.5, velocity.z * -4.0);
+            p.terrain(sprite, tint, DVec3::new(x, feet.y + 0.1, z), aux, false);
+        }
+    }
+
     /// `ClientLevel.addBreakingBlockEffects`'s sound: a hit on the block being mined.
     fn hit_sound(&mut self, pos: IVec3) {
         let state = mc_physics::World::state(&self.collision, pos.x, pos.y, pos.z);
@@ -949,11 +1116,12 @@ impl Walker {
     }
 
     /// `LevelEventHandler`'s 2001 as the player's own `Block.playerWillDestroy` plays it: the
-    /// block breaking.
+    /// block breaking, with its sound and its bits (`ClientLevel.addDestroyBlockEffect`).
     fn break_sound(&mut self, pos: [i32; 3], state: u32) {
         if self.blocks.is_air(state) {
             return;
         }
+        self.destroy_particles(IVec3::from(pos), state);
         let t = self.blocks.sound_type(state);
         let (event, volume, pitch) = (t.break_sound.clone(), (t.volume + 1.0) / 2.0, t.pitch * 0.8);
         self.block_sound(&event, volume, pitch, pos);
@@ -1043,6 +1211,8 @@ impl Walker {
                     }
                     (11, mc_protocol::DataValue::Bool(ambient)) => self.swirls.1 = *ambient,
                     (1, mc_protocol::DataValue::Int(air)) => self.air = *air,
+                    (17, mc_protocol::DataValue::Float(amount)) => self.absorption = *amount,
+                    (7, mc_protocol::DataValue::Int(ticks)) => self.ticks_frozen = *ticks,
                     // `LocalPlayer.onSyncedDataUpdated`: the server starts or stops it.
                     (8, mc_protocol::DataValue::Byte(flags)) => {
                         if flags & 1 == 0 {
@@ -1129,8 +1299,18 @@ impl Walker {
             }
             // `handleRespawn`: a new player, whose first health doesn't flash, and the death
             // screen closes.
-            mc_protocol::Event::Respawn { game_mode } => {
+            mc_protocol::Event::Respawn {
+                game_mode,
+                keep_attributes,
+            } => {
                 self.game_mode = game_mode;
+                // `handleRespawn`: `assignBaseValues` drops the modifiers, such as the ones
+                // armour gives, and keeps the base values.
+                if !keep_attributes {
+                    for (base, value) in self.attributes.values_mut() {
+                        *value = *base;
+                    }
+                }
                 self.death = None;
                 self.respawning = false;
                 self.health.value = 20.0;
@@ -1138,6 +1318,8 @@ impl Walker {
                 self.view_bob.reset();
                 self.on_fire = false;
                 self.air = 300;
+                self.absorption = 0.0;
+                self.ticks_frozen = 0;
                 self.effects.clear();
                 self.using = None;
             }
@@ -1228,6 +1410,12 @@ impl Walker {
                     self.view_bob.hurt();
                 }
                 (self.food, self.saturation) = (food, saturation);
+            }
+            // `ClientPacketListener.handleUpdateAttributes`.
+            mc_protocol::Event::Attributes { id, values } if id == self.entity_id => {
+                for (name, base, value) in values {
+                    self.attributes.insert(name, (base, value));
+                }
             }
             mc_protocol::Event::Experience { progress, level } => {
                 (self.xp_progress, self.xp_level) = (progress, level);
@@ -1325,6 +1513,97 @@ impl Walker {
         })
     }
 
+    /// Hands this tick's player to `Entities::tick_own`, for the third-person views.
+    fn tick_own(&mut self) {
+        let p = &self.player;
+        let flags = u8::from(self.on_fire)
+            | u8::from(p.crouching) << 1
+            | u8::from(p.sprinting) << 3
+            | u8::from(self.swirls.2) << 5;
+        // `Pose`'s ids: dying 7, swimming 3, crouching 5.
+        let pose = match p.pose {
+            _ if self.dead() => 7,
+            mc_physics::Pose::Swimming => 3,
+            mc_physics::Pose::Crouching => 5,
+            mc_physics::Pose::Standing => 0,
+        };
+        // `InventoryMenu`'s slots: the hotbar's selected one, the off hand, and the armour
+        // from feet (8) to head (5).
+        let equipment = [36 + self.selected as usize, 45, 8, 7, 6, 5].map(|i| {
+            self.inventory.slots[i]
+                .as_ref()
+                .map(|(item, _)| item.clone())
+        });
+        let own = crate::entities::Own {
+            old: self.previous,
+            pos: p.pos,
+            yaw: p.yaw,
+            pitch: p.pitch,
+            on_ground: p.on_ground,
+            flags,
+            pose,
+            health: self.health.value,
+            equipment,
+            swing: self.hands.swing.clone(),
+            hurt_time: self.view_bob.hurt_time(),
+            using: self
+                .using
+                .as_ref()
+                .map(|u| (u.hand, u.item.clone(), u.remaining)),
+        };
+        self.entities.tick_own(self.uuid, own);
+    }
+
+    /// The player itself as the third-person views show it, looking down at `pitch`;
+    /// spectators don't see themselves.
+    pub fn own_entity(&self, pitch: f32) -> Option<mc_render::entity::Lit> {
+        if self.game_mode == 3 {
+            return None;
+        }
+        self.entities
+            .render_own(self.since_tick / TICK, pitch, |p| {
+                self.light.at(p.floor().as_ivec3().to_array())
+            })
+    }
+
+    /// `Camera.alignWithEntity`'s detached camera: from `eye`, looking at `yaw` and `pitch`
+    /// (turned round for the front view, `mirrored`), backed off along the view by the
+    /// `camera_distance` attribute's 4 blocks, but no further than the nearest block any
+    /// of eight rays around it meets (`getMaxZoom`). Vanilla clips against blocks' visual
+    /// shapes, which glass and barriers don't have; this uses their collision shapes.
+    pub fn detached_camera(
+        &self,
+        eye: Vec3,
+        yaw: f32,
+        pitch: f32,
+        mirrored: bool,
+    ) -> (Vec3, f32, f32) {
+        let (yaw, pitch) = if mirrored {
+            (yaw + 180.0, -pitch)
+        } else {
+            (yaw, pitch)
+        };
+        let back = -mc_physics::view_vector(yaw, pitch);
+        let eye_d = eye.as_dvec3();
+        let mut distance = 4.0f32;
+        for i in 0..8 {
+            let offset = DVec3::new(
+                f64::from((i & 1) * 2 - 1),
+                f64::from((i >> 1 & 1) * 2 - 1),
+                f64::from((i >> 2 & 1) * 2 - 1),
+            ) * 0.1;
+            let from = eye_d + offset;
+            let to = from + back * f64::from(distance);
+            if let Some(hit) = mc_physics::clip_collider(&self.collision, &self.blocks, from, to) {
+                let squared = hit.location.distance_squared(eye_d) as f32;
+                if squared < distance * distance {
+                    distance = squared.sqrt();
+                }
+            }
+        }
+        ((eye_d + back * f64::from(distance)).as_vec3(), yaw, pitch)
+    }
+
     /// The chests whose lids are open or moving: where each is, its state, how far open
     /// to draw it this frame (`ChestRenderer.submit` eases it, `1 - (1 - open)³`), and the
     /// light there.
@@ -1419,6 +1698,13 @@ impl Walker {
             eprintln!("asking to respawn: {e:#}");
         }
         self.respawning = true;
+    }
+
+    /// `LivingEntity.getAttributeValue`: an attribute's value, or its `default` until the
+    /// server sends it, within its range (`RangedAttribute.sanitizeValue`).
+    fn attribute(&self, name: &str, default: f64, min: f64, max: f64) -> f64 {
+        let value = self.attributes.get(name).map_or(default, |a| a.1);
+        value.clamp(min, max)
     }
 
     fn dead(&self) -> bool {
@@ -1625,7 +1911,7 @@ impl Walker {
 
     /// What the hotbar shows, and in survival and adventure (`GameType.isSurvival`) the
     /// hearts, food and experience above it. Call it once a frame: the hearts blink from
-    /// the frame the health changes. Max health is always 20, as attributes aren't read yet.
+    /// the frame the health changes.
     pub fn hotbar(&mut self) -> mc_render::hud::Hotbar {
         let (health, old_health, blink) = self.health.frame();
         let vitals = matches!(self.game_mode, 0 | 2).then(|| mc_render::hud::Vitals {
@@ -1633,7 +1919,7 @@ impl Walker {
             health,
             old_health,
             blink,
-            max_health: 20.0,
+            max_health: self.attribute("minecraft:max_health", 20.0, 1.0, 1024.0) as f32,
             hardcore: self.hardcore,
             food: self.food,
             saturation: self.saturation,
@@ -1641,6 +1927,20 @@ impl Walker {
             xp_level: self.xp_level,
             air: self.air,
             eye_in_water: self.player.eye_in_water(),
+            absorption: self.absorption.ceil() as i32,
+            // `HeartType.forPlayer`: poison, then wither, then `isFullyFrozen` (140 ticks).
+            hearts: if self.effects.contains_key("minecraft:poison") {
+                mc_render::hud::HeartType::Poisoned
+            } else if self.effects.contains_key("minecraft:wither") {
+                mc_render::hud::HeartType::Withered
+            } else if self.ticks_frozen >= 140 {
+                mc_render::hud::HeartType::Frozen
+            } else {
+                mc_render::hud::HeartType::Normal
+            },
+            regenerating: self.effects.contains_key("minecraft:regeneration"),
+            // `LivingEntity.getArmorValue`, within the attribute's range of 0 to 30.
+            armor: self.attribute("minecraft:armor", 0.0, 0.0, 30.0).floor() as i32,
         });
         mc_render::hud::Hotbar {
             slots: std::array::from_fn(|i| self.inventory.slots[36 + i].clone()),
@@ -1719,10 +2019,36 @@ impl Walker {
         !(self.game_mode == 3 && self.blocks.solid_render(self.collision.state(x, y, z)))
     }
 
-    pub fn in_fluid(&self, eye: Vec3, yaw: f32, pitch: f32) -> Option<mc_render::gpu::InFluid> {
+    pub fn in_fluid(
+        &self,
+        eye: Vec3,
+        yaw: f32,
+        pitch: f32,
+        render_distance: f32,
+    ) -> Option<mc_render::gpu::InFluid> {
         use mc_physics::fluid::FluidKind;
-        let kind = mc_physics::fluid::camera_fluid(&self.collision, &self.blocks, eye.as_dvec3())?;
         let rgb = |c: u32| [c >> 16, c >> 8 & 0xFF, c & 0xFF].map(|v| v as f32 / 255.0);
+        let Some(kind) =
+            mc_physics::fluid::camera_fluid(&self.collision, &self.blocks, eye.as_dvec3())
+        else {
+            // `FogType.POWDER_SNOW` and `PowderedSnowFogEnvironment`: a pale blue wall two
+            // blocks off, or half the render distance away for spectators.
+            let [x, y, z] = eye.floor().as_ivec3().to_array();
+            let state = mc_physics::World::state(&self.collision, x, y, z);
+            return (self.powder_snow == Some(state)).then(|| {
+                let spectator = self.game_mode == 3;
+                mc_render::gpu::InFluid {
+                    fog_color: rgb(0x9FBAC9),
+                    fog_start: if spectator { -8.0 } else { 0.0 },
+                    fog_end: if spectator {
+                        render_distance * 0.5
+                    } else {
+                        2.0
+                    },
+                    overlay: None,
+                }
+            });
+        };
         Some(match kind {
             FluidKind::Water => {
                 // `WATER_FOG_COLOR` and `WATER_FOG_END_DISTANCE`, from their defaults and
@@ -1756,6 +2082,12 @@ impl Walker {
                 }
             }
         })
+    }
+
+    /// `Entity.getPercentFrozen`: how far frozen the player is, 0 to 1, which the frost
+    /// overlay's opacity follows.
+    pub fn frozen(&self) -> f32 {
+        self.ticks_frozen.clamp(0, 140) as f32 / 140.0
     }
 
     /// `ScreenEffectRenderer`'s fire: whether the player sees themselves burning, which
@@ -1941,8 +2273,12 @@ impl Walker {
                 self.camera_eye[1] + (eye - self.camera_eye[1]) * 0.5,
             ];
             self.previous = self.player.pos;
+            self.entities.game_time = self.sky.game_time;
             if self.entities.tick(&self.collision, &self.blocks) {
                 self.sky.flash = 2;
+            }
+            for (feet, velocity, width) in self.entities.sprinters(&self.collision, &self.blocks) {
+                self.sprint_particle(feet, velocity, width);
             }
             // `MobEffectInstance.tickClient`: the time left counts down until the server
             // takes the effect away.
@@ -2000,6 +2336,7 @@ impl Walker {
                 }
                 // A dead player doesn't move or act; the server ignores it until it
                 // respawns.
+                self.tick_own();
                 continue;
             }
             (self.player.yaw, self.player.pitch) = (yaw, pitch);
@@ -2007,6 +2344,11 @@ impl Walker {
                 eprintln!("sending block actions: {e:#}");
             }
             self.tick_using();
+            // `Entity.baseTick`'s `canSpawnSprintParticle`.
+            let p = &self.player;
+            if p.sprinting && !p.in_water && !p.in_lava() && !p.crouching && self.game_mode != 3 {
+                self.sprint_particle(p.pos, p.velocity, 0.6);
+            }
             let before = self.player.pos;
             self.player.tick(input, &self.collision, &self.blocks);
             self.movement_sounds();
@@ -2018,6 +2360,7 @@ impl Walker {
                     .map(|(item, _)| item.as_str())
             });
             self.hands.tick(held, yaw, pitch);
+            self.tick_own();
             if let Err(e) = self.send_changes(input) {
                 eprintln!("sending movement: {e:#}");
             }
@@ -2214,6 +2557,7 @@ impl Walker {
         self.destroying = (progress < 1.0).then_some((pos, face, 0.0));
         if progress < 1.0 {
             self.hit_sound(pos);
+            self.crack_particles(pos, face);
         } else {
             self.break_sound(pos.to_array(), state);
         }

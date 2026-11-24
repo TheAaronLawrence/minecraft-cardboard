@@ -1,7 +1,8 @@
 //! The particles in the world, moved each tick: `Particle.tick` and `move`, for the poofs
 //! of smoke dying mobs leave (`ExplodeParticle`), the sparks and dark hearts of hits
-//! (`CritParticle`), the crumbs of food being eaten (`BreakingItemParticle`), and potion
-//! swirls (`SpellParticle`).
+//! (`CritParticle`), the crumbs of food being eaten (`BreakingItemParticle`), potion
+//! swirls (`SpellParticle`), a glow squid's glow (`GlowParticle`), squids' ink
+//! (`SquidInkParticle`), and bits of blocks broken, mined and run on (`TerrainParticle`).
 
 use glam::DVec3;
 
@@ -17,9 +18,18 @@ pub enum Kind {
     Damage,
     /// `ParticleTypes.ITEM`: a quarter of an item's sprite, the part in `rect`.
     Item,
+    /// `ParticleTypes.BLOCK` (`TerrainParticle`): a quarter of a block's particle sprite,
+    /// the part in `rect`.
+    Terrain,
     /// `ParticleTypes.ENTITY_EFFECT` (`SpellParticle`): a potion's swirl, tinted its
     /// colour, rising.
     Effect,
+    /// `ParticleTypes.GLOW` (`GlowParticle.GlowSquidProvider`): a speck drifting off a glow
+    /// squid, light or dark teal, glowing brighter until it's gone.
+    Glow,
+    /// `ParticleTypes.SQUID_INK` and `GLOW_SQUID_INK` (`SquidInkParticle`): a puff of
+    /// black or teal ink that shrinks as it fades, sinking through air, always fully lit.
+    Ink,
 }
 
 /// A particle: where it is now and last tick, its motion, and how far through its life.
@@ -274,6 +284,62 @@ impl Particles {
         });
     }
 
+    /// `TerrainParticle`: a random quarter of a block's particle sprite `sprite` (atlas
+    /// coordinates), flipped across, 0.6 grey times the block's `tint`, half the usual size,
+    /// at `pos`, set off about `aux` as `Particle`'s constructor does, falling. A block
+    /// being cracked sheds slower, smaller ones (`setPower(0.2)` and `scale(0.6)`).
+    pub fn terrain(
+        &mut self,
+        sprite: [f32; 4],
+        tint: [f32; 3],
+        pos: DVec3,
+        aux: DVec3,
+        cracking: bool,
+    ) {
+        let lifetime = (4.0 / (self.random() * 0.9 + 0.1)) as u32;
+        let mut d = DVec3::new(
+            aux.x + ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+            aux.y + ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+            aux.z + ((self.random() * 2.0 - 1.0) * 0.4) as f64,
+        );
+        let speed = ((self.random() + self.random() + 1.0) * 0.15) as f64;
+        d = d / d.length() * speed * f64::from(0.4f32);
+        d.y += f64::from(0.1f32);
+        let mut size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 / 2.0;
+        let (uo, vo) = (self.random() * 3.0, self.random() * 3.0);
+        if cracking {
+            d.x *= f64::from(0.2f32);
+            d.y = (d.y - f64::from(0.1f32)) * f64::from(0.2f32) + f64::from(0.1f32);
+            d.z *= f64::from(0.2f32);
+            size *= 0.6;
+        }
+        let [u0, v0, u1, v1] = sprite;
+        let u = |f: f32| u0 + (u1 - u0) * f;
+        let v = |f: f32| v0 + (v1 - v0) * f;
+        self.particles.push(Particle {
+            kind: Kind::Terrain,
+            old: pos,
+            pos,
+            velocity: d,
+            on_ground: false,
+            stopped: false,
+            age: 0,
+            lifetime,
+            size,
+            color: tint.map(|c| 0.6 * c),
+            alpha: 1.0,
+            rect: Some([
+                u((uo + 1.0) / 4.0),
+                v(vo / 4.0),
+                u(uo / 4.0),
+                v((vo + 1.0) / 4.0),
+            ]),
+            gravity: 1.0,
+            friction: 0.98,
+            physics: true,
+        });
+    }
+
     /// `getRandomX(0.5)`, `getRandomY` and `getRandomZ(0.5)`: somewhere in a `width` ×
     /// `height` box with its bottom middle at `feet`.
     pub fn in_box(&mut self, feet: DVec3, [width, height]: [f32; 2]) -> DVec3 {
@@ -314,6 +380,64 @@ impl Particles {
     /// `SpellParticle.MobEffectProvider`: a swirl at `pos` tinted `argb`, its motion a
     /// random sideways drift and `aux`'s height; with no sideways `aux` it barely drifts.
     pub fn effect(&mut self, pos: DVec3, aux: DVec3, argb: u32) {
+        let channel = |shift: u32| ((argb >> shift) & 0xff) as f32 / 255.0;
+        let tint = ([channel(16), channel(8), channel(0)], channel(24));
+        self.drift(Kind::Effect, pos, aux, |_| tint);
+    }
+
+    /// `SquidInkParticle.Provider` (`glow` false, black) and `GlowInkProvider` (teal): a
+    /// puff at `pos` moving at `velocity`, half a block across.
+    pub fn ink(&mut self, pos: DVec3, velocity: DVec3, glow: bool) {
+        // `Particle`'s constructor's lifetime and `SingleQuadParticle`'s size, both
+        // replaced.
+        self.random();
+        self.random();
+        let size = 0.5f32;
+        let lifetime = (size * 12.0 / (self.random() * 0.8 + 0.2)) as u32;
+        let color = if glow { [0.2, 0.8, 0.6] } else { [0.0; 3] };
+        self.particles.push(Particle {
+            kind: Kind::Ink,
+            old: pos,
+            pos,
+            velocity,
+            on_ground: false,
+            stopped: false,
+            age: 0,
+            lifetime,
+            size,
+            color,
+            alpha: 1.0,
+            rect: None,
+            gravity: 0.0,
+            friction: 0.92,
+            physics: false,
+        });
+    }
+
+    /// `GlowParticle.GlowSquidProvider`: a glow at `pos`, drifting as a swirl does, light
+    /// or dark teal at random, weightless.
+    pub fn glow(&mut self, pos: DVec3) {
+        self.drift(Kind::Glow, pos, DVec3::ZERO, |p| {
+            let color = if p.random() < 0.5 {
+                [0.6, 1.0, 0.8]
+            } else {
+                [0.08, 0.4, 0.4]
+            };
+            (color, 1.0)
+        });
+    }
+
+    /// What `SpellParticle.MobEffectProvider` and `GlowSquidProvider` share: a particle at
+    /// `pos`, its motion a random sideways drift and `aux`'s height, slowed (with no
+    /// sideways `aux`, it barely drifts); `tint` picks its colour and alpha after it's
+    /// made, before its lifetime.
+    fn drift(
+        &mut self,
+        kind: Kind,
+        pos: DVec3,
+        aux: DVec3,
+        tint: impl FnOnce(&mut Self) -> ([f32; 3], f32),
+    ) {
         let xa = 0.5 - self.random() as f64;
         let za = 0.5 - self.random() as f64;
         // `Particle`'s constructors: its lifetime (replaced below), then a direction
@@ -327,18 +451,18 @@ impl Particles {
         let speed = ((self.random() + self.random() + 1.0) * 0.15) as f64;
         d = d / d.length() * speed * f64::from(0.4f32);
         d.y += f64::from(0.1f32);
-        // `SingleQuadParticle`, then `SpellParticle`: rising slowly, three quarters the
-        // size.
+        // `SingleQuadParticle`, then `SpellParticle` or `GlowParticle`: three quarters
+        // the size, rising slowly.
         let size = 0.1 * (self.random() * 0.5 + 0.5) * 2.0 * 0.75;
         d.y *= f64::from(0.2f32);
         if aux.x == 0.0 && aux.z == 0.0 {
             d.x *= f64::from(0.1f32);
             d.z *= f64::from(0.1f32);
         }
+        let (color, alpha) = tint(self);
         let lifetime = (8.0 / (self.random() as f64 * 0.8 + 0.2)) as u32;
-        let channel = |shift: u32| ((argb >> shift) & 0xff) as f32 / 255.0;
         self.particles.push(Particle {
-            kind: Kind::Effect,
+            kind,
             old: pos,
             pos,
             velocity: d,
@@ -347,10 +471,11 @@ impl Particles {
             age: 0,
             lifetime,
             size,
-            color: [channel(16), channel(8), channel(0)],
-            alpha: channel(24),
+            color,
+            alpha,
             rect: None,
-            gravity: -0.1,
+            // `SpellParticle` floats up; a glow has no weight.
+            gravity: if kind == Kind::Effect { -0.1 } else { 0.0 },
             friction: 0.96,
             physics: false,
         });
@@ -360,7 +485,24 @@ impl Particles {
     pub fn tick(&mut self, world: &impl mc_physics::World, blocks: &mc_physics::BlockPhysics) {
         let collide =
             |pos, motion| mc_physics::collide_box(world, blocks, pos, [SIZE, SIZE], motion);
-        self.particles.retain_mut(|p| p.tick(Some(&collide)));
+        self.particles.retain_mut(|p| {
+            if !p.tick(Some(&collide)) {
+                return false;
+            }
+            // `SquidInkParticle.tick`: it fades over the second half of its life, and sinks
+            // while it's in air.
+            if p.kind == Kind::Ink {
+                let half = p.lifetime / 2;
+                if p.age > half {
+                    p.alpha = 1.0 - (p.age - half) as f32 / p.lifetime as f32;
+                }
+                let b = p.pos.floor().as_ivec3();
+                if blocks.is_air(world.state(b.x, b.y, b.z)) {
+                    p.velocity.y -= f64::from(0.0074f32);
+                }
+            }
+            true
+        });
     }
 
     /// What to draw, `pt` of the way to the next tick, lit by `light` where each is.
@@ -369,7 +511,7 @@ impl Particles {
         pt: f32,
         light: impl Fn(DVec3) -> [u8; 2],
     ) -> Vec<mc_render::particle::Particle> {
-        use mc_render::particle::{CRIT, DAMAGE, EFFECT, ENCHANTED_HIT, POOF};
+        use mc_render::particle::{CRIT, DAMAGE, EFFECT, ENCHANTED_HIT, GLOW, POOF};
         self.particles
             .iter()
             .map(|p| mc_render::particle::Particle {
@@ -377,20 +519,33 @@ impl Particles {
                 size: p.size,
                 sprite: match p.kind {
                     // `SpriteSet.get(age, lifetime)`.
-                    Kind::Poof => POOF[(p.age as usize * (POOF.len() - 1)) / p.lifetime as usize],
+                    Kind::Poof | Kind::Ink => {
+                        POOF[(p.age as usize * (POOF.len() - 1)) / p.lifetime.max(1) as usize]
+                    }
                     Kind::Crit => CRIT,
                     Kind::EnchantedHit => ENCHANTED_HIT,
                     Kind::Damage => DAMAGE,
-                    Kind::Item => "",
+                    Kind::Item | Kind::Terrain => "",
                     Kind::Effect => {
                         EFFECT[(p.age as usize * (EFFECT.len() - 1)) / p.lifetime as usize]
                     }
+                    Kind::Glow => GLOW,
                 },
                 rect: p.rect,
                 color: p.color,
                 alpha: p.alpha,
-                translucent: p.kind == Kind::Effect,
-                light: light(p.pos),
+                // `SimpleAnimatedParticle`: blended, and always fully lit.
+                translucent: matches!(p.kind, Kind::Effect | Kind::Ink),
+                light: if p.kind == Kind::Ink {
+                    [15, 15]
+                } else {
+                    light(p.pos)
+                },
+                // `GlowParticle.getLightCoords`: block light grows to full over its life.
+                emission: match p.kind {
+                    Kind::Glow => (p.age as f32 + pt) / p.lifetime as f32,
+                    _ => 0.0,
+                },
             })
             .collect()
     }
@@ -427,7 +582,7 @@ impl Particle {
             None => self.pos += self.velocity,
         }
         // `speedUpWhenYMotionIsBlocked`.
-        if self.kind == Kind::Effect && self.pos.y == self.old.y {
+        if matches!(self.kind, Kind::Effect | Kind::Glow) && self.pos.y == self.old.y {
             self.velocity.x *= 1.1;
             self.velocity.z *= 1.1;
         }

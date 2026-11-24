@@ -32,6 +32,7 @@ const FONT_EXTRA: &str = "minecraft:font/nonlatin_european";
 const XP_BACKGROUND: &str = "hud/experience_bar_background";
 const XP_PROGRESS: &str = "hud/experience_bar_progress";
 const FOOD: [&str; 3] = ["hud/food_empty", "hud/food_half", "hud/food_full"];
+const ARMOR: [&str; 3] = ["hud/armor_empty", "hud/armor_half", "hud/armor_full"];
 const AIR: [&str; 3] = ["hud/air", "hud/air_bursting", "hud/air_empty"];
 /// `Hud`'s attack indicator under the crosshair: full, then the charging bar's background
 /// and progress.
@@ -51,6 +52,34 @@ const MAX_AIR: i32 = 300;
 /// `Hud.HeartType`'s sprites for a container or a normal heart, which come in hardcore,
 /// half and blinking forms; a container has no half form.
 fn heart(container: bool, hardcore: bool, half: bool, blink: bool) -> String {
+    heart_of("", container, hardcore, half, blink)
+}
+
+/// `Hud.HeartType`'s kinds of filled heart that a player's health shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum HeartType {
+    #[default]
+    Normal,
+    Poisoned,
+    Withered,
+    Frozen,
+}
+
+impl HeartType {
+    /// The prefix of its sprites' names.
+    fn prefix(self) -> &'static str {
+        match self {
+            HeartType::Normal => "",
+            HeartType::Poisoned => "poisoned_",
+            HeartType::Withered => "withered_",
+            HeartType::Frozen => "frozen_",
+        }
+    }
+}
+
+/// `HeartType`'s sprite: `kind` is `""` for `NORMAL` or the type's prefix, such as
+/// `"absorbing_"` (whose hardcore sprites put `hardcore_` after it).
+fn heart_of(kind: &str, container: bool, hardcore: bool, half: bool, blink: bool) -> String {
     let blink = if blink { "_blinking" } else { "" };
     if container {
         let hardcore = if hardcore { "_hardcore" } else { "" };
@@ -58,7 +87,7 @@ fn heart(container: bool, hardcore: bool, half: bool, blink: bool) -> String {
     } else {
         let hardcore = if hardcore { "hardcore_" } else { "" };
         let size = if half { "half" } else { "full" };
-        format!("hud/heart/{hardcore}{size}{blink}")
+        format!("hud/heart/{kind}{hardcore}{size}{blink}")
     }
 }
 
@@ -177,6 +206,7 @@ fn named_sprites() -> Vec<String> {
     let mut names: Vec<String> = [XP_BACKGROUND, XP_PROGRESS]
         .into_iter()
         .chain(FOOD)
+        .chain(ARMOR)
         .chain(AIR)
         .chain(ATTACK_INDICATOR)
         .chain([OFFHAND])
@@ -193,6 +223,9 @@ fn named_sprites() -> Vec<String> {
     for i in 0..16 {
         let bit = |b: u32| i & 1 << b != 0;
         names.push(heart(bit(0), bit(1), bit(2), bit(3)));
+        for kind in ["absorbing_", "poisoned_", "withered_", "frozen_"] {
+            names.push(heart_of(kind, false, bit(1), bit(2), bit(3)));
+        }
     }
     names.sort();
     names.dedup();
@@ -588,6 +621,14 @@ pub struct Vitals {
     /// `Entity.getAirSupply` in ticks, up to 300, and whether the eye is in water.
     pub air: i32,
     pub eye_in_water: bool,
+    /// `Player.getArmorValue`: armour points, two to a chestplate icon.
+    pub armor: i32,
+    /// `Player.getAbsorptionAmount`, rounded up: half hearts of absorption.
+    pub absorption: i32,
+    /// How the health's hearts look.
+    pub hearts: HeartType,
+    /// Has Regeneration, so one heart at a time bobs up along the row.
+    pub regenerating: bool,
 }
 
 /// Quads in GUI pixels. Vertices are `Vertex`es whose x and y are in GUI pixels, whose z is
@@ -958,25 +999,79 @@ impl GuiMesh {
         let mut random = crate::bake::JavaRandom::new(i64::from(v.tick.wrapping_mul(312_871)));
         let (x_left, x_right, y_base) = (width / 2 - 91, width / 2 + 91, height - 39);
         let max_health = v.max_health.max(v.old_health.max(v.health) as f32);
-        let rows = (max_health / 2.0 / 10.0).ceil() as i32;
+        let rows = ((max_health + v.absorption as f32) / 2.0 / 10.0).ceil() as i32;
         let row_height = (10 - (rows - 2)).max(3);
 
-        // `extractHearts`.
+        // `extractArmor`: a row above the hearts, when there's any armour.
+        if v.armor > 0 {
+            let [empty, half, full] = ARMOR;
+            let y = y_base - (rows - 1) * row_height - 10;
+            for i in 0..10 {
+                let name = match (i * 2 + 1).cmp(&v.armor) {
+                    std::cmp::Ordering::Less => full,
+                    std::cmp::Ordering::Equal => half,
+                    std::cmp::Ordering::Greater => empty,
+                };
+                sprite(self, name, x_left + i * 8, y, 9, 9);
+            }
+        }
+
+        // `extractHearts`: the health's containers, then absorption's after them, which
+        // fill yellow and never blink.
         let containers = (max_health / 2.0).ceil() as i32;
-        for i in (0..containers).rev() {
+        let absorbing = (v.absorption as f32 / 2.0).ceil() as i32;
+        // `heartOffsetIndex`: Regeneration lifts the heart this far along, ticking past the
+        // end for a moment before it starts again.
+        let lifted = if v.regenerating {
+            v.tick.rem_euclid((max_health + 5.0).ceil() as i32)
+        } else {
+            -1
+        };
+        let kind = v.hearts.prefix();
+        // Wither blackens absorption's hearts too.
+        let absorbing_kind = match v.hearts {
+            HeartType::Withered => kind,
+            _ => "absorbing_",
+        };
+        for i in (0..containers + absorbing).rev() {
             let (x, mut y) = (x_left + i % 10 * 8, y_base - i / 10 * row_height);
-            if v.health <= 4 {
+            if v.health + v.absorption <= 4 {
                 y += random.next_int(2);
+            }
+            if i < containers && i == lifted {
+                y -= 2;
             }
             sprite(self, &heart(true, v.hardcore, false, v.blink), x, y, 9, 9);
             let halves = i * 2;
+            if i >= containers {
+                let halves = halves - containers * 2;
+                if halves < v.absorption {
+                    let half = halves + 1 == v.absorption;
+                    let name = heart_of(absorbing_kind, false, v.hardcore, half, false);
+                    sprite(self, &name, x, y, 9, 9);
+                }
+            }
             if v.blink && halves < v.old_health {
                 let half = halves + 1 == v.old_health;
-                sprite(self, &heart(false, v.hardcore, half, true), x, y, 9, 9);
+                sprite(
+                    self,
+                    &heart_of(kind, false, v.hardcore, half, true),
+                    x,
+                    y,
+                    9,
+                    9,
+                );
             }
             if halves < v.health {
                 let half = halves + 1 == v.health;
-                sprite(self, &heart(false, v.hardcore, half, false), x, y, 9, 9);
+                sprite(
+                    self,
+                    &heart_of(kind, false, v.hardcore, half, false),
+                    x,
+                    y,
+                    9,
+                    9,
+                );
             }
         }
 
